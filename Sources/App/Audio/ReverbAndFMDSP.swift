@@ -237,20 +237,25 @@ public struct HadamardFDNReverbKernel: Sendable {
         let oneMinusDamp = 1.0 - clampedDamp
 
         // 1. Stereo input Schroeder all-pass decorrelation ([149, 211] @ 48 kHz)
+        var idxInL = inDiffIdxL
         let diffInL = stepSchroederAllPass(
             input: leftIn,
             gain: 0.61803399,
             offset: inDiffOffsetL,
             length: inDiffLenL,
-            index: &inDiffIdxL
+            index: &idxInL
         )
+        inDiffIdxL = idxInL
+
+        var idxInR = inDiffIdxR
         let diffInR = stepSchroederAllPass(
             input: rightIn,
             gain: 0.61803399,
             offset: inDiffOffsetR,
             length: inDiffLenR,
-            index: &inDiffIdxR
+            index: &idxInR
         )
+        inDiffIdxR = idxInR
 
         // 2. Read 8 mutually prime delay lines
         let p0 = fdnOffsets.0 + fdnIndices.0
@@ -302,20 +307,25 @@ public struct HadamardFDNReverbKernel: Sendable {
         let rawWetL = (dampingStates[0] - dampingStates[2] + dampingStates[4] - dampingStates[6] + dampingStates[1] * 0.25) * tapScale
         let rawWetR = (dampingStates[1] - dampingStates[3] + dampingStates[5] - dampingStates[7] - dampingStates[0] * 0.25) * tapScale
 
+        var idxOutL = outDiffIdxL
         let wetL = stepSchroederAllPass(
             input: rawWetL,
             gain: -0.58,
             offset: outDiffOffsetL,
             length: outDiffLenL,
-            index: &outDiffIdxL
+            index: &idxOutL
         )
+        outDiffIdxL = idxOutL
+
+        var idxOutR = outDiffIdxR
         let wetR = stepSchroederAllPass(
             input: rawWetR,
             gain: -0.58,
             offset: outDiffOffsetR,
             length: outDiffLenR,
-            index: &outDiffIdxR
+            index: &idxOutR
         )
+        outDiffIdxR = idxOutR
 
         let dryGain = 1.0 - clampedWet
         let outL = leftIn * dryGain + wetL * clampedWet
