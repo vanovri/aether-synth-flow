@@ -1503,7 +1503,7 @@ public struct SynthLabPanelView: View {
         .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude, cornerRadius: 24)
     }
 
-    private func rayTracedAcousticsHeader(accent: Color, report: AcousticRayTraceReport?) -> some View {
+    private func rayTracedAcousticsHeader(accent: Color, report: AcousticTraceReport?) -> some View {
         HStack {
             Label("3D Ray-Traced Acoustics & RT60 Analyzer", systemImage: "cube.transparent.fill")
                 .font(.system(size: 14, weight: .bold, design: .rounded))
@@ -1585,7 +1585,7 @@ public struct SynthLabPanelView: View {
 
     private func rayTracedVisualizerRow(
         accent: Color,
-        report: AcousticRayTraceReport?,
+        report: AcousticTraceReport?,
         rt60: SIMD4<Float>,
         sabine: SIMD4<Float>,
         eyring: SIMD4<Float>
