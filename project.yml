@@ -1,0 +1,83 @@
+name: AetherSynthFlow
+options:
+  bundleIdPrefix: com.aethersynth
+  deploymentTarget:
+    iOS: "18.0"
+  xcodeVersion: "16.0"
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+
+targets:
+  AetherSynthFlow:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources/Shared
+      - path: Sources/App
+    info:
+      path: Config/AetherSynthFlow-Info.plist
+    entitlements:
+      path: Config/AetherSynthFlow.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aethersynth.flow
+        ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: YES
+    dependencies:
+      - target: AetherSynthWidgets
+        embed: true
+
+  AetherSynthWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Sources/Shared
+      - path: Sources/Widgets
+    info:
+      path: Config/AetherSynthWidgets-Info.plist
+    entitlements:
+      path: Config/AetherSynthWidgets.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aethersynth.flow.widgets
+        SKIP_INSTALL: YES
+    dependencies:
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework
+      - sdk: AppIntents.framework
+      - sdk: ActivityKit.framework
+
+  AetherSynthTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests/AetherSynthTests
+    dependencies:
+      - target: AetherSynthFlow
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aethersynth.flow.tests
+        GENERATE_INFOPLIST_FILE: YES
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/AetherSynthFlow.app/$(BUNDLE_EXECUTABLE_PATH)"
+
+schemes:
+  AetherSynthFlow:
+    build:
+      targets:
+        AetherSynthFlow: all
+        AetherSynthWidgets: all
+        AetherSynthTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - name: AetherSynthTests
+          parallelizable: true
