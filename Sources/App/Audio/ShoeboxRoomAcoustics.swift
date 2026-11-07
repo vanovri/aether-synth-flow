@@ -682,6 +682,15 @@ public struct OrbitalSatelliteVoice: Sendable, Equatable {
     public var harmonicRatio: Float
     public var amplitude: Float
 
+    @inline(__always)
+    public var isActive: Bool { amplitude > 1.0e-5 }
+
+    @inline(__always)
+    public var azimuthDeg: Float { azimuthRadians * (180.0 / .pi) }
+
+    @inline(__always)
+    public var elevationDeg: Float { elevationRadians * (180.0 / .pi) }
+
     public init(
         azimuthRadians: Float = 0.0,
         elevationRadians: Float = 0.0,
@@ -720,6 +729,16 @@ public struct OrbitalSatelliteBank: Sendable, Equatable {
         let idle = OrbitalSatelliteVoice()
         self.activeCount = 0
         self.voices = (idle, idle, idle, idle, idle, idle)
+    }
+
+    public func asArray() -> [OrbitalSatelliteVoice] {
+        let count = min(max(activeCount, 0), Self.maxVoices)
+        var result: [OrbitalSatelliteVoice] = []
+        result.reserveCapacity(count)
+        for i in 0..<count {
+            result.append(self[i])
+        }
+        return result
     }
 
     public static func == (lhs: OrbitalSatelliteBank, rhs: OrbitalSatelliteBank) -> Bool {
