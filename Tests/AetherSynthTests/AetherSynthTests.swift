@@ -2501,6 +2501,141 @@ struct AetherSynthTests {
         #expect(abs(out2[0].tp9 - 0.0) < 0.5)
         #expect(abs(out2[1].tp9 - s2.tp9) < 0.05)
     }
+
+    // MARK: - 31. Phase 10 Track 33: SPWVD Instantaneous Chirp Ridge (<1.5 Hz) & Hilbert-Huang Completeness (<1e-4)
+
+    @Test("HilbertHuangSifter separates 6Hz + 22Hz + chirp with <1e-4 completeness error & SPWVDAnalyzer tracks chirp ridge within <1.5Hz")
+    func verifyPhase10Track33SPWVDChirpRidgeAndHilbertHuangCompleteness() {
+        let nCount = SPWVDAnalyzer.canonicalBlockSize // 128
+        let fs = 256.0
+        var compositeSignal = [Float](repeating: 0.0, count: nCount)
+        var chirpSignal = [Float](repeating: 0.0, count: nCount)
+        let f0 = 10.0
+        let chirpRate = 24.0
+
+        for n in 0..<nCount {
+            let t = Double(n) / fs
+            let phaseChirp = 2.0 * Double.pi * (f0 * t + 0.5 * chirpRate * t * t)
+            chirpSignal[n] = Float(sin(phaseChirp))
+            compositeSignal[n] = Float(sin(2.0 * Double.pi * 6.0 * t) + sin(2.0 * Double.pi * 22.0 * t) + 0.5 * sin(phaseChirp))
+        }
+
+        let hht = HilbertHuangSifter.sift(
+            signal: compositeSignal,
+            sampleRate: fs,
+            maxIMFs: 4,
+            maxSiftIterations: 12,
+            cauchyConvergenceThreshold: 0.05
+        )
+        #expect(!hht.imfs.isEmpty)
+        #expect(hht.imfAnalytics.count == hht.imfs.count)
+        #expect(hht.maxReconstructionError < 1.0e-4)
+
+        let spwvd = SPWVDAnalyzer.analyze(
+            signal: chirpSignal,
+            sampleRate: fs,
+            freqBins: 64,
+            halfLagL: 16,
+            halfTimeM: 6
+        )
+        #expect(spwvd.timeSteps == nCount)
+        #expect(spwvd.freqBins == 64)
+        #expect(spwvd.renyiEntropyBits > 0.0 && spwvd.renyiEntropyBits.isFinite)
+        #expect((0.0...1.0).contains(spwvd.corticalSpindlePowerRatio))
+
+        var interiorErrorSum: Double = 0.0
+        var interiorCount = 0
+        for n in 20..<(nCount - 20) {
+            let t = Double(n) / fs
+            let trueInstHz = f0 + chirpRate * t
+            let estHz = Double(spwvd.instantaneousFreqRidgeHz[n])
+            interiorErrorSum += abs(estHz - trueInstHz)
+            interiorCount += 1
+        }
+        let meanRidgeErrorHz = interiorErrorSum / Double(max(1, interiorCount))
+        #expect(meanRidgeErrorHz < 1.5)
+    }
+
+    // MARK: - 32. Phase 10 Track 34: Quantum MPS Left-Canonical Orthogonality (<1e-5), S_vN Bounds & 2-Site DMRG Descent
+
+    @Test("MatrixProductStateEngine left-canonical ||U^T U - I||_F < 1e-5, S_vN == 0 (product) vs ln(chi) (Bell) & DMRG monotonic energy descent")
+    func verifyPhase10Track34QuantumMPSTTSVDAndTwoSiteDMRGSweeps() {
+        // 1. Separable product state: S_vN == 0, P_2 == 1
+        let productVec = MatrixProductStateEngine.makeSeparableProductState()
+        let productMPS = MatrixProductStateEngine(stateVector: productVec, maxBondDim: 8)
+        let productOrthoErr = productMPS.verifyLeftCanonicalOrthogonality()
+        let productSnap = productMPS.evaluateEntanglement()
+        #expect(productOrthoErr < 1.0e-5)
+        #expect(abs(productSnap.vonNeumannEntropyNats) < 1.0e-6)
+        #expect(abs(productSnap.renyi2Purity - 1.0) < 1.0e-6)
+
+        // 2. Maximally entangled Bell state across cut k=3 with rank chi=8: S_vN == ln(8)
+        let chi = 8
+        let bellVec = MatrixProductStateEngine.makeMaximallyEntangledBellState(schmidtRank: chi)
+        let bellMPS = MatrixProductStateEngine(stateVector: bellVec, maxBondDim: 16)
+        let bellOrthoErr = bellMPS.verifyLeftCanonicalOrthogonality()
+        let bellSnap = bellMPS.evaluateEntanglement()
+        #expect(bellOrthoErr < 1.0e-5)
+        #expect(abs(bellSnap.vonNeumannEntropyNats - log(Double(chi))) < 1.0e-4)
+        #expect(abs(bellSnap.renyi2Purity - (1.0 / Double(chi))) < 1.0e-4)
+
+        // 3. 2-Site DMRG sweeps monotonically lower <psi | H | psi>
+        let sweeps = DMRGVariationalOptimizer.runSweeps(
+            initialState: bellVec,
+            couplingJ: 1.0,
+            transverseFieldH: 0.5,
+            sweeps: 3,
+            maxBondDim: 8
+        )
+        #expect(sweeps.count == 3)
+        for idx in 1..<sweeps.count {
+            #expect(sweeps[idx].variationalEnergy <= sweeps[idx - 1].variationalEnergy + 1.0e-6)
+        }
+
+        let control = DMRGVariationalOptimizer.extractOptimalBioAcousticControl(from: bellMPS)
+        #expect((4.0...18.0).contains(control.recommendedBinauralBeatHz))
+        #expect((136.0...432.5).contains(control.recommendedCarrierHz))
+    }
+
+    // MARK: - 33. Phase 10 Track 35: Acousto-Optic Cauchy Dispersion & Gladstone-Dale Refraction (400nm vs 700nm)
+
+    @Test("AcoustoOpticCausticsEngine violet 400nm refracts at strictly greater angle than red 700nm under identical nonzero pressure gradient")
+    func verifyPhase10Track35AcoustoOpticCauchyDispersionAndGladstoneDaleRefraction() {
+        let pressure: Float = 0.35
+        let gradP: Float = 0.80
+
+        let nViolet400 = AcoustoOpticCausticsEngine.refractiveIndex(wavelengthNm: 400.0, pressure: pressure)
+        let nRed700 = AcoustoOpticCausticsEngine.refractiveIndex(wavelengthNm: 700.0, pressure: pressure)
+        #expect(nViolet400 > nRed700)
+
+        let angleViolet400 = AcoustoOpticCausticsEngine.refractionDeflectionAngleRadians(
+            wavelengthNm: 400.0,
+            pressure: pressure,
+            pressureGradientMagnitude: gradP
+        )
+        let angleRed700 = AcoustoOpticCausticsEngine.refractionDeflectionAngleRadians(
+            wavelengthNm: 700.0,
+            pressure: pressure,
+            pressureGradientMagnitude: gradP
+        )
+        #expect(angleViolet400 > angleRed700)
+
+        let xyz550 = AcoustoOpticCausticsEngine.wavelengthToCIE1931XYZ(550.0)
+        let p3RGB = AcoustoOpticCausticsEngine.xyzToLinearDisplayP3(xyz550)
+        #expect(xyz550.y > 0.5 && p3RGB.y > 0.5)
+    }
+
+    // MARK: - 34. Phase 10 Track 36: End-to-End Capstone Certification via AetherCapstoneBenchmarkSuite.shared
+
+    @Test("AetherCapstoneBenchmarkSuite.shared.runFullAudit passes all 12 invariants & seals 64-hex SHA-256 digest")
+    func verifyPhase10Track36EndToEndCapstoneMasterCertification() async {
+        let report = await AetherCapstoneBenchmarkSuite.shared.runFullAudit()
+        #expect(report.allInvariantsPassed == true)
+        #expect(report.passedStageCount == 12)
+        #expect(report.totalStageCount == 12)
+        #expect(report.cryptographicSHA256Digest.count == 64)
+        #expect(report.subsystemInventory.count >= 10)
+    }
 }
 
 private struct ScheduledSliceTestEvent {

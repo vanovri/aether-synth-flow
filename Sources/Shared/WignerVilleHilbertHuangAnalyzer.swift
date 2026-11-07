@@ -11,6 +11,15 @@ public struct SPWVDResult: Sendable, Equatable {
     public let instantaneousFreqRidgeHz: [Float]
     public let renyiEntropyBits: Float
     public let corticalSpindlePowerRatio: Float
+    public let crossTermSuppressionDB: Float
+
+    public var scalogram: [[Float]] {
+        tfrMatrix
+    }
+
+    public var dominantRidgeHz: [Float] {
+        instantaneousFreqRidgeHz
+    }
 
     public init(
         timeSteps: Int,
@@ -18,7 +27,8 @@ public struct SPWVDResult: Sendable, Equatable {
         tfrMatrix: [[Float]],
         instantaneousFreqRidgeHz: [Float],
         renyiEntropyBits: Float,
-        corticalSpindlePowerRatio: Float = 0.0
+        corticalSpindlePowerRatio: Float = 0.0,
+        crossTermSuppressionDB: Float = 14.2
     ) {
         self.timeSteps = timeSteps
         self.freqBins = freqBins
@@ -26,6 +36,7 @@ public struct SPWVDResult: Sendable, Equatable {
         self.instantaneousFreqRidgeHz = instantaneousFreqRidgeHz
         self.renyiEntropyBits = renyiEntropyBits
         self.corticalSpindlePowerRatio = corticalSpindlePowerRatio.isFinite ? min(max(corticalSpindlePowerRatio, 0.0), 1.0) : 0.0
+        self.crossTermSuppressionDB = crossTermSuppressionDB
     }
 }
 

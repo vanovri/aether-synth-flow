@@ -6,6 +6,24 @@ import simd
 
 // MARK: - 1. Pure-Swift Acousto-Optic Physics & Spectral Photon Caustics Engine
 
+public enum SpectralCausticsRenderer: Sendable {
+    @inline(__always)
+    public static func sellmeierRefractiveIndex(wavelengthNm: Float, dispersionStrength: Float = 1.0) -> Float {
+        AcoustoOpticCausticsEngine.refractiveIndex(
+            wavelengthNm: wavelengthNm,
+            pressure: 0.0,
+            n0: 1.333,
+            cauchyB: 0.0031 * max(0.05, dispersionStrength),
+            kappaAO: 0.045
+        )
+    }
+
+    @inline(__always)
+    public static func cie1931RGB(wavelengthNm: Float) -> SIMD3<Float> {
+        AcoustoOpticCausticsEngine.wavelengthToLinearSRGB(wavelengthNm)
+    }
+}
+
 public enum AcoustoOpticCausticsEngine: Sendable {
     public static let minVisibleWavelengthNm: Float = 380.0
     public static let maxVisibleWavelengthNm: Float = 700.0

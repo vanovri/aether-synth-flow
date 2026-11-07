@@ -222,6 +222,13 @@ public struct MatrixProductStateEngine: Sendable, Equatable {
         return psi
     }
 
+    /// Constructs a canonical separable product state `|0>^{\otimes 6}` (`S_vN == 0`, `P_2 == 1`).
+    public static func makeSeparableProductState() -> [Double] {
+        var psi = [Double](repeating: 0.0, count: hilbertSpaceDimension)
+        psi[0] = 1.0
+        return psi
+    }
+
     /// Reconstructs the dense 4096-element state vector by sequentially contracting `cores[0..<6]`.
     public func reconstructStateVector() -> [Double] {
         guard !cores.isEmpty else { return [] }

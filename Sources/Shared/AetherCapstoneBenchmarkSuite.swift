@@ -108,6 +108,14 @@ public struct CapstoneAuditReport: Codable, Sendable, Equatable {
         overallP99Microseconds
     }
 
+    public var metrics: [StageBenchmarkMetrics] {
+        stages
+    }
+
+    public var markdownSummary: String {
+        renderMarkdownReport()
+    }
+
     public init(
         schemaVersion: String = "AETHER-CAPSTONE-PHASE10-V1",
         generatedAtISO8601: String,
