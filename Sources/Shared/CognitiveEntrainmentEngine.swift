@@ -255,6 +255,7 @@ public enum EntrainmentPhase: String, Codable, CaseIterable, Sendable {
 
 public struct EntrainmentSplineSample: Codable, Sendable, Equatable {
     public let normalizedProgress: Double
+    public var progress: Double { normalizedProgress }
     public let phase: EntrainmentPhase
     public let carrierFrequencyHz: Float
     public let binauralBeatHz: Float

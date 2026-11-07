@@ -479,7 +479,8 @@ public struct MacStudioThreeColumnWorkspaceView: View {
                 highBandEnergy: model.highBandEnergy,
                 beatFrequencyHz: model.synthParameters.binauralBeatHz,
                 accentHue: model.activeAccentHue,
-                focusProgress: model.focusProgress
+                focusProgress: model.focusProgress,
+                onTouchVelocityPulse: { _, _ in }
             )
             .frame(height: 268)
             .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))

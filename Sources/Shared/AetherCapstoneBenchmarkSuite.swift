@@ -1108,8 +1108,8 @@ public actor AetherCapstoneBenchmarkSuite {
 
                 let archive = AetherTelemetryArchive(
                     habits: HabitNodeDTO.defaultSeeds,
-                    sessions: [],
                     presets: AudioPresetDTO.defaultPresets,
+                    sessions: [],
                     dailyTelemetry: []
                 )
 
