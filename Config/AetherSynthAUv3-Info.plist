@@ -2,58 +2,78 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleDevelopmentRegion</key>
-    <string>$(DEVELOPMENT_LANGUAGE)</string>
-    <key>CFBundleDisplayName</key>
-    <string>AetherSynth AUv3</string>
-    <key>CFBundleExecutable</key>
-    <string>$(EXECUTABLE_NAME)</string>
-    <key>CFBundleIdentifier</key>
-    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>CFBundleName</key>
-    <string>$(PRODUCT_NAME)</string>
-    <key>CFBundlePackageType</key>
-    <string>XPC!</string>
-    <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-    <key>NSExtension</key>
-    <dict>
-        <key>NSExtensionAttributes</key>
-        <dict>
-            <key>AudioComponents</key>
-            <array>
-                <dict>
-                    <key>description</key>
-                    <string>AetherSynth &amp; Flow Spatial Binaural MPE Synthesizer &amp; FX</string>
-                    <key>manufacturer</key>
-                    <string>AETH</string>
-                    <key>name</key>
-                    <string>AetherLab: AetherSynth &amp; Flow</string>
-                    <key>sandboxSafe</key>
-                    <true/>
-                    <key>subtype</key>
-                    <string>aeth</string>
-                    <key>tags</key>
-                    <array>
-                        <string>Synthesizer</string>
-                        <string>Effects</string>
-                        <string>Spatial</string>
-                    </array>
-                    <key>type</key>
-                    <string>aumu</string>
-                    <key>version</key>
-                    <integer>65536</integer>
-                </dict>
-            </array>
-        </dict>
-        <key>NSExtensionPointIdentifier</key>
-        <string>com.apple.AudioUnit-UI</string>
-        <key>NSExtensionPrincipalClass</key>
-        <string>$(PRODUCT_MODULE_NAME).AetherAUv3ViewController</string>
-    </dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>AetherSynth AUv3</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>NSExtension</key>
+	<dict>
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.AudioUnit-UI</string>
+		<key>NSExtensionPrincipalClass</key>
+		<string>AetherSynthAUv3.AetherAUv3ViewController</string>
+		<key>NSExtensionAttributes</key>
+		<dict>
+			<key>AudioComponents</key>
+			<array>
+				<dict>
+					<key>type</key>
+					<string>aumu</string>
+					<key>subtype</key>
+					<string>AsFl</string>
+					<key>manufacturer</key>
+					<string>Aeth</string>
+					<key>name</key>
+					<string>AetherSynth: AetherSynthFlow Instrument</string>
+					<key>description</key>
+					<string>AetherSynth &amp; Flow 8-Voice MPE Spatial HRTF &amp; Binaural AUv3 Synthesizer</string>
+					<key>version</key>
+					<integer>65536</integer>
+					<key>sandboxSafe</key>
+					<true/>
+					<key>tags</key>
+					<array>
+						<string>Synthesizer</string>
+						<string>Spatial</string>
+					</array>
+				</dict>
+				<dict>
+					<key>type</key>
+					<string>aumf</string>
+					<key>subtype</key>
+					<string>AsFl</string>
+					<key>manufacturer</key>
+					<string>Aeth</string>
+					<key>name</key>
+					<string>AetherSynth: AetherSynthFlow Spatial FX</string>
+					<key>description</key>
+					<string>AetherSynth &amp; Flow 24dB Cytomic TPT SVF, 8-Ch Hadamard FDN &amp; KEMAR HRTF Effect</string>
+					<key>version</key>
+					<integer>65536</integer>
+					<key>sandboxSafe</key>
+					<true/>
+					<key>tags</key>
+					<array>
+						<string>Effects</string>
+						<string>Spatial</string>
+					</array>
+				</dict>
+			</array>
+		</dict>
+	</dict>
 </dict>
 </plist>

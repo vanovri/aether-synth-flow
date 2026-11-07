@@ -762,6 +762,12 @@ public struct WaveFieldNodeSolution: Sendable, Equatable, Identifiable {
     public let cosIncidenceAngle: Double              // cos(\psi_i)
 
     @inline(__always)
+    public var tofDelaySeconds: Double { compensatedWFSDelaySeconds }
+
+    @inline(__always)
+    public var totalWavefrontArrivalSeconds: Double { totalArrivalAtSweetSpotSeconds }
+
+    @inline(__always)
     public func delayInSamples(sampleRate: Double) -> Double {
         max(0.0, compensatedWFSDelaySeconds * max(8_000.0, sampleRate))
     }
@@ -777,6 +783,10 @@ public struct SpatialWaveFieldSolver: Sendable {
 
     public init(speedOfSound: Double = speedOfSoundMetersPerSecond) {
         self.speedOfSound = max(100.0, speedOfSound)
+    }
+
+    public init(speedOfSoundMetersPerSec: Double) {
+        self.speedOfSound = max(100.0, speedOfSoundMetersPerSec)
     }
 
     /// Exact raw 2.5D WFS relative delay $\tau_{\text{wfs}, i} = \frac{\|\vec{p}_i - \vec{p}_S\| - \|\vec{p}_L - \vec{p}_S\|}{c}$.

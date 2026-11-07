@@ -1620,6 +1620,379 @@ struct AetherSynthTests {
         #expect(renderSnap.rmsAmplitude > 0.01)
         #expect(ring.availableFramesToRead == ComplementaryHannOverlapAdd.hopSize * 2 - renderFrames)
     }
+
+    // MARK: - 17. Phase 8 Track 29.3.1: Marzullo's Interval Intersection & Byzantine Outlier Rejection
+
+    @Test("MarzulloClockFilter W=16 recovers +1.25ms true offset within ±0.08ms & rejects 3 +45ms Byzantine spike packets")
+    func verifyMarzulloIntervalIntersectionAndByzantineOutlierRejection() throws {
+        var filter = MarzulloClockFilter(windowCapacity: 16)
+        let trueOffsetNs: Int64 = 1_250_000 // +1.25 ms
+        let spikeIndices: Set<Int> = [3, 9, 14]
+
+        // Deterministic micro-jitter sequence within ±0.15 ms around +1.25 ms
+        let jitterMicroseconds: [Double] = [
+            -42.0, +38.0, -19.0, 0.0, +51.0, -33.0, +14.0, -27.0,
+            +44.0, 0.0, -36.0, +29.0, -15.0, +21.0, 0.0, -11.0
+        ]
+
+        var latestEstimate = MarzulloConsensusEstimate(
+            consensusOffsetSeconds: 0,
+            confidenceRadiusSeconds: 0,
+            intersectionLowSeconds: 0,
+            intersectionHighSeconds: 0,
+            survivingIntervalCount: 0,
+            totalIntervalCount: 0,
+            rejectedOutlierCount: 0,
+            minimumRTTDelaySeconds: 0,
+            allanDeviation: 0
+        )
+
+        let baseOriginNs: UInt64 = 10_000_000_000
+        for idx in 0..<16 {
+            let t1 = baseOriginNs + UInt64(idx) * 100_000_000
+            let turnaroundNs: UInt64 = 25_000
+
+            if spikeIndices.contains(idx) {
+                // Corrupt 3 packets with asymmetric +45.0 ms Wi-Fi aggregation spike on forward leg
+                // and an intentionally shifted Byzantine offset (+46.25 ms apparent midpoint, tight fake RTT = 0.8 ms)
+                let byzantineOffsetNs: Int64 = trueOffsetNs + 45_000_000
+                let halfRttNs: Int64 = 400_000 // 0.4 ms one-way
+                let t2 = UInt64(Int64(t1) + byzantineOffsetNs + halfRttNs)
+                let t3 = t2 + turnaroundNs
+                let t4 = UInt64(Int64(t3) - byzantineOffsetNs + halfRttNs)
+
+                let packet = OrchestraPTPClockPacket(
+                    packetKind: .delayResponse,
+                    sequenceNumber: UInt32(idx + 1),
+                    peerNodeID: 2,
+                    t1OriginNs: t1,
+                    t2ResponderIngressNs: t2,
+                    t3ResponderEgressNs: t3,
+                    t4InitiatorIngressNs: t4,
+                    masterBeatPhase: 0.25,
+                    tempoBPM: 120.0,
+                    globalSampleCounter: UInt64(idx * 4_800)
+                )
+                let encoded = packet.encode()
+                #expect(encoded.count == OrchestraPTPClockPacket.byteLength)
+                let decoded = try OrchestraPTPClockPacket.decode(from: encoded)
+                latestEstimate = filter.ingestPacket(decoded, sampleIntervalTauSeconds: 0.10)
+            } else {
+                // 13 valid exchanges with true offset +1.25 ms ± 0.15 ms and symmetric ~0.36 ms RTT
+                let jitterNs = Int64((jitterMicroseconds[idx] * 1_000.0).rounded())
+                let fwdNs: Int64 = 180_000 + jitterNs
+                let revNs: Int64 = 180_000 - jitterNs
+                let t2 = UInt64(Int64(t1) + trueOffsetNs + fwdNs)
+                let t3 = t2 + turnaroundNs
+                let t4 = UInt64(Int64(t3) - trueOffsetNs + revNs)
+
+                let packet = OrchestraPTPClockPacket(
+                    packetKind: .delayResponse,
+                    sequenceNumber: UInt32(idx + 1),
+                    peerNodeID: 2,
+                    t1OriginNs: t1,
+                    t2ResponderIngressNs: t2,
+                    t3ResponderEgressNs: t3,
+                    t4InitiatorIngressNs: t4,
+                    masterBeatPhase: 0.50,
+                    tempoBPM: 120.0,
+                    globalSampleCounter: UInt64(idx * 4_800)
+                )
+                let encoded = packet.encode()
+                #expect(encoded.count == 64)
+                let decoded = try OrchestraPTPClockPacket.decode(from: encoded)
+                latestEstimate = filter.ingestPacket(decoded, sampleIntervalTauSeconds: 0.10)
+            }
+        }
+
+        let targetOffsetSec = 0.00125 // +1.25 ms
+        let estimationErrorMs = abs(latestEstimate.consensusOffsetSeconds - targetOffsetSec) * 1_000.0
+        #expect(latestEstimate.totalIntervalCount == 16)
+        #expect(latestEstimate.survivingIntervalCount == 13)
+        #expect(latestEstimate.rejectedOutlierCount == 3)
+        #expect(estimationErrorMs <= 0.08)
+        #expect(latestEstimate.allanDeviation.isFinite && latestEstimate.allanDeviation >= 0.0)
+    }
+
+    // MARK: - 18. Phase 8 Track 29.3.2: 2nd-Order PI-PLL Clock Servo Convergence
+
+    @Test("PhaseLockedLoopClockServo converges two ProceduralSynthKernel instances from 12.5ms offset & +40ppm drift to <0.15ms in 200 ticks")
+    func verifySecondOrderPIPLLClockServoConvergence() {
+        let sampleRate = 48_000.0
+        let tickFrames = 4_800 // 0.10 s per PTP tick
+        let dtSec = Double(tickFrames) / sampleRate
+        let params = SynthParameters(
+            carrierFrequencyHz: 216.0,
+            binauralBeatHz: 10.0,
+            binauralMix: 0.5,
+            pinkNoiseMix: 0.0,
+            padMix: 0.35,
+            masterGain: 0.7,
+            isMuted: false
+        )
+
+        var masterKernel = ProceduralSynthKernel(sampleRate: sampleRate, snapInitialParameters: params)
+        var followerKernel = ProceduralSynthKernel(sampleRate: sampleRate, snapInitialParameters: params)
+
+        var pll = PhaseLockedLoopClockServo(naturalBandwidthHz: 0.8, dampingRatio: 0.7071067811865476)
+        // Start with +12.5 ms initial phase/time offset and +40 ppm local hardware crystal drift
+        var residualTimeOffsetSeconds: Double = 0.0125
+        let crystalDriftFrac: Double = 40.0e-6 // +40 ppm
+        var maxOvershootNegativeMs: Double = 0.0
+
+        var scratchL = [Float](repeating: 0, count: tickFrames)
+        var scratchR = [Float](repeating: 0, count: tickFrames)
+
+        for _ in 0..<200 {
+            let phaseErrorCycles = masterKernel.binauralEnvelopePhase - followerKernel.binauralEnvelopePhase
+            let wrappedPhaseErr = phaseErrorCycles - (phaseErrorCycles + 0.5).rounded(.down)
+
+            let telemetry = pll.step(
+                offsetErrorSeconds: residualTimeOffsetSeconds,
+                phaseErrorCycles: wrappedPhaseErr * 0.02,
+                referenceFrequencyHz: Double(params.binauralBeatHz),
+                dtSeconds: dtSec
+            )
+
+            #expect(telemetry.sampleRateScale >= 0.9990 && telemetry.sampleRateScale <= 1.0010)
+            masterKernel.pllSampleRateScale = 1.0
+            followerKernel.pllSampleRateScale = telemetry.sampleRateScale
+
+            scratchL.withUnsafeMutableBufferPointer { lPtr in
+                scratchR.withUnsafeMutableBufferPointer { rPtr in
+                    _ = masterKernel.renderStereoBlock(
+                        leftOutput: lPtr.baseAddress!,
+                        rightOutput: rPtr.baseAddress!,
+                        frameCount: tickFrames,
+                        target: params
+                    )
+                    _ = followerKernel.renderStereoBlock(
+                        leftOutput: lPtr.baseAddress!,
+                        rightOutput: rPtr.baseAddress!,
+                        frameCount: tickFrames,
+                        target: params
+                    )
+                }
+            }
+
+            // Advance physical clock offset under +40 ppm crystal drift vs PLL warp correction
+            let netRateRatio = (1.0 + crystalDriftFrac) * telemetry.sampleRateScale
+            residualTimeOffsetSeconds += dtSec * (1.0 - netRateRatio)
+            if residualTimeOffsetSeconds < 0.0 {
+                maxOvershootNegativeMs = max(maxOvershootNegativeMs, abs(residualTimeOffsetSeconds) * 1_000.0)
+            }
+        }
+
+        let finalErrorMs = abs(residualTimeOffsetSeconds) * 1_000.0
+        #expect(finalErrorMs < 0.15)
+        // Verify critically damped loop does not suffer runaway overshoot instability (< 3.5 ms peak damped swing)
+        #expect(maxOvershootNegativeMs < 3.5)
+    }
+
+    // MARK: - 19. Phase 8 Track 29.3.3: Acoustic Wave-Field Synthesis (WFS) Time-of-Flight Geometry
+
+    @Test("SpatialWaveFieldSolver 4-node array equalizes total acoustic arrival time d_i/c + tau_wfs,i at sweet spot (< 1e-9s)")
+    func verifyWaveFieldSynthesisTimeOfFlightGeometry() {
+        let solver = SpatialWaveFieldSolver(speedOfSoundMetersPerSec: 343.0)
+        let listenerSweetSpot = SIMD3<Double>(0.0, 0.0, 0.0)
+        let virtualSource = SIMD3<Double>(0.45, 0.0, 2.80)
+
+        let nodes: [OrchestraSpeakerNode] = [
+            OrchestraSpeakerNode(nodeID: 1, label: "Node 1", positionMeters: SIMD3<Double>(-1.40, 0.0, 1.35)),
+            OrchestraSpeakerNode(nodeID: 2, label: "Node 2", positionMeters: SIMD3<Double>( 1.25, 0.0, 1.60)),
+            OrchestraSpeakerNode(nodeID: 3, label: "Node 3", positionMeters: SIMD3<Double>(-1.75, 0.0, 0.85)),
+            OrchestraSpeakerNode(nodeID: 4, label: "Node 4", positionMeters: SIMD3<Double>( 1.65, 0.0, 1.10))
+        ]
+
+        let solutions = solver.solveArray(
+            nodes: nodes,
+            listenerPosition: listenerSweetSpot,
+            virtualSourcePosition: virtualSource
+        )
+        #expect(solutions.count == 4)
+
+        let referenceArrivalSec = solutions[0].totalWavefrontArrivalSeconds
+        for sol in solutions {
+            #expect(sol.tofDelaySeconds >= 0.0)
+            #expect(sol.wfsDrivingAmplitude > 0.0 && sol.wfsDrivingAmplitude <= 2.0)
+            let arrivalDiff = abs(sol.totalWavefrontArrivalSeconds - referenceArrivalSec)
+            #expect(arrivalDiff < 1.0e-9)
+        }
+    }
+
+    // MARK: - 20. Phase 8 Track 29.3.4: AUv3 Sample-Accurate Event Slicing & 9-Note MPE Voice Stealing
+
+    @Test("AetherSynthAudioUnit 512-frame sample-accurate slicing (NoteOn@128, Ramp@128..384, PitchBend@256) & 9-note MPE voice stealing")
+    func verifyAUv3SampleAccurateEventSlicingAndMPEVoiceStealing() throws {
+        #if canImport(AudioToolbox) && !os(watchOS)
+        let sampleRate = 48_000.0
+        let frameCount = 512
+        var leftOut = [Float](repeating: 0.0, count: frameCount)
+        var rightOut = [Float](repeating: 0.0, count: frameCount)
+
+        let paramBank = RealtimeParameterBank()
+        // Set ambient drone masterGain to 0.0 so ONLY the MPE polyphonic voices produce audio in the sub-block test
+        paramBank.setHostValue(0.0, for: .masterGain)
+        paramBank.setHostValue(1200.0, for: .filterCutoffHz)
+        paramBank.resetRenderStateFromAtomics()
+
+        let voiceBank = MPEPolyphonicVoiceBank(sampleRate: sampleRate)
+        var synthKernel = ProceduralSynthKernel(sampleRate: sampleRate, snapInitialParameters: paramBank.makeSynthParametersSnapshot())
+
+        // Scheduled events inside the 512-frame buffer:
+        // - Frame 0..<128: Silence before Note On
+        // - Frame 128: Note On (Ch 2, Note 69 = A4 440Hz, Velocity 110) + Parameter Ramp on filterCutoffHz (1200 -> 4800 Hz over 256 frames: 128..384)
+        // - Frame 256: MPE Member Ch 2 14-bit Pitch Bend (+2048 above 8192 center = +12 semitones)
+        // - Frame 384..<512: Post-ramp steady state
+        let events: [ScheduledSliceTestEvent] = [
+            ScheduledSliceTestEvent(
+                sampleOffset: 128,
+                kind: .midi(status: 0x91, data1: 69, data2: 110) // Ch 2 Note On
+            ),
+            ScheduledSliceTestEvent(
+                sampleOffset: 128,
+                kind: .parameterRamp(
+                    address: AetherAUParameterAddress.filterCutoffHz.rawValue,
+                    targetValue: 4800.0,
+                    durationFrames: 256
+                )
+            ),
+            ScheduledSliceTestEvent(
+                sampleOffset: 256,
+                kind: .midi(status: 0xE1, data1: 0x00, data2: 0x50) // Ch 2 Pitch Bend MSB 0x50 -> 10240 (+2048)
+            )
+        ]
+
+        var cutoffAtFrame128: Float = 0.0
+        var cutoffAtFrame256: Float = 0.0
+        var cutoffAtFrame384: Float = 0.0
+
+        leftOut.withUnsafeMutableBufferPointer { lBuf in
+            rightOut.withUnsafeMutableBufferPointer { rBuf in
+                let lBase = lBuf.baseAddress!
+                let rBase = rBuf.baseAddress!
+
+                var currentFrame = 0
+                var eventIdx = 0
+
+                while currentFrame < frameCount {
+                    while eventIdx < events.count && events[eventIdx].sampleOffset <= currentFrame {
+                        switch events[eventIdx].kind {
+                        case let .midi(status, d1, d2):
+                            voiceBank.handleMIDIMessage(status: status, data1: d1, data2: d2)
+                        case let .parameterRamp(addr, target, dur):
+                            paramBank.scheduleRenderParameterEvent(
+                                address: addr,
+                                targetValue: target,
+                                rampDurationFrames: AUAudioFrameCount(dur)
+                            )
+                        }
+                        eventIdx += 1
+                    }
+
+                    if currentFrame == 128 {
+                        cutoffAtFrame128 = paramBank.renderValue(.filterCutoffHz)
+                    } else if currentFrame == 256 {
+                        cutoffAtFrame256 = paramBank.renderValue(.filterCutoffHz)
+                    } else if currentFrame == 384 {
+                        cutoffAtFrame384 = paramBank.renderValue(.filterCutoffHz)
+                    }
+
+                    let nextBoundary = min(
+                        frameCount,
+                        eventIdx < events.count ? events[eventIdx].sampleOffset : frameCount,
+                        currentFrame == 256 ? 384 : (currentFrame < 256 && currentFrame >= 128 ? 256 : frameCount)
+                    )
+                    let sliceFrames = nextBoundary - currentFrame
+                    guard sliceFrames > 0 else { break }
+
+                    let snapParams = paramBank.makeSynthParametersSnapshot()
+                    _ = synthKernel.renderStereoBlock(
+                        leftOutput: lBase.advanced(by: currentFrame),
+                        rightOutput: rBase.advanced(by: currentFrame),
+                        frameCount: sliceFrames,
+                        target: snapParams
+                    )
+                    voiceBank.renderAndAccumulate(
+                        leftOutput: lBase.advanced(by: currentFrame),
+                        rightOutput: rBase.advanced(by: currentFrame),
+                        frameCount: sliceFrames,
+                        baseCutoffHz: paramBank.renderValue(.filterCutoffHz),
+                        resonance: paramBank.renderValue(.filterResonance),
+                        masterGain: 0.85
+                    )
+
+                    for _ in 0..<sliceFrames {
+                        paramBank.stepActiveRampsOneSample()
+                    }
+                    currentFrame = nextBoundary
+                }
+            }
+        }
+
+        // 1. Assert frames [0 ..< 128] prior to Note On at sample 128 are silent (< 1e-6)
+        let preNotePeak = (0..<128).map { max(abs(leftOut[$0]), abs(rightOut[$0])) }.max() ?? 0.0
+        #expect(preNotePeak < 1.0e-6)
+
+        // 2. Assert frames [128 ..< 512] initiate phase-coherent oscillation with non-zero energy
+        let postNoteRMS = sqrt((128..<512).reduce(Float(0.0)) { $0 + leftOut[$1] * leftOut[$1] } / Float(512 - 128))
+        #expect(postNoteRMS > 0.01)
+
+        // 3. Assert linear parameter ramp across [128 ..< 384] interpolates accurately from 1200 Hz -> 3000 Hz -> 4800 Hz
+        #expect(abs(cutoffAtFrame128 - 1200.0) < 1.0)
+        #expect(abs(cutoffAtFrame256 - 3000.0) < 15.0)
+        #expect(abs(cutoffAtFrame384 - 4800.0) < 1.0)
+
+        // 4. Trigger 9 simultaneous MPE notes into the 8-voice bank (after releasing note 1 so it is the oldest released voice)
+        let stealBank = MPEPolyphonicVoiceBank(sampleRate: sampleRate)
+        for noteIdx in 0..<8 {
+            let ch = UInt8(1 + (noteIdx % 15))
+            let note = UInt8(60 + noteIdx)
+            stealBank.handleMIDIMessage(status: 0x90 | ch, data1: note, data2: 100)
+        }
+        // Release voice 0 (note 60 on ch 2) so it enters .releasing state as the oldest released voice
+        stealBank.handleMIDIMessage(status: 0x81, data1: 60, data2: 0)
+
+        var stealBufL = [Float](repeating: 0.0, count: 256)
+        var stealBufR = [Float](repeating: 0.0, count: 256)
+        stealBufL.withUnsafeMutableBufferPointer { lPtr in
+            stealBufR.withUnsafeMutableBufferPointer { rPtr in
+                stealBank.renderAndAccumulate(
+                    leftOutput: lPtr.baseAddress!,
+                    rightOutput: rPtr.baseAddress!,
+                    frameCount: 64,
+                    baseCutoffHz: 2400.0,
+                    resonance: 0.3,
+                    masterGain: 0.8
+                )
+                // Trigger 9th note (note 72 on ch 10): must deterministically steal voice 0 with 2.5ms raised-cosine crossfade
+                stealBank.handleMIDIMessage(status: 0x99, data1: 72, data2: 118)
+                stealBank.renderAndAccumulate(
+                    leftOutput: lPtr.baseAddress!.advanced(by: 64),
+                    rightOutput: rPtr.baseAddress!.advanced(by: 64),
+                    frameCount: 192,
+                    baseCutoffHz: 2400.0,
+                    resonance: 0.3,
+                    masterGain: 0.8
+                )
+            }
+        }
+
+        #expect(stealBank.totalVoiceStealCount == 1)
+        #expect(stealBank.lastStolenVoiceIndex == 0)
+        #expect(stealBufL.allSatisfy { $0.isFinite && abs($0) <= 1.05 })
+        #expect(stealBufR.allSatisfy { $0.isFinite && abs($0) <= 1.05 })
+        #endif
+    }
+}
+
+private struct ScheduledSliceTestEvent {
+    enum Kind {
+        case midi(status: UInt8, data1: UInt8, data2: UInt8)
+        case parameterRamp(address: UInt64, targetValue: Float, durationFrames: Int)
+    }
+    let sampleOffset: Int
+    let kind: Kind
 }
 
 private final class LockedCommandBox: @unchecked Sendable {
