@@ -1161,3 +1161,242 @@ public struct DMRGVariationalOptimizer: Sendable {
         return ritzGround
     }
 }
+
+// MARK: - 4. QR / LQ Canonicalization & Multimodal Bio-Acoustic Control Extraction
+
+public struct OptimalBioAcousticControl: Codable, Sendable, Equatable {
+    public let recommendedBinauralBeatHz: Float
+    public let recommendedCarrierHz: Float
+    public let recommendedTZFMIndex: Float
+    public let recommendedHRTFOrbitSpeed: Float
+    public let recommendedFDTDWaveguideStiffness: Float
+    public let centralEntanglementEntropy: Float
+    public let renyi2Purity: Float
+    public let groundStateEnergy: Float
+
+    public init(
+        recommendedBinauralBeatHz: Float,
+        recommendedCarrierHz: Float,
+        recommendedTZFMIndex: Float,
+        recommendedHRTFOrbitSpeed: Float,
+        recommendedFDTDWaveguideStiffness: Float,
+        centralEntanglementEntropy: Float,
+        renyi2Purity: Float,
+        groundStateEnergy: Float
+    ) {
+        self.recommendedBinauralBeatHz = recommendedBinauralBeatHz
+        self.recommendedCarrierHz = recommendedCarrierHz
+        self.recommendedTZFMIndex = recommendedTZFMIndex
+        self.recommendedHRTFOrbitSpeed = recommendedHRTFOrbitSpeed
+        self.recommendedFDTDWaveguideStiffness = recommendedFDTDWaveguideStiffness
+        self.centralEntanglementEntropy = centralEntanglementEntropy
+        self.renyi2Purity = renyi2Purity
+        self.groundStateEnergy = groundStateEnergy
+    }
+}
+
+extension MatrixProductStateEngine {
+    /// Performs thin Modified Gram-Schmidt QR factorization `A = Q * R` (`Q` is `rows x k` column-orthonormal, `R` is `k x cols` upper-triangular).
+    public static func qrOrthogonalize(
+        matrix: [Double],
+        rows: Int,
+        cols: Int
+    ) -> (q: [Double], r: [Double], rank: Int) {
+        let k = min(rows, cols)
+        guard rows > 0, cols > 0, matrix.count == rows * cols else {
+            return ([], [], 0)
+        }
+
+        var qCols = [[Double]](repeating: [Double](repeating: 0.0, count: rows), count: k)
+        var rMat = [Double](repeating: 0.0, count: k * cols)
+
+        for j in 0..<cols {
+            var v = [Double](repeating: 0.0, count: rows)
+            for r in 0..<rows {
+                v[r] = matrix[r * cols + j]
+            }
+
+            let limit = min(j, k)
+            // Two-pass Modified Gram-Schmidt for machine-precision orthogonality
+            for pass in 0..<2 {
+                for i in 0..<limit {
+                    var dot = 0.0
+                    for r in 0..<rows {
+                        dot += qCols[i][r] * v[r]
+                    }
+                    rMat[i * cols + j] += dot
+                    for r in 0..<rows {
+                        v[r] -= dot * qCols[i][r]
+                    }
+                    _ = pass
+                }
+            }
+
+            if j < k {
+                var normSq = 0.0
+                for r in 0..<rows { normSq += v[r] * v[r] }
+                let norm = sqrt(max(0.0, normSq))
+                rMat[j * cols + j] = norm
+                if norm > 1e-13 {
+                    let invNorm = 1.0 / norm
+                    for r in 0..<rows {
+                        qCols[j][r] = v[r] * invNorm
+                    }
+                } else {
+                    qCols[j][j % rows] = 1.0
+                }
+            }
+        }
+
+        var qFlat = [Double](repeating: 0.0, count: rows * k)
+        for r in 0..<rows {
+            for c in 0..<k {
+                qFlat[r * k + c] = qCols[c][r]
+            }
+        }
+        return (qFlat, rMat, k)
+    }
+
+    /// Performs thin LQ factorization `A = L * Q` (`L` is `rows x k` lower-triangular, `Q` is `k x cols` row-orthonormal).
+    public static func lqOrthogonalize(
+        matrix: [Double],
+        rows: Int,
+        cols: Int
+    ) -> (l: [Double], q: [Double], rank: Int) {
+        guard rows > 0, cols > 0, matrix.count == rows * cols else {
+            return ([], [], 0)
+        }
+        var transposed = [Double](repeating: 0.0, count: cols * rows)
+        for r in 0..<rows {
+            for c in 0..<cols {
+                transposed[c * rows + r] = matrix[r * cols + c]
+            }
+        }
+        let qr = qrOrthogonalize(matrix: transposed, rows: cols, cols: rows)
+        let k = qr.rank
+        var lMat = [Double](repeating: 0.0, count: rows * k)
+        var qMat = [Double](repeating: 0.0, count: k * cols)
+        for r in 0..<rows {
+            for c in 0..<k {
+                lMat[r * k + c] = qr.r[c * rows + r]
+            }
+        }
+        for r in 0..<k {
+            for c in 0..<cols {
+                qMat[r * cols + c] = qr.q[c * k + r]
+            }
+        }
+        return (lMat, qMat, k)
+    }
+
+    /// Encodes 6 multimodal physiological & acoustic state vectors (`d_k = 4` per site) into a normalized
+    /// 6-site entangled state vector of dimension `4^6 = 4096` with tunable bio-acoustic coupling strength.
+    public static func encodeBioAcousticStateTensor(
+        eegCorticalBands4: SIMD4<Float>,
+        hrvVagalMetrics4: SIMD4<Float>,
+        spwvdEntropyState4: SIMD4<Float>,
+        binauralOscillatorState4: SIMD4<Float>,
+        hrtfFDTDWavefield4: SIMD4<Float>,
+        circadianKalmanPhase4: SIMD4<Float>,
+        entanglementCoupling: Float = 0.65
+    ) -> [Float] {
+        func normalizeSite(_ v: SIMD4<Float>) -> [Double] {
+            let d = [
+                v[0].isFinite ? max(0.01, Double(abs(v[0])) + 0.05) : 0.25,
+                v[1].isFinite ? max(0.01, Double(abs(v[1])) + 0.05) : 0.25,
+                v[2].isFinite ? max(0.01, Double(abs(v[2])) + 0.05) : 0.25,
+                v[3].isFinite ? max(0.01, Double(abs(v[3])) + 0.05) : 0.25
+            ]
+            let norm = sqrt(d.reduce(0.0) { $0 + $1 * $1 })
+            return d.map { $0 / max(1e-12, norm) }
+        }
+
+        let s0 = normalizeSite(eegCorticalBands4)
+        let s1 = normalizeSite(hrvVagalMetrics4)
+        let s2 = normalizeSite(spwvdEntropyState4)
+        let s3 = normalizeSite(binauralOscillatorState4)
+        let s4 = normalizeSite(hrtfFDTDWavefield4)
+        let s5 = normalizeSite(circadianKalmanPhase4)
+
+        let gamma = min(max(Double(entanglementCoupling), 0.0), 1.0)
+        var psi = [Double](repeating: 0.0, count: 4096)
+        var normSq = 0.0
+
+        for i0 in 0..<4 {
+            for i1 in 0..<4 {
+                for i2 in 0..<4 {
+                    let bioMode = (i0 + i1 + i2) % 4
+                    for i3 in 0..<4 {
+                        for i4 in 0..<4 {
+                            for i5 in 0..<4 {
+                                let acoMode = (i3 + i4 + i5) % 4
+                                let idx = (((((i0 * 4 + i1) * 4 + i2) * 4 + i3) * 4 + i4) * 4) + i5
+                                let prodAmp = s0[i0] * s1[i1] * s2[i2] * s3[i3] * s4[i4] * s5[i5]
+                                let bellResonance = (bioMode == acoMode) ? (1.0 + 1.5 * gamma) : (1.0 - 0.55 * gamma)
+                                let amp = prodAmp * bellResonance
+                                psi[idx] = amp
+                                normSq += amp * amp
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let invNorm = 1.0 / sqrt(max(1e-30, normSq))
+        return psi.map { Float($0 * invNorm) }
+    }
+}
+
+extension DMRGVariationalOptimizer {
+    /// Extracts optimal acoustic synthesis control parameters from a DMRG-converged 6-site Matrix Product State.
+    public static func extractOptimalBioAcousticControl(
+        from mps: MatrixProductStateEngine
+    ) -> OptimalBioAcousticControl {
+        let telemetry = mps.evaluateEntanglement()
+        let groundEnergy = Float(mps.expectationValueNearestNeighborXXZ(anisotropyDelta: 1.0))
+
+        // Extract single-site reduced marginal probabilities on Acoustic Sites 3, 4, 5 (0-indexed: 3, 4, 5)
+        func siteExpectation(_ siteIndex: Int) -> Float {
+            guard siteIndex >= 0 && siteIndex < mps.cores.count else { return 0.5 }
+            let core = mps.cores[siteIndex]
+            var weighted = 0.0
+            var total = 0.0
+            for p in 0..<core.physicalDim {
+                var pWeight = 0.0
+                for l in 0..<core.leftBond {
+                    for r in 0..<core.rightBond {
+                        let v = core[l, p, r]
+                        pWeight += v * v
+                    }
+                }
+                weighted += Double(p) * pWeight
+                total += pWeight
+            }
+            guard total > 1e-15 else { return 0.5 }
+            return Float(min(max(weighted / (Double(max(1, core.physicalDim - 1)) * total), 0.0), 1.0))
+        }
+
+        let uBeat = siteExpectation(3)
+        let uSpace = siteExpectation(4)
+        let uPhase = siteExpectation(5)
+        let entropyNorm = min(max(telemetry.centralEntanglementEntropy / Float(log(16.0)), 0.0), 1.0)
+
+        let beatHz = 4.0 + (0.65 * uBeat + 0.35 * entropyNorm) * 14.0
+        let carrierHz = 136.1 + (0.60 * uSpace + 0.40 * uPhase) * (432.0 - 136.1)
+        let tzfmIdx = 0.35 + (0.55 * entropyNorm + 0.45 * uBeat) * 2.40
+        let orbitSpeed = 0.08 + (0.50 * uSpace + 0.50 * entropyNorm) * 0.72
+        let stiffness = 0.015 + 0.045 * uPhase
+
+        return OptimalBioAcousticControl(
+            recommendedBinauralBeatHz: beatHz,
+            recommendedCarrierHz: carrierHz,
+            recommendedTZFMIndex: tzfmIdx,
+            recommendedHRTFOrbitSpeed: orbitSpeed,
+            recommendedFDTDWaveguideStiffness: stiffness,
+            centralEntanglementEntropy: telemetry.centralEntanglementEntropy,
+            renyi2Purity: telemetry.renyi2Purity,
+            groundStateEnergy: groundEnergy
+        )
+    }
+}

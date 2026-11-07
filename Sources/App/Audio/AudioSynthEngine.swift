@@ -35,6 +35,14 @@ public struct SynthParameters: Sendable, Equatable {
     public var latentGuidanceScale: Float      // [1.0 ... 4.0] Rectified-Flow Classifier-Free Guidance scale
     public var latentTemperature: Float        // [0.1 ... 2.0] Gaussian prior latent entropy temperature
     public var rayTracedAcousticsEnabled: Bool // Enables Metal/SAH-BVH ray-traced 512-tap DRIR convolution
+    public var reverbWetMix: Float             // [0.0 ... 1.0] 8-Channel Hadamard FDN Reverb wet mix
+    public var reverbDecaySeconds: Float       // [0.2 ... 12.0] 8-Channel Hadamard FDN RT60 decay
+    public var reverbDamping: Float            // [0.02 ... 0.96] FDN high-frequency damping
+    public var fmModulationIndex: Float        // [0.0 ... 8.0] 4-Operator Through-Zero FM index
+    public var fmHarmonicRatio: Float          // [0.25 ... 8.0] 4-Operator TZFM harmonic ratio
+    public var fmMix: Float                    // [0.0 ... 1.0] 4-Operator TZFM voice mix
+    public var fdtdResonatorMix: Float         // [0.0 ... 1.0] 24x24 SIMD4 2D FDTD physical plate resonator mix
+    public var fdtdStiffness: Float            // [0.0 ... 1.0] 2D FDTD biharmonic stiffness kappa
     public var isMuted: Bool
 
     public init(
@@ -61,6 +69,14 @@ public struct SynthParameters: Sendable, Equatable {
         latentGuidanceScale: Float = 2.2,
         latentTemperature: Float = 0.85,
         rayTracedAcousticsEnabled: Bool = false,
+        reverbWetMix: Float = 0.22,
+        reverbDecaySeconds: Float = 2.4,
+        reverbDamping: Float = 0.38,
+        fmModulationIndex: Float = 1.6,
+        fmHarmonicRatio: Float = 2.0,
+        fmMix: Float = 0.0,
+        fdtdResonatorMix: Float = 0.0,
+        fdtdStiffness: Float = 0.22,
         isMuted: Bool = false
     ) {
         self.carrierFrequencyHz = min(max(carrierFrequencyHz, 60.0), 880.0)
@@ -86,6 +102,14 @@ public struct SynthParameters: Sendable, Equatable {
         self.latentGuidanceScale = min(max(latentGuidanceScale, 1.0), 4.0)
         self.latentTemperature = min(max(latentTemperature, 0.1), 2.0)
         self.rayTracedAcousticsEnabled = rayTracedAcousticsEnabled
+        self.reverbWetMix = min(max(reverbWetMix, 0.0), 1.0)
+        self.reverbDecaySeconds = min(max(reverbDecaySeconds, 0.2), 12.0)
+        self.reverbDamping = min(max(reverbDamping, 0.02), 0.96)
+        self.fmModulationIndex = min(max(fmModulationIndex, 0.0), 8.0)
+        self.fmHarmonicRatio = min(max(fmHarmonicRatio, 0.25), 8.0)
+        self.fmMix = min(max(fmMix, 0.0), 1.0)
+        self.fdtdResonatorMix = min(max(fdtdResonatorMix, 0.0), 1.0)
+        self.fdtdStiffness = min(max(fdtdStiffness, 0.0), 1.0)
         self.isMuted = isMuted
     }
 
@@ -138,10 +162,25 @@ public struct AudioTelemetrySnapshot: Sendable, Equatable {
 
 public struct ProceduralSynthKernel: Sendable {
     private static let spatialChunkCapacity: Int = 512
+    private static let wfsDelayCapacity: Int = 16_384
+    private static let wfsDelayMask: Int = 16_383
 
     public let sampleRate: Double
     private let invSampleRate: Double
     private let twoPi: Double = .pi * 2.0
+
+    // Phase 8 Distributed Multi-Peer Orchestra PLL & Wave-Field Synthesis (WFS) Controls
+    public var pllSampleRateScale: Double = 1.0
+    public var wfsDelaySamples: Double = 0.0
+    public var wfsGainScale: Float = 1.0
+    public var masterPhaseSyncTarget: Double? = nil
+    public private(set) var renderedVirtualTimeSeconds: Double = 0.0
+
+    public var binauralEnvelopePhase: Double {
+        var diff = phaseBinauralRight - phaseBinauralLeft
+        diff -= floor(diff)
+        return diff
+    }
 
     // Binaural phase accumulators (Double precision prevents long-session drift)
     private var phaseBinauralLeft: Double = 0.0
@@ -189,6 +228,13 @@ public struct ProceduralSynthKernel: Sendable {
     private var smoothNeuralMix: Float = 0.0
     private var smoothRayTracedMix: Float = 0.0
 
+    // Phase 3 & Phase 9 Pre-Allocated 8-Line Hadamard FDN Reverb, 4-Op Through-Zero FM & 24x24 SIMD4 FDTD Resonator
+    private var fdnReverb: HadamardFDNReverbKernel
+    private var tzfmVoice: FourOpTZFMVoiceKernel
+    private var fdtdResonator: RealtimeFDTDResonatorKernel
+    private var smoothFMMix: Float = 0.0
+    private var smoothFDTDMix: Float = 0.0
+
     // Phase 6 Pre-Allocated KEMAR HRTF UPOLS Convolver, 3D Shoebox ISM + FDN & Multi-Satellite Spatializer
     private var hrtfConvolver: SpatialHRTFConvolver
     private var roomSimulator: ShoeboxRoomSimulator
@@ -207,6 +253,13 @@ public struct ProceduralSynthKernel: Sendable {
     private var drirWetLeftScratch: [Float]
     private var drirWetRightScratch: [Float]
 
+    // Phase 8 Pre-Allocated 3rd-Order Lagrange Fractional Delay Line for Acoustic Wave-Field Synthesis (WFS)
+    private var wfsDelayLeft: [Float]
+    private var wfsDelayRight: [Float]
+    private var wfsWriteHead: Int = 0
+    private var smoothWFSDelaySamples: Double = 0.0
+    private var smoothWFSGain: Float = 1.0
+
     public init(sampleRate: Double, snapInitialParameters: SynthParameters? = nil) {
         let safeRate = max(8_000.0, sampleRate)
         self.sampleRate = safeRate
@@ -218,6 +271,10 @@ public struct ProceduralSynthKernel: Sendable {
             distanceMeters: snapInitialParameters?.hrtfDistanceMeters ?? 1.4
         )
         let initialRoom = ShoeboxRoomPreset(rawValue: snapInitialParameters?.roomPresetIndex ?? 1) ?? .obsidianStudio
+
+        self.fdnReverb = HadamardFDNReverbKernel(sampleRate: safeRate)
+        self.tzfmVoice = FourOpTZFMVoiceKernel(sampleRate: safeRate)
+        self.fdtdResonator = RealtimeFDTDResonatorKernel(sampleRate: safeRate)
 
         self.hrtfConvolver = SpatialHRTFConvolver(sampleRate: safeRate, initialPose: initialPose)
         self.roomSimulator = ShoeboxRoomSimulator(sampleRate: safeRate, initialPreset: initialRoom, initialPose: initialPose)
@@ -236,6 +293,9 @@ public struct ProceduralSynthKernel: Sendable {
         self.drirWetLeftScratch = [Float](repeating: 0, count: Self.spatialChunkCapacity)
         self.drirWetRightScratch = [Float](repeating: 0, count: Self.spatialChunkCapacity)
 
+        self.wfsDelayLeft = [Float](repeating: 0, count: Self.wfsDelayCapacity)
+        self.wfsDelayRight = [Float](repeating: 0, count: Self.wfsDelayCapacity)
+
         if let initial = snapInitialParameters {
             self.smoothCarrierHz = initial.carrierFrequencyHz
             self.smoothBeatHz = initial.binauralBeatHz
@@ -251,6 +311,8 @@ public struct ProceduralSynthKernel: Sendable {
             self.smoothElevationTilt = initial.headElevationTilt
             self.smoothNeuralMix = initial.isMuted ? 0.0 : (initial.neuralSoundscapeMix * initial.masterGain)
             self.smoothRayTracedMix = (initial.rayTracedAcousticsEnabled && !initial.isMuted) ? 0.36 : 0.0
+            self.smoothFMMix = initial.isMuted ? 0.0 : initial.fmMix
+            self.smoothFDTDMix = initial.isMuted ? 0.0 : initial.fdtdResonatorMix
         }
     }
 
@@ -347,9 +409,66 @@ public struct ProceduralSynthKernel: Sendable {
             )
         }
 
+        let wantsFM = !target.isMuted && (target.fmMix > 0.0005 || smoothFMMix > 0.0005)
+        let wantsFDTD = !target.isMuted && (target.fdtdResonatorMix > 0.0005 || smoothFDTDMix > 0.0005)
+        let wantsFDN = !target.isHRTFSpatializerEnabled && !target.isMuted && target.reverbWetMix > 0.0005
+        if wantsFM || wantsFDTD || wantsFDN {
+            if wantsFDTD {
+                fdtdResonator.detachCopyIfShared()
+            }
+            let postSlew = Float(min(1.0, 35.0 * invSampleRate))
+            let targetFMMix: Float = target.isMuted ? 0.0 : target.fmMix
+            let targetFDTDMix: Float = target.isMuted ? 0.0 : target.fdtdResonatorMix
+            for i in 0..<frameCount {
+                var l = leftOutput[i]
+                var r = rightOutput[i]
+                if wantsFM {
+                    smoothFMMix += postSlew * (targetFMMix - smoothFMMix)
+                    let fmPair = tzfmVoice.nextStereoSample(
+                        fundamentalHz: Double(smoothCarrierHz),
+                        harmonicRatio: target.fmHarmonicRatio,
+                        modulationIndex: target.fmModulationIndex
+                    )
+                    l += fmPair.0 * smoothFMMix * smoothMasterGain * 0.45
+                    r += fmPair.1 * smoothFMMix * smoothMasterGain * 0.45
+                }
+                if wantsFDTD {
+                    smoothFDTDMix += postSlew * (targetFDTDMix - smoothFDTDMix)
+                    let excite = 0.5 * (l + r)
+                    let fdtdPair = fdtdResonator.stepSample(
+                        excitation: excite,
+                        waveSpeed: 280.0 + smoothCutoffHz * 0.04,
+                        stiffnessKappa: target.fdtdStiffness,
+                        dampingSigma: 1.4
+                    )
+                    l = l * (1.0 - 0.35 * smoothFDTDMix) + fdtdPair.0 * smoothFDTDMix
+                    r = r * (1.0 - 0.35 * smoothFDTDMix) + fdtdPair.1 * smoothFDTDMix
+                }
+                if wantsFDN {
+                    let revPair = fdnReverb.processStereoSample(
+                        leftIn: l,
+                        rightIn: r,
+                        wetMix: target.reverbWetMix,
+                        decaySeconds: target.reverbDecaySeconds,
+                        damping: target.reverbDamping
+                    )
+                    l = revPair.0
+                    r = revPair.1
+                }
+                leftOutput[i] = fastSoftClip(l)
+                rightOutput[i] = fastSoftClip(r)
+            }
+        }
+
         let wantsNeural = neuralRingBuffer != nil && (target.neuralSoundscapeMix > 0.0001 || smoothNeuralMix > 0.0001)
         let wantsRayTraced = drirConvolverBridge != nil && (target.rayTracedAcousticsEnabled || smoothRayTracedMix > 0.0001)
-        guard wantsNeural || wantsRayTraced else {
+        let wantsWFS = wfsDelaySamples > 1.0e-5 || abs(wfsGainScale - 1.0) > 1.0e-5 || smoothWFSDelaySamples > 1.0e-4 || abs(smoothWFSGain - 1.0) > 1.0e-4
+        guard wantsNeural || wantsRayTraced || wantsWFS else {
+            return baseSnapshot
+        }
+
+        if wantsWFS && !wantsNeural && !wantsRayTraced {
+            applyWaveFieldFractionalDelay(leftInOut: leftOutput, rightInOut: rightOutput, frameCount: frameCount)
             return baseSnapshot
         }
 
@@ -459,6 +578,10 @@ public struct ProceduralSynthKernel: Sendable {
         drirWetLeftScratch = localWetL
         drirWetRightScratch = localWetR
 
+        if wantsWFS {
+            applyWaveFieldFractionalDelay(leftInOut: leftOutput, rightInOut: rightOutput, frameCount: frameCount)
+        }
+
         let invCount = 1.0 / Float(frameCount)
         let rms = sqrt(sumSquares * invCount)
         return AudioTelemetrySnapshot(
@@ -468,6 +591,73 @@ public struct ProceduralSynthKernel: Sendable {
             highBandEnergy: min(max(highAccum * invCount * 3.0, 0.0), 1.0),
             isRendering: baseSnapshot.isRendering || smoothNeuralMix > 0.001
         )
+    }
+
+    /// Applies 4-point 3rd-order Cubic Lagrange fractional-sample Time-of-Flight delay and Rayleigh WFS driving gain.
+    /// Operates on pre-allocated `wfsDelayLeft` / `wfsDelayRight` buffers with zero heap allocations.
+    private mutating func applyWaveFieldFractionalDelay(
+        leftInOut: UnsafeMutablePointer<Float>,
+        rightInOut: UnsafeMutablePointer<Float>,
+        frameCount: Int
+    ) {
+        var dLineL = wfsDelayLeft
+        var dLineR = wfsDelayRight
+        wfsDelayLeft = []
+        wfsDelayRight = []
+
+        let mask = Self.wfsDelayMask
+        let maxDelay = Double(Self.wfsDelayCapacity - 8)
+        let targetDelay = min(max(wfsDelaySamples, 0.0), maxDelay)
+        let targetGain = min(max(wfsGainScale, 0.0), 2.0)
+        let slew = min(1.0, 25.0 * invSampleRate)
+        let slewF = Float(slew)
+
+        var head = wfsWriteHead
+        for i in 0..<frameCount {
+            smoothWFSDelaySamples += slew * (targetDelay - smoothWFSDelaySamples)
+            smoothWFSGain += slewF * (targetGain - smoothWFSGain)
+
+            dLineL[head] = leftInOut[i]
+            dLineR[head] = rightInOut[i]
+
+            let d = min(max(smoothWFSDelaySamples, 0.0), maxDelay)
+            let dInt = Int(d)
+            let frac = Float(d - Double(dInt))
+
+            if dInt == 0 && frac < 1.0e-5 {
+                leftInOut[i] = fastSoftClip(leftInOut[i] * smoothWFSGain)
+                rightInOut[i] = fastSoftClip(rightInOut[i] * smoothWFSGain)
+            } else {
+                // 4-point 3rd-order Lagrange interpolation around [dInt - 1, dInt, dInt + 1, dInt + 2]
+                let baseTap = max(1, dInt)
+                let idx0 = (head - (baseTap - 1) + Self.wfsDelayCapacity) & mask
+                let idx1 = (head - baseTap + Self.wfsDelayCapacity) & mask
+                let idx2 = (head - (baseTap + 1) + Self.wfsDelayCapacity) & mask
+                let idx3 = (head - (baseTap + 2) + Self.wfsDelayCapacity) & mask
+
+                let mu = dInt == 0 ? frac : (frac + 1.0)
+                let muMinus1 = mu - 1.0
+                let muMinus2 = mu - 2.0
+                let muMinus3 = mu - 3.0
+
+                let c0 = -muMinus1 * muMinus2 * muMinus3 * (1.0 / 6.0)
+                let c1 =  mu * muMinus2 * muMinus3 * 0.5
+                let c2 = -mu * muMinus1 * muMinus3 * 0.5
+                let c3 =  mu * muMinus1 * muMinus2 * (1.0 / 6.0)
+
+                let delayedL = c0 * dLineL[idx0] + c1 * dLineL[idx1] + c2 * dLineL[idx2] + c3 * dLineL[idx3]
+                let delayedR = c0 * dLineR[idx0] + c1 * dLineR[idx1] + c2 * dLineR[idx2] + c3 * dLineR[idx3]
+
+                leftInOut[i] = fastSoftClip(delayedL * smoothWFSGain)
+                rightInOut[i] = fastSoftClip(delayedR * smoothWFSGain)
+            }
+
+            head = (head + 1) & mask
+        }
+
+        wfsWriteHead = head
+        wfsDelayLeft = dLineL
+        wfsDelayRight = dLineR
     }
 
     // MARK: - Legacy Constant-Power Stereo Path (Bit-Exact Backward Compatibility)
@@ -480,6 +670,8 @@ public struct ProceduralSynthKernel: Sendable {
     ) -> AudioTelemetrySnapshot {
         let slewCoeff = Float(min(1.0, 35.0 * invSampleRate))
         let targetGain: Float = target.isMuted ? 0.0 : target.masterGain
+        let clampedPLL = min(max(pllSampleRateScale, 0.9990), 1.0010)
+        let effectiveInvSampleRate = invSampleRate * clampedPLL
 
         var sumSquares: Float = 0.0
         var peak: Float = 0.0
@@ -511,14 +703,21 @@ public struct ProceduralSynthKernel: Sendable {
             let binauralL = Float(sin(twoPi * phaseBinauralLeft))
             let binauralR = Float(sin(twoPi * phaseBinauralRight))
 
-            advancePhase(&phaseBinauralLeft, delta: freqLeft * invSampleRate)
-            advancePhase(&phaseBinauralRight, delta: freqRight * invSampleRate)
-            advancePhase(&phaseSubFundamental, delta: (carrier * 0.5) * invSampleRate)
+            advancePhase(&phaseBinauralLeft, delta: freqLeft * effectiveInvSampleRate)
+            advancePhase(&phaseBinauralRight, delta: freqRight * effectiveInvSampleRate)
+            advancePhase(&phaseSubFundamental, delta: (carrier * 0.5) * effectiveInvSampleRate)
+            renderedVirtualTimeSeconds += effectiveInvSampleRate
 
+            if let syncTarget = masterPhaseSyncTarget {
+                var phaseErr = syncTarget - lfoPhasePrimary
+                phaseErr -= (phaseErr + 0.5).rounded(.down)
+                advancePhase(&lfoPhasePrimary, delta: 0.083 * effectiveInvSampleRate + phaseErr * 0.0005)
+            } else {
+                advancePhase(&lfoPhasePrimary, delta: 0.083 * effectiveInvSampleRate)
+            }
             let lfoA = Float(sin(twoPi * lfoPhasePrimary))
             let lfoB = Float(cos(twoPi * lfoPhaseSecondary))
-            advancePhase(&lfoPhasePrimary, delta: 0.083 * invSampleRate)
-            advancePhase(&lfoPhaseSecondary, delta: 0.137 * invSampleRate)
+            advancePhase(&lfoPhaseSecondary, delta: 0.137 * effectiveInvSampleRate)
 
             var padL: Float = 0.0
             var padR: Float = 0.0
@@ -546,17 +745,17 @@ public struct ProceduralSynthKernel: Sendable {
                 padL = fastSoftClip(rawPadL * 1.35) * 0.68
                 padR = fastSoftClip(rawPadR * 1.35) * 0.68
 
-                advancePhase(&padPhasesLeft.0, delta: carrier * r0 * detuneRatioDown * invSampleRate)
-                advancePhase(&padPhasesLeft.1, delta: carrier * r1 * detuneRatioUp * invSampleRate)
-                advancePhase(&padPhasesLeft.2, delta: carrier * r2 * detuneRatioDown * invSampleRate)
-                advancePhase(&padPhasesLeft.3, delta: carrier * r3 * detuneRatioUp * invSampleRate)
-                advancePhase(&padPhasesLeft.4, delta: carrier * r4 * detuneRatioDown * invSampleRate)
+                advancePhase(&padPhasesLeft.0, delta: carrier * r0 * detuneRatioDown * effectiveInvSampleRate)
+                advancePhase(&padPhasesLeft.1, delta: carrier * r1 * detuneRatioUp * effectiveInvSampleRate)
+                advancePhase(&padPhasesLeft.2, delta: carrier * r2 * detuneRatioDown * effectiveInvSampleRate)
+                advancePhase(&padPhasesLeft.3, delta: carrier * r3 * detuneRatioUp * effectiveInvSampleRate)
+                advancePhase(&padPhasesLeft.4, delta: carrier * r4 * detuneRatioDown * effectiveInvSampleRate)
 
-                advancePhase(&padPhasesRight.0, delta: carrier * r0 * detuneRatioUp * invSampleRate)
-                advancePhase(&padPhasesRight.1, delta: carrier * r1 * detuneRatioDown * invSampleRate)
-                advancePhase(&padPhasesRight.2, delta: carrier * r2 * detuneRatioUp * invSampleRate)
-                advancePhase(&padPhasesRight.3, delta: carrier * r3 * detuneRatioDown * invSampleRate)
-                advancePhase(&padPhasesRight.4, delta: carrier * r4 * detuneRatioUp * invSampleRate)
+                advancePhase(&padPhasesRight.0, delta: carrier * r0 * detuneRatioUp * effectiveInvSampleRate)
+                advancePhase(&padPhasesRight.1, delta: carrier * r1 * detuneRatioDown * effectiveInvSampleRate)
+                advancePhase(&padPhasesRight.2, delta: carrier * r2 * detuneRatioUp * effectiveInvSampleRate)
+                advancePhase(&padPhasesRight.3, delta: carrier * r3 * detuneRatioDown * effectiveInvSampleRate)
+                advancePhase(&padPhasesRight.4, delta: carrier * r4 * detuneRatioUp * effectiveInvSampleRate)
             }
 
             var noiseL: Float = 0.0
@@ -650,6 +849,8 @@ public struct ProceduralSynthKernel: Sendable {
     ) -> AudioTelemetrySnapshot {
         let slewCoeff = Float(min(1.0, 35.0 * invSampleRate))
         let targetGain: Float = target.isMuted ? 0.0 : target.masterGain
+        let clampedPLL = min(max(pllSampleRateScale, 0.9990), 1.0010)
+        let effectiveInvSampleRate = invSampleRate * clampedPLL
 
         var sumSquares: Float = 0.0
         var peak: Float = 0.0
@@ -717,14 +918,21 @@ public struct ProceduralSynthKernel: Sendable {
 
                 let binauralL = Float(sin(twoPi * phaseBinauralLeft))
                 let binauralR = Float(sin(twoPi * phaseBinauralRight))
-                advancePhase(&phaseBinauralLeft, delta: freqLeft * invSampleRate)
-                advancePhase(&phaseBinauralRight, delta: freqRight * invSampleRate)
-                advancePhase(&phaseSubFundamental, delta: (carrier * 0.5) * invSampleRate)
+                advancePhase(&phaseBinauralLeft, delta: freqLeft * effectiveInvSampleRate)
+                advancePhase(&phaseBinauralRight, delta: freqRight * effectiveInvSampleRate)
+                advancePhase(&phaseSubFundamental, delta: (carrier * 0.5) * effectiveInvSampleRate)
+                renderedVirtualTimeSeconds += effectiveInvSampleRate
 
+                if let syncTarget = masterPhaseSyncTarget {
+                    var phaseErr = syncTarget - lfoPhasePrimary
+                    phaseErr -= (phaseErr + 0.5).rounded(.down)
+                    advancePhase(&lfoPhasePrimary, delta: 0.083 * effectiveInvSampleRate + phaseErr * 0.0005)
+                } else {
+                    advancePhase(&lfoPhasePrimary, delta: 0.083 * effectiveInvSampleRate)
+                }
                 let lfoA = Float(sin(twoPi * lfoPhasePrimary))
                 let lfoB = Float(cos(twoPi * lfoPhaseSecondary))
-                advancePhase(&lfoPhasePrimary, delta: 0.083 * invSampleRate)
-                advancePhase(&lfoPhaseSecondary, delta: 0.137 * invSampleRate)
+                advancePhase(&lfoPhaseSecondary, delta: 0.137 * effectiveInvSampleRate)
 
                 var padMono: Float = 0.0
                 if smoothPadMix > 0.0005 {
@@ -749,17 +957,17 @@ public struct ProceduralSynthKernel: Sendable {
                     let rawPadR = (v0R * 0.34 + v1R * 0.26 + v2R * 0.22 + v3R * (0.16 + 0.06 * lfoB) + v4R * (0.12 + 0.05 * lfoA) + subWarmth) * bloomGain
                     padMono = fastSoftClip((rawPadL + rawPadR) * 0.675) * 0.68
 
-                    advancePhase(&padPhasesLeft.0, delta: carrier * r0 * detuneRatioDown * invSampleRate)
-                    advancePhase(&padPhasesLeft.1, delta: carrier * r1 * detuneRatioUp * invSampleRate)
-                    advancePhase(&padPhasesLeft.2, delta: carrier * r2 * detuneRatioDown * invSampleRate)
-                    advancePhase(&padPhasesLeft.3, delta: carrier * r3 * detuneRatioUp * invSampleRate)
-                    advancePhase(&padPhasesLeft.4, delta: carrier * r4 * detuneRatioDown * invSampleRate)
+                    advancePhase(&padPhasesLeft.0, delta: carrier * r0 * detuneRatioDown * effectiveInvSampleRate)
+                    advancePhase(&padPhasesLeft.1, delta: carrier * r1 * detuneRatioUp * effectiveInvSampleRate)
+                    advancePhase(&padPhasesLeft.2, delta: carrier * r2 * detuneRatioDown * effectiveInvSampleRate)
+                    advancePhase(&padPhasesLeft.3, delta: carrier * r3 * detuneRatioUp * effectiveInvSampleRate)
+                    advancePhase(&padPhasesLeft.4, delta: carrier * r4 * detuneRatioDown * effectiveInvSampleRate)
 
-                    advancePhase(&padPhasesRight.0, delta: carrier * r0 * detuneRatioUp * invSampleRate)
-                    advancePhase(&padPhasesRight.1, delta: carrier * r1 * detuneRatioDown * invSampleRate)
-                    advancePhase(&padPhasesRight.2, delta: carrier * r2 * detuneRatioUp * invSampleRate)
-                    advancePhase(&padPhasesRight.3, delta: carrier * r3 * detuneRatioDown * invSampleRate)
-                    advancePhase(&padPhasesRight.4, delta: carrier * r4 * detuneRatioUp * invSampleRate)
+                    advancePhase(&padPhasesRight.0, delta: carrier * r0 * detuneRatioUp * effectiveInvSampleRate)
+                    advancePhase(&padPhasesRight.1, delta: carrier * r1 * detuneRatioDown * effectiveInvSampleRate)
+                    advancePhase(&padPhasesRight.2, delta: carrier * r2 * detuneRatioUp * effectiveInvSampleRate)
+                    advancePhase(&padPhasesRight.3, delta: carrier * r3 * detuneRatioDown * effectiveInvSampleRate)
+                    advancePhase(&padPhasesRight.4, delta: carrier * r4 * detuneRatioUp * effectiveInvSampleRate)
                 }
 
                 var noiseMono: Float = 0.0
@@ -897,6 +1105,7 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
     private let paramLock: UnsafeMutablePointer<os_unfair_lock_s>
     private let telemetryLock: UnsafeMutablePointer<os_unfair_lock_s>
     private var sharedParameters: SynthParameters
+    private var sharedOrchestraSync: RealtimeOrchestraSyncControl = RealtimeOrchestraSyncControl()
     private var sharedTelemetry: AudioTelemetrySnapshot
 
     private let scopeRingBuffer: UnsafeMutablePointer<Float>
@@ -961,6 +1170,12 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
         os_unfair_lock_unlock(paramLock)
     }
 
+    public func writeOrchestraSync(_ sync: RealtimeOrchestraSyncControl) {
+        os_unfair_lock_lock(paramLock)
+        sharedOrchestraSync = sync
+        os_unfair_lock_unlock(paramLock)
+    }
+
     public func readTelemetry() -> AudioTelemetrySnapshot {
         os_unfair_lock_lock(telemetryLock)
         let copy = sharedTelemetry
@@ -996,6 +1211,11 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
     ) -> OSStatus {
         if os_unfair_lock_trylock(paramLock) {
             audioThreadCachedParameters = sharedParameters
+            let sync = sharedOrchestraSync
+            dspKernel.pllSampleRateScale = sync.isMeshSyncActive ? sync.pllSampleRateScale : 1.0
+            dspKernel.wfsDelaySamples = sync.isMeshSyncActive ? sync.wfsDelaySamples : 0.0
+            dspKernel.wfsGainScale = sync.isMeshSyncActive ? sync.wfsGainScale : 1.0
+            dspKernel.masterPhaseSyncTarget = sync.isMeshSyncActive ? sync.masterPhaseSyncTarget : nil
             os_unfair_lock_unlock(paramLock)
         }
 
@@ -1224,6 +1444,10 @@ public actor AudioSynthEngine {
     public func updateOrbitalSatellites(_ bank: OrbitalSatelliteBank) {
         currentParameters.orbitalSatellites = bank
         bridge?.writeParameters(currentParameters)
+    }
+
+    public func updateOrchestraSync(_ control: RealtimeOrchestraSyncControl) {
+        bridge?.writeOrchestraSync(control)
     }
 
     public func applyPreset(_ preset: AudioPresetDTO) {

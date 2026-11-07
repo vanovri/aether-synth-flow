@@ -73,6 +73,12 @@ public struct StereoHRIRPair: Sendable, Equatable {
     public let rightTaps: [Float]
     public let itdSeconds: Float
 
+    @inline(__always)
+    public var left: [Float] { leftTaps }
+
+    @inline(__always)
+    public var right: [Float] { rightTaps }
+
     public init(leftTaps: [Float], rightTaps: [Float], itdSeconds: Float) {
         if leftTaps.count == Self.tapCount {
             self.leftTaps = leftTaps
@@ -99,6 +105,7 @@ public typealias KEMARHRIRPair = StereoHRIRPair
 // MARK: - 2. Procedural KEMAR Anthropometric HRIR Synthesizer
 
 public enum KEMARHRIRSynthesizer: Sendable {
+    public static let tapCount: Int = StereoHRIRPair.tapCount
     public static let headRadiusMeters: Float = 0.0875
     public static let speedOfSound: Float = 343.0
     public static let diffractionCutoffRadPerSec: Double = Double(343.0 / 0.0875) // w0 = c / a ≈ 3920 rad/s
@@ -160,12 +167,26 @@ public enum KEMARHRIRSynthesizer: Sendable {
         )
     }
 
+    @inline(__always)
+    public static func woodworthSchlosbergITDSeconds(
+        azimuthDeg: Float,
+        elevationDeg: Float = 0.0
+    ) -> Float {
+        computeWoodworthITD(azimuthDeg: azimuthDeg, elevationDeg: elevationDeg)
+    }
+
     /// Analytical KEMAR primary pinna spectral notch center frequency `f_N1(phi) = 6200 + 3800 * sin(phi)` Hz.
     @inline(__always)
     public static func primaryPinnaNotchFrequencyHz(elevationDeg: Float) -> Double {
         let clampedEl = min(max(Double(elevationDeg), -45.0), 90.0)
         let sinPhi = sin(clampedEl * Double.pi / 180.0)
         return 6_200.0 + 3_800.0 * sinPhi
+    }
+
+    @inline(__always)
+    public static func primaryPinnaNotchFrequencyHz(elevationRad: Float) -> Float {
+        let deg = elevationRad * (180.0 / .pi)
+        return Float(primaryPinnaNotchFrequencyHz(elevationDeg: deg))
     }
 
     /// Analytical KEMAR secondary pinna spectral notch center frequency `f_N2(phi) = 9800 + 2600 * sin(phi)` Hz.
@@ -820,6 +841,37 @@ public struct PartitionedOverlapSaveConvolver: Sendable {
         }
     }
 
+    public mutating func setHRIR(
+        leftTaps: UnsafePointer<Float>,
+        rightTaps: UnsafePointer<Float>,
+        tapCount: Int,
+        crossfade: Bool = true
+    ) {
+        if !crossfade {
+            hasProcessedSamples = false
+        }
+        setImpulseResponse(
+            leftPtr: leftTaps,
+            leftCount: tapCount,
+            rightPtr: rightTaps,
+            rightCount: tapCount
+        )
+    }
+
+    public mutating func process(
+        input: UnsafePointer<Float>,
+        leftOutput: UnsafeMutablePointer<Float>,
+        rightOutput: UnsafeMutablePointer<Float>,
+        frameCount: Int
+    ) {
+        processMonoToStereoBlock(
+            monoInput: input,
+            leftOutput: leftOutput,
+            rightOutput: rightOutput,
+            frameCount: frameCount
+        )
+    }
+
     // MARK: - Radix-2 Split-Complex FFT / IFFT (N = 256)
 
     @inline(__always)
@@ -1171,6 +1223,7 @@ public struct SpatialHRTFConvolver: Sendable {
     public let sampleRate: Double
     public private(set) var activePose: BinauralSourcePose
     public private(set) var convolver: PartitionedOverlapSaveConvolver
+    public private(set) var crossfadeCount: Int = 0
 
     // Pre-allocated 128-tap synthesis buffers (exchanged out of self during update for zero CoW allocations)
     private var stagingLeftHRIR: [Float]
@@ -1230,6 +1283,7 @@ public struct SpatialHRTFConvolver: Sendable {
         stagingLeftHRIR = localL
         stagingRightHRIR = localR
         activePose = targetPose
+        crossfadeCount &+= 1
     }
 
     public mutating func processMonoToBinaural(
@@ -1246,6 +1300,22 @@ public struct SpatialHRTFConvolver: Sendable {
             leftOutput: leftOutput,
             rightOutput: rightOutput,
             frameCount: frameCount
+        )
+    }
+
+    public mutating func processMonoToBinaural(
+        monoInput: UnsafePointer<Float>,
+        leftOutput: UnsafeMutablePointer<Float>,
+        rightOutput: UnsafeMutablePointer<Float>,
+        frameCount: Int,
+        targetPose: BinauralSourcePose
+    ) {
+        processMonoToBinaural(
+            monoInput: monoInput,
+            leftOutput: leftOutput,
+            rightOutput: rightOutput,
+            frameCount: frameCount,
+            pose: targetPose
         )
     }
 }

@@ -10,19 +10,22 @@ public struct SPWVDResult: Sendable, Equatable {
     public let tfrMatrix: [[Float]]
     public let instantaneousFreqRidgeHz: [Float]
     public let renyiEntropyBits: Float
+    public let corticalSpindlePowerRatio: Float
 
     public init(
         timeSteps: Int,
         freqBins: Int,
         tfrMatrix: [[Float]],
         instantaneousFreqRidgeHz: [Float],
-        renyiEntropyBits: Float
+        renyiEntropyBits: Float,
+        corticalSpindlePowerRatio: Float = 0.0
     ) {
         self.timeSteps = timeSteps
         self.freqBins = freqBins
         self.tfrMatrix = tfrMatrix
         self.instantaneousFreqRidgeHz = instantaneousFreqRidgeHz
         self.renyiEntropyBits = renyiEntropyBits
+        self.corticalSpindlePowerRatio = corticalSpindlePowerRatio.isFinite ? min(max(corticalSpindlePowerRatio, 0.0), 1.0) : 0.0
     }
 }
 
@@ -181,6 +184,7 @@ public enum SPWVDAnalyzer: Sendable {
 
         var sumPositiveP = 0.0
         var sumPositiveP3 = 0.0
+        var spindleBandEnergy = 0.0
 
         for timeIdx in 0..<n {
             let localMaxLag = min(maxLag, min(timeIdx, n - 1 - timeIdx))
@@ -239,6 +243,11 @@ public enum SPWVDAnalyzer: Sendable {
                 let posP = max(0.0, val)
                 sumPositiveP += posP
                 sumPositiveP3 += posP * posP * posP
+
+                let binFreqHz = (Double(k) / Double(2 * bins)) * fs
+                if binFreqHz >= 11.0 && binFreqHz <= 16.0 {
+                    spindleBandEnergy += posP
+                }
             }
 
             // Sub-bin parabolic ridge refinement
@@ -267,12 +276,17 @@ public enum SPWVDAnalyzer: Sendable {
             renyiBits = 0.0
         }
 
+        let spindleRatio = sumPositiveP > 1e-15
+            ? Float(min(max(spindleBandEnergy / sumPositiveP, 0.0), 1.0))
+            : 0.0
+
         return SPWVDResult(
             timeSteps: n,
             freqBins: bins,
             tfrMatrix: tfrMatrix,
             instantaneousFreqRidgeHz: ridgeHz,
-            renyiEntropyBits: renyiBits
+            renyiEntropyBits: renyiBits,
+            corticalSpindlePowerRatio: spindleRatio
         )
     }
 
@@ -348,30 +362,67 @@ public enum SPWVDAnalyzer: Sendable {
 
 // MARK: - 2. Hilbert-Huang Empirical Mode Decomposition (Thomas O(N) Natural Cubic Spline Sifter)
 
+public struct IMFAnalytics: Sendable, Equatable {
+    public let imfIndex: Int
+    public let samples: [Float]
+    public let instantaneousPhaseRad: [Float]
+    public let instantaneousFrequencyHz: [Float]
+    public let instantaneousEnergy: [Float]
+    public let meanFrequencyHz: Float
+    public let totalEnergy: Float
+
+    public init(
+        imfIndex: Int,
+        samples: [Float],
+        instantaneousPhaseRad: [Float],
+        instantaneousFrequencyHz: [Float],
+        instantaneousEnergy: [Float],
+        meanFrequencyHz: Float,
+        totalEnergy: Float
+    ) {
+        self.imfIndex = imfIndex
+        self.samples = samples
+        self.instantaneousPhaseRad = instantaneousPhaseRad
+        self.instantaneousFrequencyHz = instantaneousFrequencyHz
+        self.instantaneousEnergy = instantaneousEnergy
+        self.meanFrequencyHz = meanFrequencyHz
+        self.totalEnergy = totalEnergy
+    }
+}
+
 public struct HilbertHuangResult: Sendable, Equatable {
     public let imfs: [[Float]]
     public let residual: [Float]
     public let maxReconstructionError: Float
+    public let imfAnalytics: [IMFAnalytics]
+    public let orthogonalityIndex: Float
 
     public init(
         imfs: [[Float]],
         residual: [Float],
-        maxReconstructionError: Float
+        maxReconstructionError: Float,
+        imfAnalytics: [IMFAnalytics] = [],
+        orthogonalityIndex: Float = 0.0
     ) {
         self.imfs = imfs
         self.residual = residual
         self.maxReconstructionError = maxReconstructionError
+        self.imfAnalytics = imfAnalytics
+        self.orthogonalityIndex = orthogonalityIndex
     }
 }
 
 public enum HilbertHuangSifter: Sendable {
     /// Decomposes an arbitrary non-stationary signal into Intrinsic Mode Functions (`imfs`) and a monotonic/slow
     /// `residual` via Empirical Mode Decomposition with Thomas-algorithm O(N) natural cubic spline envelopes.
-    /// Guarantees `sum(imfs) + residual == signal` within `< 1e-5` floating-point precision.
+    /// Guarantees `sum(imfs) + residual == signal` within `< 1e-5` floating-point precision, and evaluates
+    /// per-IMF Hilbert instantaneous phase `phi_k[n]`, unwrapped frequency `omega_k[n]`, and energy `A_k^2[n]`.
     public static func sift(
         signal: [Float],
+        sampleRate: Double = 256.0,
         maxIMFs: Int = 4,
-        maxSiftIterations: Int = 12
+        maxSiftIterations: Int = 12,
+        cauchyConvergenceThreshold: Double = 0.05
     ) -> HilbertHuangResult {
         let n = signal.count
         let sanitized = signal.map { $0.isFinite ? $0 : 0.0 }
@@ -379,11 +430,14 @@ public enum HilbertHuangSifter: Sendable {
             return HilbertHuangResult(
                 imfs: [],
                 residual: sanitized,
-                maxReconstructionError: 0.0
+                maxReconstructionError: 0.0,
+                imfAnalytics: [],
+                orthogonalityIndex: 0.0
             )
         }
 
         let siftLimit = max(1, maxSiftIterations)
+        let cauchyTol = min(max(1e-5, cauchyConvergenceThreshold), 0.05)
         var runningResidual = sanitized.map(Double.init)
         var extractedIMFs: [[Float]] = []
         extractedIMFs.reserveCapacity(maxIMFs)
@@ -439,7 +493,7 @@ public enum HilbertHuangSifter: Sendable {
 
                 protoIMF = nextProto
                 let cauchySD = diffSq / max(1e-15, prevSq)
-                if cauchySD < 0.02 && satisfiesIMFZeroCrossingCondition(protoIMF) {
+                if cauchySD < min(0.02, cauchyTol) && satisfiesIMFZeroCrossingCondition(protoIMF) {
                     break
                 }
             }
@@ -466,11 +520,91 @@ public enum HilbertHuangSifter: Sendable {
             }
         }
 
+        let fs = max(1.0, sampleRate)
+        let analytics = extractedIMFs.enumerated().map { idx, imf in
+            computeIMFAnalytics(imfIndex: idx, imf: imf, sampleRate: fs)
+        }
+        let orthoIdx = computeOrthogonalityIndex(imfs: extractedIMFs, signal: sanitized)
+
         return HilbertHuangResult(
             imfs: extractedIMFs,
             residual: residualFloat,
-            maxReconstructionError: maxError
+            maxReconstructionError: maxError,
+            imfAnalytics: analytics,
+            orthogonalityIndex: orthoIdx
         )
+    }
+
+    private static func computeIMFAnalytics(
+        imfIndex: Int,
+        imf: [Float],
+        sampleRate: Double
+    ) -> IMFAnalytics {
+        let n = imf.count
+        let analytic = SPWVDAnalyzer.computeAnalyticSignal(imf)
+        var phases = [Float](repeating: 0.0, count: n)
+        var freqs = [Float](repeating: 0.0, count: n)
+        var energies = [Float](repeating: 0.0, count: n)
+
+        let scaleHz = sampleRate / (2.0 * Double.pi)
+        let nyquist = 0.5 * sampleRate
+        var prevPhase = 0.0
+        var weightedFreqSum = 0.0
+        var totalEnergy = 0.0
+
+        for i in 0..<n {
+            let z = analytic[i]
+            let phase = atan2(z.imag, z.real)
+            let energy = z.real * z.real + z.imag * z.imag
+            phases[i] = Float(phase)
+            energies[i] = Float(energy)
+            totalEnergy += energy
+
+            if i > 0 {
+                let dPhi = atan2(sin(phase - prevPhase), cos(phase - prevPhase))
+                let instHz = min(max(abs(dPhi * scaleHz), 0.0), nyquist)
+                freqs[i] = Float(instHz)
+                weightedFreqSum += instHz * energy
+            }
+            prevPhase = phase
+        }
+        if n > 1 {
+            freqs[0] = freqs[1]
+            weightedFreqSum += Double(freqs[0]) * Double(energies[0])
+        }
+
+        let meanFreq = totalEnergy > 1e-12 ? Float(weightedFreqSum / totalEnergy) : 0.0
+        return IMFAnalytics(
+            imfIndex: imfIndex,
+            samples: imf,
+            instantaneousPhaseRad: phases,
+            instantaneousFrequencyHz: freqs,
+            instantaneousEnergy: energies,
+            meanFrequencyHz: meanFreq,
+            totalEnergy: Float(totalEnergy)
+        )
+    }
+
+    private static func computeOrthogonalityIndex(imfs: [[Float]], signal: [Float]) -> Float {
+        guard imfs.count >= 2 else { return 0.0 }
+        let n = signal.count
+        var sigEnergy = 0.0
+        for s in signal {
+            sigEnergy += Double(s) * Double(s)
+        }
+        guard sigEnergy > 1e-12 else { return 0.0 }
+
+        var crossSum = 0.0
+        for j in 0..<imfs.count {
+            for k in (j + 1)..<imfs.count {
+                var dot = 0.0
+                for i in 0..<n {
+                    dot += Double(imfs[j][i]) * Double(imfs[k][i])
+                }
+                crossSum += abs(dot)
+            }
+        }
+        return Float(crossSum / sigEnergy)
     }
 
     /// Exact O(N) Thomas-algorithm tridiagonal solver & evaluator for natural cubic spline (`S''(x_0) = S''(x_{K-1}) = 0`).

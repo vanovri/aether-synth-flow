@@ -19,6 +19,10 @@ struct AcoustoOpticCausticUniforms {
 
 namespace aether_caustics {
     constant float kCausticQuantScale = 65536.0f;
+    constant float kSpectralWavelengthBandsNm[8] = {
+        380.0f, 425.71429f, 471.42857f, 517.14286f,
+        562.85714f, 608.57143f, 654.28571f, 700.0f
+    };
 
     inline uint pcgHash(uint input) {
         uint state = input * 747796405u + 2891336453u;
@@ -53,13 +57,13 @@ namespace aether_caustics {
         return (1.0f - gSq) / (12.566370614f * denom * sqrt(denom));
     }
 
-    // Wyman, Sloan & Shirley (2013) piecewise Gaussian CIE 1931 XYZ -> Linear sRGB
+    // Wyman, Sloan & Shirley (2013) piecewise Gaussian CIE 1931 XYZ -> Linear Display-P3 & sRGB
     inline float asymmetricGaussian(float x, float mu, float s1, float s2) {
         float t = (x - mu) * (x < mu ? s1 : s2);
         return exp(-0.5f * t * t);
     }
 
-    inline float3 wavelengthToLinearSRGB(float wavelengthNm) {
+    inline float3 wavelengthToCIE1931XYZ(float wavelengthNm) {
         if (wavelengthNm < 360.0f || wavelengthNm > 780.0f) {
             return float3(0.0f);
         }
@@ -74,10 +78,24 @@ namespace aether_caustics {
         float zBar = 1.217f * asymmetricGaussian(wavelengthNm, 437.0f, 0.0845f, 0.0278f)
                    + 0.681f * asymmetricGaussian(wavelengthNm, 459.0f, 0.0385f, 0.0725f);
 
+        return max(float3(xBar, yBar, zBar), float3(0.0f));
+    }
+
+    inline float3 xyzToLinearDisplayP3(float3 xyz) {
+        float3 p3 = float3(
+             2.4934969f * xyz.x - 0.9313836f * xyz.y - 0.4027108f * xyz.z,
+            -0.8294890f * xyz.x + 1.7626641f * xyz.y + 0.0236247f * xyz.z,
+             0.0358458f * xyz.x - 0.0761724f * xyz.y + 0.9568845f * xyz.z
+        );
+        return max(p3, float3(0.0f));
+    }
+
+    inline float3 wavelengthToLinearSRGB(float wavelengthNm) {
+        float3 xyz = wavelengthToCIE1931XYZ(wavelengthNm);
         float3 linearRGB = float3(
-             3.2406f * xBar - 1.5372f * yBar - 0.4986f * zBar,
-            -0.9689f * xBar + 1.8758f * yBar + 0.0415f * zBar,
-             0.0557f * xBar - 0.2040f * yBar + 1.0570f * zBar
+             3.2406f * xyz.x - 1.5372f * xyz.y - 0.4986f * xyz.z,
+            -0.9689f * xyz.x + 1.8758f * xyz.y + 0.0415f * xyz.z,
+             0.0557f * xyz.x - 0.2040f * xyz.y + 1.0570f * xyz.z
         );
         return max(linearRGB, float3(0.0f));
     }
@@ -142,9 +160,15 @@ kernel void aetherTraceAcoustoOpticPhotons(
         (float(sy) + aether_caustics::rand01(rng)) / float(strataSide)
     );
 
-    float wavelengthFraction = fract(float(tid) * 0.61803398875f + 0.5f * aether_caustics::rand01(rng));
-    float wavelengthNm = mix(380.0f, 700.0f, wavelengthFraction);
-    float3 spectralRGB = aether_caustics::wavelengthToLinearSRGB(wavelengthNm) * uniforms.photonEnergyScale;
+    // Select one of the 8 spectral bands in [380, 700] nm with sub-band jitter
+    uint bandIdx = tid & 7u;
+    float baseBandNm = aether_caustics::kSpectralWavelengthBandsNm[bandIdx];
+    float wavelengthJitter = (aether_caustics::rand01(rng) - 0.5f) * 18.0f;
+    float wavelengthNm = clamp(baseBandNm + wavelengthJitter, 380.0f, 700.0f);
+    float3 xyz = aether_caustics::wavelengthToCIE1931XYZ(wavelengthNm);
+    float3 p3RGB = aether_caustics::xyzToLinearDisplayP3(xyz);
+    float3 srgb = aether_caustics::wavelengthToLinearSRGB(wavelengthNm);
+    float3 spectralRGB = mix(srgb, p3RGB, 0.5f) * uniforms.photonEnergyScale;
 
     float2 pos = uv * float2(float(w - 1), float(h - 1));
     float3 rayDir = normalize(float3(uniforms.lightDirectionXY.x, uniforms.lightDirectionXY.y, 1.0f));
@@ -164,13 +188,13 @@ kernel void aetherTraceAcoustoOpticPhotons(
             uniforms.acoustoOpticKappa
         );
 
-        // Eikonal refractive index gradient grad(n) = baseDispersionN * kappa_ao * grad(p)
+        // Symplectic Hamiltonian / Eikonal ray-bending: d/ds(n * dx/ds) = grad(n(x, lambda))
         float2 gradP = aether_caustics::samplePressureGradient(pressureField, pos, w, h);
         float2 gradN = baseDispersionN * uniforms.acoustoOpticKappa * gradP;
 
-        // Bend optical tangent vector toward higher refractive index regions
-        rayDir.xy += (gradN / max(localN, 1.0f)) * uniforms.stepSizeCells * 4.5f;
-        rayDir = normalize(rayDir);
+        float3 opticalMomentum = localN * rayDir;
+        opticalMomentum.xy += gradN * (uniforms.stepSizeCells * 4.5f);
+        rayDir = normalize(opticalMomentum);
 
         pos += rayDir.xy * uniforms.stepSizeCells;
         if (pos.x < 0.0f || pos.x >= float(w - 1) || pos.y < 0.0f || pos.y >= float(h - 1)) {
@@ -211,4 +235,65 @@ kernel void aetherTraceAcoustoOpticPhotons(
         if (qG > 0u) { atomic_fetch_add_explicit(&accumRGBQuantized[baseIdx + 1], qG, memory_order_relaxed); }
         if (qB > 0u) { atomic_fetch_add_explicit(&accumRGBQuantized[baseIdx + 2], qB, memory_order_relaxed); }
     }
+}
+
+// MARK: - Anisotropic Henyey-Greenstein Volumetric Caustics Resolve & Temporal EMA Kernel
+
+kernel void aetherResolveVolumetricCaustics(
+    device const uint* accumRGBQuantized              [[buffer(0)]],
+    device float4* historyAndResolvedRGB              [[buffer(1)]],
+    constant AcoustoOpticCausticUniforms& uniforms    [[buffer(2)]],
+    uint2 gid                                         [[thread_position_in_grid]]
+) {
+    if (gid.x >= uniforms.gridWidth || gid.y >= uniforms.gridHeight) {
+        return;
+    }
+
+    int w = int(uniforms.gridWidth);
+    int h = int(uniforms.gridHeight);
+    int x = int(gid.x);
+    int y = int(gid.y);
+    float invQuant = 1.0f / aether_caustics::kCausticQuantScale;
+
+    float2 lightDir = length(uniforms.lightDirectionXY) > 1.0e-4f
+        ? normalize(uniforms.lightDirectionXY)
+        : float2(0.0f, 1.0f);
+    float g = clamp(uniforms.anisotropyG, -0.50f, 0.85f);
+
+    float3 scatteredRGB = float3(0.0f);
+    float weightSum = 0.0f;
+
+    // 3x3 anisotropic Henyey-Greenstein volumetric in-scattering kernel
+    for (int dy = -1; dy <= 1; ++dy) {
+        int ny = clamp(y + dy, 0, h - 1);
+        for (int dx = -1; dx <= 1; ++dx) {
+            int nx = clamp(x + dx, 0, w - 1);
+            int baseIdx = (ny * w + nx) * 3;
+            float3 sampleRGB = float3(
+                float(accumRGBQuantized[baseIdx + 0]) * invQuant,
+                float(accumRGBQuantized[baseIdx + 1]) * invQuant,
+                float(accumRGBQuantized[baseIdx + 2]) * invQuant
+            );
+
+            float weight = 1.0f;
+            if (dx != 0 || dy != 0) {
+                float2 offsetDir = normalize(float2(float(dx), float(dy)));
+                float cosTheta = dot(offsetDir, lightDir);
+                float phase = aether_caustics::henyeyGreensteinPhase(cosTheta, g);
+                weight = 0.35f * phase;
+            }
+            scatteredRGB += sampleRGB * weight;
+            weightSum += weight;
+        }
+    }
+
+    float3 currentRGB = scatteredRGB / max(weightSum, 1.0e-5f);
+    // ACES-inspired filmic compression for iridescent caustic highlights
+    float3 mappedRGB = currentRGB / (1.0f + 0.65f * currentRGB);
+
+    int cellIdx = y * w + x;
+    float4 prev = historyAndResolvedRGB[cellIdx];
+    float emaAlpha = 0.24f;
+    float3 blended = mix(prev.rgb, mappedRGB, emaAlpha);
+    historyAndResolvedRGB[cellIdx] = float4(clamp(blended, float3(0.0f), float3(1.0f)), 1.0f);
 }

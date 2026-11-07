@@ -7,6 +7,9 @@ import simd
 #if canImport(CoreML)
 import CoreML
 #endif
+#if canImport(AudioToolbox)
+import AudioToolbox
+#endif
 #if os(macOS)
 @testable import AetherSynthMac
 #elseif os(visionOS)
@@ -944,6 +947,678 @@ struct AetherSynthTests {
             #expect(fftFrame.lowBandEnergy >= 0.0 && fftFrame.lowBandEnergy <= 1.0)
             #expect(fftFrame.highBandEnergy >= 0.0 && fftFrame.highBandEnergy <= 1.0)
         }
+    }
+
+    // MARK: - 11. Parametric KEMAR HRTF Physical Invariants (ITD, Contralateral Head Shadow & Pinna Notch)
+
+    @Test("KEMARHRIRSynthesizer median-plane symmetry, lateralized Woodworth-Schlosberg ITD, >6 dB head shadow & pinna notch shift")
+    func verifyKEMARHRTFPhysicalInvariants() {
+        let sampleRate: Double = 48_000.0
+
+        // 1. Median-plane symmetry: ITD(0°, φ) == 0 and ||h_L - h_R||_2 < 1e-6 across elevations
+        let elevations: [Float] = [-30.0, 0.0, 30.0, 60.0]
+        for el in elevations {
+            let itdSec = KEMARHRIRSynthesizer.woodworthSchlosbergITDSeconds(
+                azimuthDeg: 0.0,
+                elevationDeg: el
+            )
+            #expect(abs(itdSec) < 1e-9)
+
+            let pair = KEMARHRIRSynthesizer.synthesize(
+                pose: BinauralSourcePose(azimuthDeg: 0.0, elevationDeg: el, distanceMeters: 1.4),
+                sampleRate: sampleRate
+            )
+            #expect(pair.left.count == KEMARHRIRSynthesizer.tapCount)
+            #expect(pair.right.count == KEMARHRIRSynthesizer.tapCount)
+            #expect(abs(pair.itdSeconds) < 1e-9)
+
+            var l2DiffSquared: Float = 0.0
+            for i in 0..<KEMARHRIRSynthesizer.tapCount {
+                let d = pair.left[i] - pair.right[i]
+                l2DiffSquared += d * d
+            }
+            let l2NormDiff = sqrtf(l2DiffSquared)
+            #expect(l2NormDiff < 1e-6)
+        }
+
+        // 2. Lateralized Woodworth-Schlosberg ITD at θ = +90°, φ = 0°:
+        //    Right ear leads left ear by (a / c) * (1 + π/2) ≈ 0.0006557s (≈ 31.47 samples at 48 kHz)
+        let lateralPose = BinauralSourcePose(azimuthDeg: 90.0, elevationDeg: 0.0, distanceMeters: 1.4)
+        let lateralPair = KEMARHRIRSynthesizer.synthesize(pose: lateralPose, sampleRate: sampleRate)
+
+        let expectedITDSec: Float = (0.0875 / 343.0) * (1.0 + .pi * 0.5)
+        #expect(abs(lateralPair.itdSeconds - expectedITDSec) < 1e-6)
+        #expect(abs(lateralPair.itdSeconds * 1_000.0 - 0.6557) < 0.005)
+        let expectedSampleLag = expectedITDSec * Float(sampleRate)
+        #expect(abs(expectedSampleLag - 31.47) < 0.15)
+
+        // Verify empirical impulse peak index in right ear leads left ear by ~31.5 samples
+        let rightPeakIdx = lateralPair.right.enumerated().max(by: { abs($0.element) < abs($1.element) })?.offset ?? 0
+        let leftPeakIdx = lateralPair.left.enumerated().max(by: { abs($0.element) < abs($1.element) })?.offset ?? 0
+        let measuredSampleLead = Float(leftPeakIdx - rightPeakIdx)
+        #expect(rightPeakIdx < leftPeakIdx)
+        #expect(abs(measuredSampleLead - expectedSampleLag) <= 2.0)
+
+        // Verify high-frequency contralateral (left-ear) head-shadow attenuation exceeds 6.0 dB above 5 kHz
+        func averageBandPowerDB(ir: [Float], fLow: Double, fHigh: Double) -> Float {
+            let freqs = stride(from: fLow, through: fHigh, by: 250.0)
+            var totalPower: Double = 0.0
+            var count = 0
+            for f in freqs {
+                let omega = 2.0 * Double.pi * f / sampleRate
+                var re = 0.0
+                var im = 0.0
+                for (n, h) in ir.enumerated() {
+                    let angle = omega * Double(n)
+                    re += Double(h) * cos(angle)
+                    im -= Double(h) * sin(angle)
+                }
+                totalPower += (re * re + im * im)
+                count += 1
+            }
+            let meanPower = max(totalPower / Double(max(1, count)), 1e-12)
+            return Float(10.0 * log10(meanPower))
+        }
+
+        let rightHFdB = averageBandPowerDB(ir: lateralPair.right, fLow: 5_000.0, fHigh: 16_000.0)
+        let leftHFdB = averageBandPowerDB(ir: lateralPair.left, fLow: 5_000.0, fHigh: 16_000.0)
+        let contralateralAttenuationDB = rightHFdB - leftHFdB
+        #expect(contralateralAttenuationDB > 6.0)
+
+        // 3. Verify Pinna primary spectral notch shifts monotonically upward as elevation φ increases from -30° to +60°
+        let sweepElevations: [Float] = [-30.0, -10.0, 10.0, 30.0, 60.0]
+        var previousAnalyticalNotchHz: Float = 0.0
+        var previousMeasuredNotchHz: Double = 0.0
+
+        for (idx, elDeg) in sweepElevations.enumerated() {
+            let elRad = elDeg * .pi / 180.0
+            let analyticalNotchHz = KEMARHRIRSynthesizer.primaryPinnaNotchFrequencyHz(elevationRad: elRad)
+            let pair = KEMARHRIRSynthesizer.synthesize(
+                pose: BinauralSourcePose(azimuthDeg: 0.0, elevationDeg: elDeg, distanceMeters: 1.5),
+                sampleRate: sampleRate
+            )
+
+            // Search fine DFT magnitude minimum in the primary pinna notch band [3,800 Hz ... 10,000 Hz]
+            var minMagSq = Double.greatestFiniteMagnitude
+            var measuredNotchHz = Double(analyticalNotchHz)
+            var f = 3_800.0
+            while f <= 10_000.0 {
+                let omega = 2.0 * Double.pi * f / sampleRate
+                var re = 0.0
+                var im = 0.0
+                for (n, h) in pair.left.enumerated() {
+                    let angle = omega * Double(n)
+                    re += Double(h) * cos(angle)
+                    im -= Double(h) * sin(angle)
+                }
+                let magSq = re * re + im * im
+                if magSq < minMagSq {
+                    minMagSq = magSq
+                    measuredNotchHz = f
+                }
+                f += 25.0
+            }
+
+            if idx > 0 {
+                #expect(analyticalNotchHz > previousAnalyticalNotchHz)
+                #expect(measuredNotchHz > previousMeasuredNotchHz)
+            }
+            previousAnalyticalNotchHz = analyticalNotchHz
+            previousMeasuredNotchHz = measuredNotchHz
+        }
+    }
+
+    // MARK: - 12. UPOLS FFT Convolver Mathematical Equivalence & Dual-Path Crossfade
+
+    @Test("PartitionedOverlapSaveConvolver matches direct time-domain O(N*M) linear convolution (< 1e-4 max error)")
+    func verifyUPOLSConvolverEquivalenceAndCrossfade() {
+        let sampleCount = 4_096
+        let hrirPair = KEMARHRIRSynthesizer.synthesize(
+            pose: BinauralSourcePose(azimuthDeg: 38.0, elevationDeg: 18.0, distanceMeters: 1.25),
+            sampleRate: 48_000.0
+        )
+
+        var inputSignal = [Float](repeating: 0.0, count: sampleCount)
+        for n in 0..<sampleCount {
+            let t = Float(n) / 48_000.0
+            inputSignal[n] = 0.45 * sinf(2.0 * .pi * 220.0 * t)
+                + 0.30 * cosf(2.0 * .pi * 1_240.0 * t + 0.4)
+                + 0.20 * sinf(2.0 * .pi * 4_800.0 * t * (1.0 + 0.15 * t))
+        }
+
+        // Direct time-domain O(N * M) reference linear convolution
+        var refLeft = [Float](repeating: 0.0, count: sampleCount)
+        var refRight = [Float](repeating: 0.0, count: sampleCount)
+        let tapCount = KEMARHRIRSynthesizer.tapCount
+        for n in 0..<sampleCount {
+            var sumL: Float = 0.0
+            var sumR: Float = 0.0
+            let maxK = min(n, tapCount - 1)
+            for k in 0...maxK {
+                let x = inputSignal[n - k]
+                sumL += x * hrirPair.left[k]
+                sumR += x * hrirPair.right[k]
+            }
+            refLeft[n] = sumL
+            refRight[n] = sumR
+        }
+
+        var convolver = PartitionedOverlapSaveConvolver()
+        hrirPair.left.withUnsafeBufferPointer { lPtr in
+            hrirPair.right.withUnsafeBufferPointer { rPtr in
+                convolver.setHRIR(
+                    leftTaps: lPtr.baseAddress!,
+                    rightTaps: rPtr.baseAddress!,
+                    tapCount: tapCount,
+                    crossfade: false
+                )
+            }
+        }
+
+        var upolsLeft = [Float](repeating: 0.0, count: sampleCount)
+        var upolsRight = [Float](repeating: 0.0, count: sampleCount)
+        inputSignal.withUnsafeBufferPointer { inPtr in
+            upolsLeft.withUnsafeMutableBufferPointer { outL in
+                upolsRight.withUnsafeMutableBufferPointer { outR in
+                    convolver.process(
+                        input: inPtr.baseAddress!,
+                        leftOutput: outL.baseAddress!,
+                        rightOutput: outR.baseAddress!,
+                        frameCount: sampleCount
+                    )
+                }
+            }
+        }
+
+        var maxAbsError: Float = 0.0
+        for n in 0..<sampleCount {
+            let errL = abs(upolsLeft[n] - refLeft[n])
+            let errR = abs(upolsRight[n] - refRight[n])
+            maxAbsError = max(maxAbsError, max(errL, errR))
+        }
+        #expect(maxAbsError < 1e-4)
+
+        // Verify dual-path raised-cosine crossfaded HRIR switching across large azimuth jump remains finite & click-free
+        var spatialConvolver = SpatialHRTFConvolver(sampleRate: 48_000.0)
+        var blockLeft = [Float](repeating: 0.0, count: 256)
+        var blockRight = [Float](repeating: 0.0, count: 256)
+        inputSignal.withUnsafeBufferPointer { inPtr in
+            blockLeft.withUnsafeMutableBufferPointer { outL in
+                blockRight.withUnsafeMutableBufferPointer { outR in
+                    spatialConvolver.processMonoToBinaural(
+                        monoInput: inPtr.baseAddress!,
+                        leftOutput: outL.baseAddress!,
+                        rightOutput: outR.baseAddress!,
+                        frameCount: 128,
+                        targetPose: BinauralSourcePose(azimuthDeg: -65.0, elevationDeg: -10.0, distanceMeters: 1.2)
+                    )
+                    spatialConvolver.processMonoToBinaural(
+                        monoInput: inPtr.baseAddress!.advanced(by: 128),
+                        leftOutput: outL.baseAddress!.advanced(by: 128),
+                        rightOutput: outR.baseAddress!.advanced(by: 128),
+                        frameCount: 128,
+                        targetPose: BinauralSourcePose(azimuthDeg: 75.0, elevationDeg: 35.0, distanceMeters: 1.2)
+                    )
+                }
+            }
+        }
+        #expect(spatialConvolver.crossfadeCount >= 1)
+        #expect(blockLeft.allSatisfy { $0.isFinite && abs($0) <= 2.0 })
+        #expect(blockRight.allSatisfy { $0.isFinite && abs($0) <= 2.0 })
+    }
+
+    // MARK: - 13. 3D Shoebox Image-Source Early Reflections & Monotonic Preset Energy
+
+    @Test("ShoeboxRoomSimulator solves 18 (6 first-order + 12 second-order) reflections & monotonic preset energy")
+    func verifyShoeboxImageSourceReflectionsAndPresets() {
+        let sourcePose = BinauralSourcePose(azimuthDeg: 28.0, elevationDeg: 12.0, distanceMeters: 1.65)
+        let headQuat = simd_quatf(angle: 0.15, axis: SIMD3<Float>(0.0, 1.0, 0.0))
+
+        var presetEnergies: [Float] = []
+        for preset in ShoeboxRoomPreset.allCases {
+            let solved = ShoeboxRoomSimulator.solveImageSources(
+                configuration: preset.configuration,
+                sourcePose: sourcePose,
+                headOrientation: headQuat
+            )
+
+            // Exactly 6 first-order + 12 second-order edge = 18 virtual image sources
+            #expect(solved.taps.count == 18)
+            let firstOrderCount = solved.taps.filter { $0.order == 1 }.count
+            let secondOrderCount = solved.taps.filter { $0.order == 2 }.count
+            #expect(firstOrderCount == 6)
+            #expect(secondOrderCount == 12)
+            #expect(solved.directDelaySeconds > 0.0)
+
+            for tap in solved.taps {
+                #expect(tap.delaySeconds > solved.directDelaySeconds)
+                #expect(tap.distanceMeters > solved.directDistanceMeters)
+                #expect(tap.effectiveGain > 0.0)
+                #expect(tap.effectiveGain <= (1.0 / tap.distanceMeters) + 1e-6)
+                #expect(tap.airAbsorptionLP >= 0.05 && tap.airAbsorptionLP <= 0.995)
+                #expect(tap.listenerAzimuthDeg >= -180.0 && tap.listenerAzimuthDeg <= 180.0)
+                #expect(tap.listenerElevationDeg >= -90.0 && tap.listenerElevationDeg <= 90.0)
+            }
+
+            presetEnergies.append(solved.totalReflectionEnergy)
+        }
+
+        // Verify strictly monotonic reflection energy across presets:
+        // Anechoic Chamber < Obsidian Studio < Glass Conservatory < Cathedral Vault
+        #expect(presetEnergies.count == 4)
+        for idx in 1..<presetEnergies.count {
+            #expect(presetEnergies[idx] > presetEnergies[idx - 1])
+        }
+    }
+
+    // MARK: - 14. MPSGraph GPU / SIMD Autodiff Neural Training Convergence (>65% Loss Reduction)
+
+    @Test("MPSGraphBrainwaveTrainer 50-epoch training reduces loss by >65%, clips ||∇L||₂ <= 1.0 & round-trips checkpoints")
+    func verifyMPSGraphAndSIMDAutodiffTrainingConvergence() async throws {
+        let dataset = BiometricTrainingBatch.makeSyntheticBiometricDataset(batchSize: 8, seed: 0xA37E_5F01_99CC_1234)
+        #expect(dataset.batchSize == 8)
+        #expect(dataset.inputs.count == 8 * MPSGraphBrainwaveTrainer.sequenceLength * MPSGraphBrainwaveTrainer.featureDim)
+        #expect(dataset.targets.count == 8 * MPSGraphBrainwaveTrainer.outputDim)
+
+        let tempCheckpointURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TestMPSGraphBrainwaveTrainer-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: tempCheckpointURL) }
+
+        // 1. Train 50 epochs on primary trainer (uses MPSGraph GPU when available, or deterministic SIMD fallback)
+        let primaryTrainer = MPSGraphBrainwaveTrainer(
+            learningRate: 0.032,
+            weightDecay: 1e-4,
+            gradientClipNorm: 1.0,
+            checkpointURL: tempCheckpointURL
+        )
+
+        let initialEvalLoss = await primaryTrainer.evaluateLoss(batch: dataset)
+        #expect(initialEvalLoss.isFinite && initialEvalLoss > 0.01)
+
+        let history = await primaryTrainer.trainEpochs(batch: dataset, epochs: 50)
+        #expect(history.count == 50)
+
+        for snap in history {
+            #expect(snap.latestLoss.isFinite && snap.latestLoss >= 0.0)
+            #expect(snap.emaLoss.isFinite && snap.emaLoss >= 0.0)
+            #expect(snap.gradientL2Norm.isFinite && snap.gradientL2Norm >= 0.0)
+            #expect(snap.gradientL2Norm <= 1.0 + 1e-4)
+        }
+
+        let finalEvalLoss = await primaryTrainer.evaluateLoss(batch: dataset)
+        let firstEpochLoss = history.first!.latestLoss
+        let lastEpochLoss = history.last!.latestLoss
+        // Verify training loss decreases by > 65% (residual loss < 0.35 * initial loss)
+        #expect(lastEpochLoss < firstEpochLoss * 0.35)
+        #expect(finalEvalLoss < initialEvalLoss * 0.35)
+
+        // 2. Verify physical setpoint prediction bounds
+        let firstWindow = Array(dataset.inputs.prefix(MPSGraphBrainwaveTrainer.sequenceLength * MPSGraphBrainwaveTrainer.featureDim))
+        let pred = await primaryTrainer.predictOptimalSetpoint(sequence8x12: firstWindow)
+        #expect((1.5...40.0).contains(pred.binauralBeatHz))
+        #expect((96.0...432.0).contains(pred.carrierHz))
+        #expect((180.0...6_400.0).contains(pred.filterCutoffHz))
+        #expect((0.05...1.60).contains(pred.hrtfOrbitSpeed))
+        #expect((0.0...1.0).contains(pred.targetCoherence))
+
+        // 3. Verify checkpoint persistence round-trip
+        let savedWeights = await primaryTrainer.snapshotWeights()
+        let savedURL = try await primaryTrainer.saveCheckpoint()
+        #expect(FileManager.default.fileExists(atPath: savedURL.path))
+
+        let reloadedTrainer = MPSGraphBrainwaveTrainer(
+            forceCPUFallback: true,
+            checkpointURL: tempCheckpointURL
+        )
+        let loadedSnap = try await reloadedTrainer.loadCheckpoint()
+        let reloadedWeights = await reloadedTrainer.snapshotWeights()
+        #expect(loadedSnap.epochCount == 50)
+        #expect(reloadedWeights == savedWeights)
+
+        // 4. Explicitly verify CPU SIMD Autodiff fallback converges identically > 65%
+        let simdTrainer = MPSGraphBrainwaveTrainer(
+            forceCPUFallback: true,
+            learningRate: 0.032,
+            weightDecay: 1e-4,
+            gradientClipNorm: 1.0,
+            checkpointURL: tempCheckpointURL
+        )
+        let simdHistory = await simdTrainer.trainEpochs(batch: dataset, epochs: 50)
+        #expect(simdHistory.last!.activeBackend == .cpuSIMDFallback)
+        #expect(simdHistory.last!.latestLoss < simdHistory.first!.latestLoss * 0.35)
+        #expect(simdHistory.allSatisfy { $0.gradientL2Norm.isFinite && $0.gradientL2Norm <= 1.0 + 1e-4 })
+    }
+
+    // MARK: - 15. Phase 7 Track 24: GPU/SAH-BVH 3D Acoustic Ray-Tracer, Möller–Trumbore & RT60 Invariants
+
+    @Test("Acoustic SAH-BVH Möller–Trumbore analytical plane intersection & watertight zero-leak closed room invariant")
+    func verifyAcousticSAHBVHMollerTrumboreAndWatertightChambers() async {
+        let halfExtents = SIMD3<Float>(4.0, 2.5, 5.0)
+        let boxRoom = ProceduralMeshGenerator.makeClosedBoxRoom(halfExtents: halfExtents, materialIndex: 0)
+        let bvh = AcousticSAHBVH(triangles: boxRoom.triangles)
+
+        // 1. Verify exact analytical plane intersection distances from origin along all 6 cardinal directions
+        let cardinalTests: [(dir: SIMD3<Float>, expectedDist: Float, expectedNormal: SIMD3<Float>)] = [
+            (SIMD3<Float>(1, 0, 0), 4.0, SIMD3<Float>(-1, 0, 0)),
+            (SIMD3<Float>(-1, 0, 0), 4.0, SIMD3<Float>(1, 0, 0)),
+            (SIMD3<Float>(0, 1, 0), 2.5, SIMD3<Float>(0, -1, 0)),
+            (SIMD3<Float>(0, -1, 0), 2.5, SIMD3<Float>(0, 1, 0)),
+            (SIMD3<Float>(0, 0, 1), 5.0, SIMD3<Float>(0, 0, -1)),
+            (SIMD3<Float>(0, 0, -1), 5.0, SIMD3<Float>(0, 0, 1))
+        ]
+
+        for testCase in cardinalTests {
+            let hit = bvh.traceClosestHit(origin: .zero, direction: testCase.dir)
+            #expect(hit != nil)
+            if let hit {
+                #expect(abs(hit.distance - testCase.expectedDist) < 1.0e-4)
+                #expect(simd_distance(hit.point, testCase.dir * testCase.expectedDist) < 1.0e-4)
+                #expect(simd_dot(hit.normal, testCase.expectedNormal) > 0.999)
+            }
+        }
+
+        // Verify oblique ray intersection against analytical slab distance min(4/|dx|, 2.5/|dy|, 5/|dz|)
+        let obliqueDir = simd_normalize(SIMD3<Float>(0.6, 0.7, -0.38729833))
+        let analyticalObliqueDist = min(
+            halfExtents.x / abs(obliqueDir.x),
+            min(halfExtents.y / abs(obliqueDir.y), halfExtents.z / abs(obliqueDir.z))
+        )
+        let obliqueHit = bvh.traceClosestHit(origin: .zero, direction: obliqueDir)
+        #expect(obliqueHit != nil)
+        if let obliqueHit {
+            #expect(abs(obliqueHit.distance - analyticalObliqueDist) < 1.0e-4)
+        }
+
+        // 2. Verify zero leaked rays across 4,096 rays inside closed box & all 3 architectural chambers + satellites
+        let tracer = MetalAcousticRayTracer(preferHardwareRayTracing: false)
+        let boxReport = await tracer.solveCustomGeometry(
+            chamberLabel: .geodesicSanctuary,
+            chamberGeometry: boxRoom,
+            materials: [AcousticSurfaceMaterialPreset.obsidianMarble.material],
+            sourcePosition: SIMD3<Float>(0.4, 0.2, 0.8),
+            listenerPose: ListenerHeadPose3D(position: SIMD3<Float>(-0.5, -0.1, -1.0)),
+            rayCount: 4_096,
+            maxBounces: 16,
+            forceCPUFallback: true
+        )
+        #expect(boxReport.leakedRayCount == 0)
+        #expect(boxReport.leftDRIR.count == 512)
+        #expect(boxReport.rightDRIR.count == 512)
+
+        let habits = HabitNodeDTO.defaultSeeds
+        for chamber in AcousticChamberPreset.allCases {
+            let report = await tracer.solveChamberAcoustics(
+                chamber: chamber,
+                surfaceMaterial: AcousticSurfaceMaterialPreset.perforatedAcousticWood.material,
+                habits: habits,
+                orbitalPhaseRadians: 0.45,
+                rayCount: 1_024,
+                maxBounces: 16,
+                forceCPUFallback: true
+            )
+            #expect(report.leakedRayCount == 0)
+            #expect(report.leftDRIR.allSatisfy { $0.isFinite })
+            #expect(report.rightDRIR.allSatisfy { $0.isFinite })
+        }
+    }
+
+    @Test("Acoustic 16-bounce energy conservation, monotonic bounce decay & 4-band RT60 absorption monotonicity")
+    func verifyAcousticBounceDecayAndRT60AbsorptionMonotonicity() async {
+        let tracer = MetalAcousticRayTracer(preferHardwareRayTracing: false)
+        let boxRoom = ProceduralMeshGenerator.makeClosedBoxRoom(
+            halfExtents: SIMD3<Float>(4.5, 3.0, 5.5),
+            materialIndex: 0
+        )
+
+        let lowAlphaMaterial = AcousticSurfaceMaterial(
+            name: "Low Absorption Reference",
+            absorption: SIMD4<Float>(repeating: 0.10),
+            scattering: SIMD4<Float>(repeating: 0.35)
+        )
+        let highAlphaMaterial = AcousticSurfaceMaterial(
+            name: "High Absorption Reference",
+            absorption: SIMD4<Float>(repeating: 0.80),
+            scattering: SIMD4<Float>(repeating: 0.35)
+        )
+
+        let bridge = RayTracedDRIRConvolverBridge()
+        let lowReport = await tracer.solveCustomGeometry(
+            chamberGeometry: boxRoom,
+            materials: [lowAlphaMaterial],
+            sourcePosition: SIMD3<Float>(0.0, 0.3, 1.4),
+            listenerPose: ListenerHeadPose3D(position: SIMD3<Float>(0.0, 0.0, -1.2)),
+            rayCount: 2_048,
+            maxBounces: 16,
+            forceCPUFallback: true,
+            convolverBridge: bridge
+        )
+        let highReport = await tracer.solveCustomGeometry(
+            chamberGeometry: boxRoom,
+            materials: [highAlphaMaterial],
+            sourcePosition: SIMD3<Float>(0.0, 0.3, 1.4),
+            listenerPose: ListenerHeadPose3D(position: SIMD3<Float>(0.0, 0.0, -1.2)),
+            rayCount: 2_048,
+            maxBounces: 16,
+            forceCPUFallback: true,
+            convolverBridge: bridge
+        )
+
+        // 1. Verify monotonic energy decay across bounces
+        #expect(lowReport.bounceMeanEnergyEnvelope.count == 16)
+        for b in 1..<lowReport.bounceMeanEnergyEnvelope.count {
+            let prev = lowReport.bounceMeanEnergyEnvelope[b - 1]
+            let curr = lowReport.bounceMeanEnergyEnvelope[b]
+            if curr.x > 0 && prev.x > 0 {
+                #expect(curr.x < prev.x)
+                #expect(curr.y < prev.y)
+                #expect(curr.z < prev.z)
+                #expect(curr.w < prev.w)
+            }
+        }
+
+        // 2. Verify Sabine, Eyring & Ray-Traced Schroeder RT60 decrease strictly across all 4 octave bands when alpha increases 0.10 -> 0.80
+        for band in 0..<4 {
+            #expect(highReport.sabineRT60PerBand[band] < lowReport.sabineRT60PerBand[band])
+            #expect(highReport.eyringRT60PerBand[band] < lowReport.eyringRT60PerBand[band])
+            #expect(highReport.rayTracedRT60PerBand[band] < lowReport.rayTracedRT60PerBand[band])
+        }
+
+        // 3. Verify wait-free RayTracedDRIRConvolverBridge dual-slot crossfaded real-time block processing
+        let blockLen = 256
+        var excitation = [Float](repeating: 0.0, count: blockLen)
+        excitation[0] = 0.9
+        excitation[64] = -0.5
+        var wetL = [Float](repeating: 0.0, count: blockLen)
+        var wetR = [Float](repeating: 0.0, count: blockLen)
+        excitation.withUnsafeBufferPointer { inBuf in
+            wetL.withUnsafeMutableBufferPointer { lBuf in
+                wetR.withUnsafeMutableBufferPointer { rBuf in
+                    bridge.processRealtimeBlock(
+                        monoInput: inBuf.baseAddress!,
+                        wetLeftOutput: lBuf.baseAddress!,
+                        wetRightOutput: rBuf.baseAddress!,
+                        frameCount: blockLen
+                    )
+                }
+            }
+        }
+        #expect(wetL.allSatisfy { $0.isFinite })
+        #expect(wetR.allSatisfy { $0.isFinite })
+        let wetEnergy = wetL.reduce(Float(0)) { $0 + $1 * $1 } + wetR.reduce(Float(0)) { $0 + $1 * $1 }
+        #expect(wetEnergy > 1.0e-5)
+    }
+
+    // MARK: - 16. Phase 7 Track 25: RVQ Monotonic Error Reduction, Snake Vocoder & Rectified-Flow ODE Invariants
+
+    @Test("Residual Vector Quantizer (RVQ) 4-stage monotonic L2 residual reduction & NeuralAudioTokenPacket round-trip")
+    func verifyRVQMonotonicResidualReductionAndTokenSerialization() throws {
+        let conditioning = LatentConditioningVector(
+            flowTime: 0.5,
+            category: .deepWork,
+            binauralBeatHz: 14.0,
+            rmssdNormalized: 0.62,
+            rsaCoherenceScore: 0.84,
+            lfHfRatioNormalized: 0.28
+        )
+        let prior = LatentAudioTensor.sampleGaussianPrior(seed: 0x1234_5678_9ABC_DEF0, temperature: 0.85)
+        let sampler = RectifiedFlowLatentSampler()
+        let z1 = sampler.sampleLatentHeun(prior: prior, conditioning: conditioning, guidanceScale: 2.2, steps: 4)
+
+        let rvq = ResidualVectorQuantizer()
+        let quant = rvq.quantize(
+            z1,
+            sequenceNumber: 42,
+            category: .deepWork,
+            binauralBeatHz: 14.0,
+            guidanceScale: 2.2
+        )
+
+        // 1. Strict inequality ||r_4||_2 < ||r_3||_2 < ||r_2||_2 < ||r_1||_2 < ||z||_2
+        #expect(quant.stageResidualNorms.count == 4)
+        let r1 = quant.stageResidualNorms[0]
+        let r2 = quant.stageResidualNorms[1]
+        let r3 = quant.stageResidualNorms[2]
+        let r4 = quant.stageResidualNorms[3]
+        #expect(r1 < quant.inputNorm)
+        #expect(r2 < r1)
+        #expect(r3 < r2)
+        #expect(r4 < r3)
+        #expect(quant.commitmentLoss > 0.0 && quant.commitmentLoss.isFinite)
+        #expect(quant.bitrateKbps > 20.0 && quant.bitrateKbps < 60.0)
+        #expect(quant.codebookPerplexity > 1.0 && quant.codebookPerplexity <= 64.0)
+
+        // 2. Bit-exact NeuralAudioTokenPacket binary serialization & FNV-1a integrity verification
+        let binaryData = quant.packet.serialize()
+        #expect(binaryData.count == NeuralAudioTokenPacket.encodedByteSize)
+        let decodedPacket = try NeuralAudioTokenPacket.deserialize(binaryData)
+        #expect(decodedPacket == quant.packet)
+        #expect(decodedPacket.sequenceNumber == 42)
+        #expect(decodedPacket.focusCategory == .deepWork)
+
+        let dequantized = rvq.dequantize(packet: decodedPacket)
+        #expect(LatentAudioTensor.l2Distance(quant.quantizedLatent, dequantized) < 1.0e-5)
+
+        // Verify tampered byte triggers checksumMismatch error
+        var corrupted = binaryData
+        corrupted[24] ^= 0x3F
+        #expect(throws: NeuralTokenPacketError.self) {
+            _ = try NeuralAudioTokenPacket.deserialize(corrupted)
+        }
+    }
+
+    @Test("Snake activation non-negative derivative monotonicity, 4-step Heun Rectified-Flow ODE & 50% Hann WOLA unity-gain")
+    func verifySnakeActivationHeunODESamplerAndHannOverlapAdd() async {
+        // 1. Snake_alpha(x) = x + (1/alpha) * sin^2(alpha * x) analytical derivative 1 + sin(2*alpha*x) >= 0
+        let alphas: [Float] = [0.65, 1.40, 2.85, 4.20]
+        let eps: Float = 1.0e-3
+        for alpha in alphas {
+            var prevVal = SnakeNeuralVocoder.snake(x: -8.0, alpha: alpha)
+            for step in -799...800 {
+                let x = Float(step) * 0.01
+                let y = SnakeNeuralVocoder.snake(x: x, alpha: alpha)
+                #expect(y.isFinite)
+                #expect(y + 1.0e-5 >= prevVal) // Monotonically non-decreasing
+                prevVal = y
+
+                let analyticDeriv = SnakeNeuralVocoder.snakeDerivative(x: x, alpha: alpha)
+                #expect(analyticDeriv >= -1.0e-6 && analyticDeriv <= 2.00001)
+                let numericDeriv = (SnakeNeuralVocoder.snake(x: x + eps, alpha: alpha) - SnakeNeuralVocoder.snake(x: x - eps, alpha: alpha)) / (2.0 * eps)
+                #expect(abs(analyticDeriv - numericDeriv) < 2.5e-3)
+            }
+        }
+
+        // 2. 4-step 2nd-Order Heun ODE integration across Classifier-Free Guidance scales w in [1.0, 2.5, 4.0]
+        let sampler = RectifiedFlowLatentSampler()
+        let prior = LatentAudioTensor.sampleGaussianPrior(seed: 0xCAFE_F00D_8888_1111, temperature: 1.0)
+        let cond = LatentConditioningVector(
+            flowTime: 0.0,
+            category: .creativeFlow,
+            binauralBeatHz: 7.5,
+            rmssdNormalized: 0.70,
+            rsaCoherenceScore: 0.88,
+            lfHfRatioNormalized: 0.22
+        )
+        for cfg in [Float(1.0), Float(2.5), Float(4.0)] {
+            let zOut = sampler.sampleLatentHeun(prior: prior, conditioning: cond, guidanceScale: cfg, steps: 4)
+            #expect(zOut.data.count == LatentAudioTensor.scalarCount)
+            #expect(zOut.isAllFinite)
+            #expect(zOut.l2Norm > 0.5 && zOut.l2Norm < 100.0)
+        }
+
+        // 3. 50% Complementary Hann Overlap-Add unity-gain & WOLA reconstruction error < 1e-5
+        var ola = ComplementaryHannOverlapAdd()
+        #expect(ola.maxUnityGainRipple() < 1.0e-5)
+
+        let signalLen = ComplementaryHannOverlapAdd.blockSize * 3
+        var testSignal = [Float](repeating: 0.0, count: signalLen)
+        for i in 0..<signalLen {
+            testSignal[i] = sinf(Float(i) * 0.031) * 0.65 + cosf(Float(i) * 0.007) * 0.25
+        }
+        let reconstructed = ola.reconstructWOLA(signal: testSignal)
+        let hop = ComplementaryHannOverlapAdd.hopSize
+        var maxInteriorError: Float = 0.0
+        for i in hop..<(signalLen - hop) {
+            maxInteriorError = max(maxInteriorError, abs(reconstructed[i] - testSignal[i]))
+        }
+        #expect(maxInteriorError < 1.0e-5)
+
+        // 4. End-to-end NeuralLatentSoundscapeEngine -> NeuralAudioRingBuffer -> ProceduralSynthKernel real-time render
+        let engine = NeuralLatentSoundscapeEngine()
+        let ring = NeuralAudioRingBuffer(capacityPowerOfTwo: 16_384)
+        let tele1 = await engine.synthesizeAndEnqueueBlock(
+            ringBuffer: ring,
+            category: .meditation,
+            binauralBeatHz: 6.0,
+            rmssdNormalized: 0.75,
+            rsaCoherenceScore: 0.90,
+            lfHfRatioNormalized: 0.18,
+            guidanceScale: 2.4,
+            temperature: 0.80
+        )
+        let tele2 = await engine.synthesizeAndEnqueueBlock(
+            ringBuffer: ring,
+            category: .meditation,
+            binauralBeatHz: 6.0,
+            rmssdNormalized: 0.75,
+            rsaCoherenceScore: 0.90,
+            lfHfRatioNormalized: 0.18,
+            guidanceScale: 2.4,
+            temperature: 0.80
+        )
+        #expect(tele1.blockSequence == 1)
+        #expect(tele2.blockSequence == 2)
+        #expect(ring.availableFramesToRead == ComplementaryHannOverlapAdd.hopSize * 2)
+
+        var synthParams = SynthParameters(
+            neuralSoundscapeMix: 0.65,
+            latentGuidanceScale: 2.4,
+            latentTemperature: 0.80,
+            rayTracedAcousticsEnabled: true,
+            isMuted: false
+        )
+        synthParams.masterGain = 0.80
+        let drirBridge = RayTracedDRIRConvolverBridge()
+        var kernel = ProceduralSynthKernel(sampleRate: 48_000.0, snapInitialParameters: synthParams)
+
+        let renderFrames = 1_024
+        var outL = [Float](repeating: 0.0, count: renderFrames)
+        var outR = [Float](repeating: 0.0, count: renderFrames)
+        let renderSnap = outL.withUnsafeMutableBufferPointer { lBuf in
+            outR.withUnsafeMutableBufferPointer { rBuf in
+                kernel.renderStereoBlock(
+                    leftOutput: lBuf.baseAddress!,
+                    rightOutput: rBuf.baseAddress!,
+                    frameCount: renderFrames,
+                    target: synthParams,
+                    neuralRingBuffer: ring,
+                    drirConvolverBridge: drirBridge
+                )
+            }
+        }
+        #expect(outL.allSatisfy { $0.isFinite && abs($0) <= 1.001 })
+        #expect(outR.allSatisfy { $0.isFinite && abs($0) <= 1.001 })
+        #expect(renderSnap.rmsAmplitude > 0.01)
+        #expect(ring.availableFramesToRead == ComplementaryHannOverlapAdd.hopSize * 2 - renderFrames)
     }
 }
 

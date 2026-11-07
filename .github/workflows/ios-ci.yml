@@ -63,8 +63,15 @@ jobs:
           echo "udid=$SIM_ID" >> "$GITHUB_OUTPUT"
           echo "Selected iOS Simulator UDID: $SIM_ID"
 
-      - name: Compile iOS 18 App, Widgets, Metal Shaders & Run Swift Testing Suite
+      - name: Compile iOS 18 App, Widgets, AUv3 Extension, Metal Ray-Tracing Shaders & Run Swift Testing Suite
         run: |
+          xcodebuild build \
+            -project AetherSynthFlow.xcodeproj \
+            -target AetherSynthAUv3 \
+            -destination "platform=iOS Simulator,id=${{ steps.ios_sim.outputs.udid }}" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO
           xcodebuild test \
             -project AetherSynthFlow.xcodeproj \
             -scheme AetherSynthFlow \

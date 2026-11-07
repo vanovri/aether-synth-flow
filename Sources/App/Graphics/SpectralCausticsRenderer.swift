@@ -9,6 +9,11 @@ import simd
 public enum AcoustoOpticCausticsEngine: Sendable {
     public static let minVisibleWavelengthNm: Float = 380.0
     public static let maxVisibleWavelengthNm: Float = 700.0
+    public static let defaultHardwarePhotonCount: Int = 16_384
+    public static let spectralWavelengthBandsNm: [Float] = [
+        380.0, 425.7143, 471.4286, 517.1429,
+        562.8571, 608.5714, 654.2857, 700.0
+    ]
 
     /// Cauchy optical dispersion + Gladstone-Dale acousto-optic pressure coupling:
     /// `n(x, lambda) = (n0 + B / lambda_um^2) * (1 + kappa_ao * p(x))`.
@@ -57,16 +62,40 @@ public enum AcoustoOpticCausticsEngine: Sendable {
         return abs(incidentRadians - refracted)
     }
 
+    /// Computes the symplectic Hamiltonian / Eikonal ray deflection angle in radians across a pressure gradient `grad(p)`.
+    /// Under identical `grad(p) != 0`, shorter violet wavelengths (`400 nm`) experience a strictly greater
+    /// dispersive refractive gradient `grad(n) = (n0 + B / lambda^2) * kappa_ao * grad(p)` and bend at a larger angle than red (`700 nm`).
+    @inline(__always)
+    public static func refractionDeflectionAngleRadians(
+        wavelengthNm: Float,
+        pressure: Float = 0.0,
+        pressureGradientMagnitude: Float,
+        stepDistance: Float = 1.0,
+        n0: Float = 1.333,
+        cauchyB: Float = 0.0125,
+        kappaAO: Float = 0.085
+    ) -> Float {
+        let snellPart = snellAngularDeflectionRadians(
+            incidentRadians: 0.45,
+            wavelengthNm: wavelengthNm,
+            pressure: pressure
+        )
+        let lambdaUm = max(0.25, wavelengthNm * 1.0e-3)
+        let baseDispN = n0 + cauchyB / (lambdaUm * lambdaUm)
+        let gradN = abs(pressureGradientMagnitude) * baseDispN * kappaAO
+        let schlierenPart = atanf(gradN * max(0.01, stepDistance))
+        return snellPart + schlierenPart
+    }
+
     @inline(__always)
     private static func asymmetricGaussian(_ x: Float, mu: Float, sigmaLeft: Float, sigmaRight: Float) -> Float {
         let t = (x - mu) * (x < mu ? sigmaLeft : sigmaRight)
         return expf(-0.5 * t * t)
     }
 
-    /// Wyman, Sloan & Shirley (2013) CIE 1931 2-degree piecewise Gaussian color-matching functions
-    /// transformed into non-negative Linear sRGB (`D65` primaries).
+    /// Wyman, Sloan & Shirley (2013) CIE 1931 2-degree piecewise Gaussian color-matching functions `XYZ`.
     @inline(__always)
-    public static func wavelengthToLinearSRGB(_ wavelengthNm: Float) -> SIMD3<Float> {
+    public static func wavelengthToCIE1931XYZ(_ wavelengthNm: Float) -> SIMD3<Float> {
         guard wavelengthNm >= 360.0 && wavelengthNm <= 780.0 else {
             return .zero
         }
@@ -81,9 +110,26 @@ public enum AcoustoOpticCausticsEngine: Sendable {
         let zBar = 1.217 * asymmetricGaussian(wavelengthNm, mu: 437.0, sigmaLeft: 0.0845, sigmaRight: 0.0278)
             + 0.681 * asymmetricGaussian(wavelengthNm, mu: 459.0, sigmaLeft: 0.0385, sigmaRight: 0.0725)
 
-        let r =  3.2406 * xBar - 1.5372 * yBar - 0.4986 * zBar
-        let g = -0.9689 * xBar + 1.8758 * yBar + 0.0415 * zBar
-        let b =  0.0557 * xBar - 0.2040 * yBar + 1.0570 * zBar
+        return SIMD3<Float>(max(0.0, xBar), max(0.0, yBar), max(0.0, zBar))
+    }
+
+    /// Converts CIE 1931 `XYZ` tristimulus values into Linear Display-P3 wide-gamut RGB.
+    @inline(__always)
+    public static func xyzToLinearDisplayP3(_ xyz: SIMD3<Float>) -> SIMD3<Float> {
+        let r =  2.4934969 * xyz.x - 0.9313836 * xyz.y - 0.4027108 * xyz.z
+        let g = -0.8294890 * xyz.x + 1.7626641 * xyz.y + 0.0236247 * xyz.z
+        let b =  0.0358458 * xyz.x - 0.0761724 * xyz.y + 0.9568845 * xyz.z
+        return SIMD3<Float>(max(0.0, r), max(0.0, g), max(0.0, b))
+    }
+
+    /// Wyman, Sloan & Shirley (2013) CIE 1931 2-degree piecewise Gaussian color-matching functions
+    /// transformed into non-negative Linear sRGB (`D65` primaries).
+    @inline(__always)
+    public static func wavelengthToLinearSRGB(_ wavelengthNm: Float) -> SIMD3<Float> {
+        let xyz = wavelengthToCIE1931XYZ(wavelengthNm)
+        let r =  3.2406 * xyz.x - 1.5372 * xyz.y - 0.4986 * xyz.z
+        let g = -0.9689 * xyz.x + 1.8758 * xyz.y + 0.0415 * xyz.z
+        let b =  0.0557 * xyz.x - 0.2040 * xyz.y + 1.0570 * xyz.z
 
         return SIMD3<Float>(max(0.0, r), max(0.0, g), max(0.0, b))
     }
@@ -337,6 +383,65 @@ public struct AcoustoOpticCausticsCanvasView: View {
                         }
                 )
             }
+        }
+    }
+}
+
+// MARK: - 3. SpectralCausticsView (FDTD Wave Tank + Spectral FFT Analyzer Coupled View)
+
+public struct SpectralCausticsView: View {
+    public let waveTankController: VisualFDTDWaveTankController
+    public let spectrumBars: [Float]
+    public let dominantSpectrumHz: Double
+    public let liveAudioAmplitude: Double
+    public let photonCount: Int
+
+    public init(
+        waveTankController: VisualFDTDWaveTankController,
+        spectrumBars: [Float] = [],
+        dominantSpectrumHz: Double = 216.0,
+        liveAudioAmplitude: Double = 0.25,
+        photonCount: Int = 4_096
+    ) {
+        self.waveTankController = waveTankController
+        self.spectrumBars = spectrumBars
+        self.dominantSpectrumHz = dominantSpectrumHz
+        self.liveAudioAmplitude = liveAudioAmplitude
+        self.photonCount = max(512, photonCount)
+    }
+
+    public var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            AcoustoOpticCausticsCanvasView(
+                waveTankController: waveTankController,
+                photonCount: photonCount,
+                accentHue: min(max(dominantSpectrumHz / 880.0, 0.42), 0.78)
+            )
+
+            HStack(spacing: 10) {
+                Label(
+                    String(format: "λ 380–700nm · %.0f Hz", dominantSpectrumHz),
+                    systemImage: "sparkles"
+                )
+                .font(.caption2.monospacedDigit().weight(.semibold))
+                .foregroundStyle(.white.opacity(0.9))
+
+                Spacer()
+
+                Text(
+                    String(
+                        format: "n₀=1.333 · κ=%.3f · RMS %.3f",
+                        0.045 + 0.040 * min(max(liveAudioAmplitude, 0.0), 1.0),
+                        waveTankController.latestRMSPressure
+                    )
+                )
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.cyan.opacity(0.9))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.ultraThinMaterial, in: Capsule())
+            .padding(10)
         }
     }
 }

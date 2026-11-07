@@ -97,6 +97,16 @@ public final class AetherAppCoordinator {
     public var onlineAdaptationEpochs: Int = 0
     public var lastOnlineHuberLoss: Double = 0.0
 
+    // Phase 7: GPU Metal Ray-Traced 3D Acoustics & Neural Latent Soundscape State
+    public var selectedChamberPreset: AcousticChamberPreset = .geodesicSanctuary
+    public var selectedSurfaceMaterialPreset: AcousticSurfaceMaterialPreset = .perforatedAcousticWood
+    public var latestAcousticReport: AcousticTraceReport?
+    public var latestNeuralSoundscapeTelemetry: NeuralSoundscapeTelemetry = NeuralSoundscapeTelemetry()
+    public var activeFocusCategory: FocusCategory = .deepWork
+
+    // Phase 8: Distributed Multi-Peer Spatial Orchestra & Wave-Field Array State
+    public var orchestraSnapshot: OrchestraMeshStatusSnapshot = OrchestraMeshStatusSnapshot()
+
     // Underlying Actors, DSP, Haptics & System Bridges
     public let hapticDirector = HapticDirector()
     public let audioEngine = AudioSynthEngine()
@@ -105,6 +115,9 @@ public final class AetherAppCoordinator {
     public let neuralTrainer = MPSGraphBrainwaveTrainer()
     public let mlPredictor = AdaptiveBrainwaveMLPredictor()
     public let watchBridge = WatchBiometricBridgeActor()
+    public let acousticRayTracer = MetalAcousticRayTracer()
+    public let neuralSoundscapeEngine = NeuralLatentSoundscapeEngine()
+    public let orchestraEngine = DistributedOrchestraEngine()
     public let databaseActor: TelemetryDatabaseActor
 
     #if canImport(ActivityKit) && os(iOS)
@@ -114,9 +127,12 @@ public final class AetherAppCoordinator {
     private var pidController = EntrainmentPIDController()
     private var physiologySimulator = SyntheticPhysiologySimulator(initialStressLevel: 0.58)
     private var lastBioEntrainmentTickDate: Date = .distantPast
+    private var lastOrchestraTickDate: Date = .distantPast
     private var previousEvaluatedMetrics: HRVAnalysisMetricsDTO?
     private var previousEvaluatedFeatures: BiometricFeatureVector?
     private var previousPredictionOutput: BrainwavePredictionOutput?
+    private var acousticSolveTask: Task<Void, Never>?
+    private var isNeuralBlockGenerating: Bool = false
 
     private var activeLiveSessionID = UUID()
     private var timerAnchorDate: Date?
@@ -273,6 +289,10 @@ public final class AetherAppCoordinator {
         onlineAdaptationEpochs = storedWeights.trainedEpochCount
         await wireWatchBiometricBridge()
 
+        await refreshRayTracedAcoustics()
+        await pumpNeuralSoundscapeRingBufferIfNeeded(forceInitialBlock: true)
+        orchestraSnapshot = orchestraEngine.snapshot()
+
         await refreshSharedWidgetSnapshotFromDB()
         startTelemetryPollingLoop()
     }
@@ -330,6 +350,14 @@ public final class AetherAppCoordinator {
                 synthParameters.orbitalSatellites = bank
                 await audioEngine.updateParameters(synthParameters)
             }
+
+            if synthParameters.neuralSoundscapeMix > 0.001,
+               audioEngine.neuralRingBuffer.availableFramesToRead < 12_288,
+               !isNeuralBlockGenerating {
+                Task { [weak self] in
+                    await self?.pumpNeuralSoundscapeRingBufferIfNeeded(forceInitialBlock: false)
+                }
+            }
         } else if dominantSpectrumHz > 0 {
             fftAnalyzer.reset()
             spectrumBars = [Float](repeating: 0, count: SpectralFFTAnalyzer.outputBarCount)
@@ -345,6 +373,22 @@ public final class AetherAppCoordinator {
             let clampedDt = min(max(bioDt, 0.5), 4.0)
             lastBioEntrainmentTickDate = nowWall
             await tickClosedLoopBioEntrainment(dtSeconds: clampedDt)
+        }
+
+        if orchestraSnapshot.isMeshSyncEnabled {
+            let orchDt = nowWall.timeIntervalSince(lastOrchestraTickDate)
+            if orchDt >= 0.095 {
+                let clampedOrchDt = min(max(orchDt, 0.05), 0.25)
+                lastOrchestraTickDate = nowWall
+                let stepResult = orchestraEngine.tickMeshSynchronization(
+                    dtSeconds: clampedOrchDt,
+                    sampleRate: 48_000.0,
+                    tempoBPM: 120.0,
+                    binauralBeatHz: Double(synthParameters.binauralBeatHz)
+                )
+                orchestraSnapshot = stepResult.snapshot
+                await audioEngine.updateOrchestraSync(stepResult.dspControl)
+            }
         }
 
         guard isTimerRunning, let anchor = timerAnchorDate else { return }
@@ -867,6 +911,7 @@ public final class AetherAppCoordinator {
     public func selectAudioPreset(_ preset: AudioPresetDTO) {
         selectedPresetID = preset.presetID
         activePresetName = preset.name
+        activeFocusCategory = preset.category
         var next = SynthParameters(preset: preset)
         next.spatialPanOffset = synthParameters.spatialPanOffset
         next.headElevationTilt = synthParameters.headElevationTilt
@@ -877,6 +922,10 @@ public final class AetherAppCoordinator {
         next.isHRTFSpatializerEnabled = synthParameters.isHRTFSpatializerEnabled
         next.headQuaternion = synthParameters.headQuaternion
         next.orbitalSatellites = synthParameters.orbitalSatellites
+        next.neuralSoundscapeMix = synthParameters.neuralSoundscapeMix
+        next.latentGuidanceScale = synthParameters.latentGuidanceScale
+        next.latentTemperature = synthParameters.latentTemperature
+        next.rayTracedAcousticsEnabled = synthParameters.rayTracedAcousticsEnabled
         synthParameters = next
         hapticDirector.playSegmentSnap()
         Task {
@@ -884,8 +933,117 @@ public final class AetherAppCoordinator {
             if isSynthPlaying {
                 await audioEngine.triggerHarmonicBloom(intensity: 0.55)
             }
+            await pumpNeuralSoundscapeRingBufferIfNeeded(forceInitialBlock: true)
         }
         syncSystemSurfaces(liveActivityActive: isTimerRunning || elapsedSeconds > 0)
+    }
+
+    // MARK: - Phase 7: GPU Metal Ray-Traced 3D Acoustics & Neural Latent Diffusion Controls
+
+    public func refreshRayTracedAcoustics() async {
+        let chamber = selectedChamberPreset
+        let surfaceMat = selectedSurfaceMaterialPreset.material
+        let habits = cachedOrbitHabits
+        let orbitPhase = Float(orbitalRotationAngle)
+        let azRad = synthParameters.hrtfAzimuthDeg * Float.pi / 180.0
+        let elRad = synthParameters.hrtfElevationDeg * Float.pi / 180.0
+        let dist = max(0.35, min(synthParameters.hrtfDistanceMeters, 2.6))
+        let srcPos = SIMD3<Float>(
+            dist * cosf(elRad) * sinf(azRad),
+            0.25 + dist * sinf(elRad) * 0.45,
+            dist * cosf(elRad) * cosf(azRad)
+        )
+        let headPose = ListenerHeadPose3D(
+            position: SIMD3<Float>(0.0, 0.0, -1.10),
+            orientation: simd_quatf(vector: synthParameters.headQuaternion)
+        )
+
+        let report = await acousticRayTracer.solveChamberAcoustics(
+            chamber: chamber,
+            surfaceMaterial: surfaceMat,
+            habits: habits,
+            orbitalPhaseRadians: orbitPhase,
+            sourcePosition: srcPos,
+            listenerPose: headPose,
+            rayCount: 1_024,
+            maxBounces: 16,
+            sampleRate: 48_000.0,
+            convolverBridge: audioEngine.drirConvolverBridge
+        )
+        latestAcousticReport = report
+    }
+
+    public func selectAcousticChamber(_ chamber: AcousticChamberPreset) {
+        selectedChamberPreset = chamber
+        hapticDirector.playSegmentSnap()
+        acousticSolveTask?.cancel()
+        acousticSolveTask = Task { [weak self] in
+            await self?.refreshRayTracedAcoustics()
+        }
+    }
+
+    public func selectAcousticSurfaceMaterial(_ materialPreset: AcousticSurfaceMaterialPreset) {
+        selectedSurfaceMaterialPreset = materialPreset
+        hapticDirector.playSegmentSnap()
+        acousticSolveTask?.cancel()
+        acousticSolveTask = Task { [weak self] in
+            await self?.refreshRayTracedAcoustics()
+        }
+    }
+
+    public func toggleRayTracedAcoustics(_ enabled: Bool) {
+        var next = synthParameters
+        next.rayTracedAcousticsEnabled = enabled
+        pushSynthParameters(next, clearingPresetSelection: false)
+        hapticDirector.playSegmentSnap()
+        if enabled {
+            acousticSolveTask?.cancel()
+            acousticSolveTask = Task { [weak self] in
+                await self?.refreshRayTracedAcoustics()
+            }
+        }
+    }
+
+    public func reseedNeuralSoundscape() {
+        hapticDirector.playOrbitalSnap(mass: 1.35)
+        Task { [weak self] in
+            guard let self else { return }
+            await self.neuralSoundscapeEngine.reseedLatentManifold()
+            await self.pumpNeuralSoundscapeRingBufferIfNeeded(forceInitialBlock: true)
+        }
+    }
+
+    private func pumpNeuralSoundscapeRingBufferIfNeeded(forceInitialBlock: Bool) async {
+        guard !isNeuralBlockGenerating else { return }
+        isNeuralBlockGenerating = true
+        defer { isNeuralBlockGenerating = false }
+
+        let metrics = latestHRVMetrics ?? .baselinePlaceholder
+        let rmssdNorm = Float(min(max(metrics.rmssdMs / 120.0, 0.0), 1.0))
+        let rsaCoh = Float(min(max(metrics.rsaCoherenceScore, 0.0), 1.0))
+        let lfHfNorm = Float(min(max(metrics.lfHfRatio / 6.0, 0.0), 1.0))
+        let category = activeFocusCategory
+        let beatHz = synthParameters.binauralBeatHz
+        let cfgScale = synthParameters.latentGuidanceScale
+        let temp = synthParameters.latentTemperature
+        let ring = audioEngine.neuralRingBuffer
+
+        let blocksToGenerate = forceInitialBlock ? 2 : 1
+        var latestSnap = latestNeuralSoundscapeTelemetry
+        for _ in 0..<blocksToGenerate {
+            latestSnap = await neuralSoundscapeEngine.synthesizeAndEnqueueBlock(
+                ringBuffer: ring,
+                category: category,
+                binauralBeatHz: beatHz,
+                rmssdNormalized: rmssdNorm,
+                rsaCoherenceScore: rsaCoh,
+                lfHfRatioNormalized: lfHfNorm,
+                guidanceScale: cfgScale,
+                temperature: temp,
+                sampleRate: 48_000.0
+            )
+        }
+        latestNeuralSoundscapeTelemetry = latestSnap
     }
 
     public func cyclePreset(step: Int) async {
@@ -959,6 +1117,86 @@ public final class AetherAppCoordinator {
         editingHabitDraft = nil
         isHabitEditorPresented = false
         await refreshSharedWidgetSnapshotFromDB()
+    }
+
+    // MARK: - Distributed Multi-Peer Spatial Orchestra & Wave-Field Array Controls
+
+    public func toggleOrchestraMeshSync(_ enabled: Bool) {
+        orchestraEngine.setMeshSyncEnabled(enabled)
+        lastOrchestraTickDate = .now
+        if enabled {
+            let result = orchestraEngine.tickMeshSynchronization(
+                dtSeconds: 0.10,
+                sampleRate: 48_000.0,
+                tempoBPM: 120.0,
+                binauralBeatHz: Double(synthParameters.binauralBeatHz)
+            )
+            orchestraSnapshot = result.snapshot
+            Task { await audioEngine.updateOrchestraSync(result.dspControl) }
+        } else {
+            orchestraSnapshot = orchestraEngine.snapshot()
+            Task { await audioEngine.updateOrchestraSync(RealtimeOrchestraSyncControl(isEnabled: false)) }
+        }
+        hapticDirector.playSegmentSnap()
+    }
+
+    public func toggleSimulateQuadArray(_ enabled: Bool) {
+        orchestraEngine.setSimulateQuadArray(enabled)
+        lastOrchestraTickDate = .now
+        let result = orchestraEngine.tickMeshSynchronization(
+            dtSeconds: 0.10,
+            sampleRate: 48_000.0,
+            tempoBPM: 120.0,
+            binauralBeatHz: Double(synthParameters.binauralBeatHz)
+        )
+        orchestraSnapshot = result.snapshot
+        Task { await audioEngine.updateOrchestraSync(result.dspControl) }
+        hapticDirector.playSegmentSnap()
+    }
+
+    public func selectOrchestraLocalNode(_ nodeID: Int) {
+        orchestraEngine.setActiveLocalNode(nodeID: nodeID)
+        let result = orchestraEngine.tickMeshSynchronization(
+            dtSeconds: 0.05,
+            sampleRate: 48_000.0,
+            tempoBPM: 120.0,
+            binauralBeatHz: Double(synthParameters.binauralBeatHz)
+        )
+        orchestraSnapshot = result.snapshot
+        Task { await audioEngine.updateOrchestraSync(result.dspControl) }
+        hapticDirector.playParameterDetentTick(intensity: 0.65)
+    }
+
+    public func moveOrchestraSpeakerNode(nodeID: Int, xMeters: Double, zMeters: Double) {
+        orchestraEngine.updateNodePosition(nodeID: nodeID, xMeters: xMeters, zMeters: zMeters)
+        orchestraSnapshot = orchestraEngine.snapshot()
+        if orchestraSnapshot.isMeshSyncEnabled {
+            let localSol = orchestraSnapshot.nodeSolutions.first(where: { $0.nodeID == orchestraSnapshot.activeLocalNodeID })
+            let control = RealtimeOrchestraSyncControl(
+                isEnabled: true,
+                pllSampleRateScale: orchestraSnapshot.pllSampleRateScale,
+                wfsDelaySamples: orchestraSnapshot.isSimulatingQuadArray ? (localSol?.delayInSamples(sampleRate: 48_000.0) ?? 0.0) : 0.0,
+                wfsGainScale: orchestraSnapshot.isSimulatingQuadArray ? (localSol?.wfsDrivingAmplitude ?? 1.0) : 1.0,
+                masterPhaseSyncTarget: nil
+            )
+            Task { await audioEngine.updateOrchestraSync(control) }
+        }
+    }
+
+    public func moveOrchestraVirtualSource(xMeters: Double, zMeters: Double) {
+        orchestraEngine.updateVirtualSourcePosition(xMeters: xMeters, zMeters: zMeters)
+        orchestraSnapshot = orchestraEngine.snapshot()
+        if orchestraSnapshot.isMeshSyncEnabled {
+            let localSol = orchestraSnapshot.nodeSolutions.first(where: { $0.nodeID == orchestraSnapshot.activeLocalNodeID })
+            let control = RealtimeOrchestraSyncControl(
+                isEnabled: true,
+                pllSampleRateScale: orchestraSnapshot.pllSampleRateScale,
+                wfsDelaySamples: orchestraSnapshot.isSimulatingQuadArray ? (localSol?.delayInSamples(sampleRate: 48_000.0) ?? 0.0) : 0.0,
+                wfsGainScale: orchestraSnapshot.isSimulatingQuadArray ? (localSol?.wfsDrivingAmplitude ?? 1.0) : 1.0,
+                masterPhaseSyncTarget: nil
+            )
+            Task { await audioEngine.updateOrchestraSync(control) }
+        }
     }
 
     // MARK: - Archive Portability Actions (JSON & CSV Export / Import)

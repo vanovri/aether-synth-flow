@@ -20,9 +20,12 @@ targets:
     type: application
     platform: iOS
     deploymentTarget: "18.0"
+    # Includes Phase 7 AcousticRayTracingKernels.metal, MetalAcousticRayTracer.swift & NeuralLatentSoundscapeEngine.swift
+    # and Phase 8 AUv3 Instrument/Effect Extension & Distributed PTP Orchestra
     sources:
       - path: Sources/Shared
       - path: Sources/App
+      - path: Sources/AUv3
     info:
       path: Config/AetherSynthFlow-Info.plist
     entitlements:
@@ -36,6 +39,15 @@ targets:
     dependencies:
       - target: AetherSynthWidgets
         embed: true
+      - target: AetherSynthAUv3
+        embed: true
+      - sdk: AudioToolbox.framework
+      - sdk: CoreAudioKit.framework
+      - sdk: AVFoundation.framework
+      - sdk: Accelerate.framework
+      - sdk: Metal.framework
+      - sdk: MetalPerformanceShaders.framework
+      - sdk: MetalPerformanceShadersGraph.framework
 
   AetherSynthWidgets:
     type: app-extension
@@ -59,6 +71,40 @@ targets:
       - sdk: SwiftUI.framework
       - sdk: AppIntents.framework
       - sdk: ActivityKit.framework
+
+  AetherSynthAUv3:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: Sources/AUv3
+      - path: Sources/Shared/PersistenceModels.swift
+      - path: Sources/Shared/DistributedOrchestraEngine.swift
+      - path: Sources/Shared/NeuralLatentSoundscapeEngine.swift
+      - path: Sources/App/Audio/AudioSynthEngine.swift
+      - path: Sources/App/Audio/SpectralFFTAnalyzer.swift
+      - path: Sources/App/Audio/SpatialHRTFConvolver.swift
+      - path: Sources/App/Audio/ShoeboxRoomAcoustics.swift
+      - path: Sources/App/Audio/MetalAcousticRayTracer.swift
+      - path: Sources/App/Graphics/AcousticRayTracingKernels.metal
+    info:
+      path: Config/AetherSynthAUv3-Info.plist
+    entitlements:
+      path: Config/AetherSynthAUv3.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aethersynth.flow.auv3
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SKIP_INSTALL: YES
+        APPLICATION_EXTENSION_API_ONLY: YES
+    dependencies:
+      - sdk: AudioToolbox.framework
+      - sdk: CoreAudioKit.framework
+      - sdk: AVFoundation.framework
+      - sdk: Accelerate.framework
+      - sdk: SwiftUI.framework
+      - sdk: Metal.framework
 
   AetherSynthVision:
     type: application
@@ -84,6 +130,8 @@ targets:
       - sdk: ARKit.framework
       - sdk: CompositorServices.framework
       - sdk: Metal.framework
+      - sdk: MetalPerformanceShaders.framework
+      - sdk: MetalPerformanceShadersGraph.framework
       - sdk: AVFoundation.framework
       - sdk: Accelerate.framework
 
@@ -95,6 +143,7 @@ targets:
       - path: Sources/Shared
       - path: Sources/App
       - path: Sources/MacOS
+      - path: Sources/AUv3
     info:
       path: Config/AetherSynthMac-Info.plist
     entitlements:
@@ -110,10 +159,13 @@ targets:
       - sdk: AppKit.framework
       - sdk: CoreAudio.framework
       - sdk: AudioToolbox.framework
+      - sdk: CoreAudioKit.framework
       - sdk: AVFoundation.framework
       - sdk: Accelerate.framework
       - sdk: ServiceManagement.framework
       - sdk: Metal.framework
+      - sdk: MetalPerformanceShaders.framework
+      - sdk: MetalPerformanceShadersGraph.framework
 
   AetherSynthWatch:
     type: application
@@ -180,6 +232,7 @@ schemes:
       targets:
         AetherSynthFlow: all
         AetherSynthWidgets: all
+        AetherSynthAUv3: all
         AetherSynthTests: [test]
     run:
       config: Debug

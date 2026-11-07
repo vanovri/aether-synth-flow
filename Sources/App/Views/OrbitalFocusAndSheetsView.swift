@@ -392,7 +392,12 @@ public struct SynthLabPanelView: View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 18) {
                 presetHeaderCard
+                sphericalHRTFRadarAndRoomCard
+                mpsGraphNeuralTrainerCard
                 bioEntrainmentInspectorCard
+                rayTracedAcousticsInspectorCard
+                neuralLatentDiffusionInspectorCard
+                distributedOrchestraArrayCard
                 realtimeSpectrumAndSpatialCard
                 filterXYPadCard
                 oscillatorAndMixerCard
@@ -480,6 +485,341 @@ public struct SynthLabPanelView: View {
                         }
                         .buttonStyle(.plain)
                     }
+                }
+            }
+        }
+        .padding(16)
+        .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude, cornerRadius: 24)
+    }
+
+    // MARK: - 3D Spherical Binaural Radar, Elevation Dome & Shoebox Room Acoustics Card
+
+    private var sphericalHRTFRadarAndRoomCard: some View {
+        let accent = Color(hue: coordinator.activeAccentHue, saturation: 0.74, brightness: 0.98)
+        let azDeg = coordinator.synthParameters.hrtfAzimuthDeg
+        let elDeg = coordinator.synthParameters.hrtfElevationDeg
+        let distM = coordinator.synthParameters.hrtfDistanceMeters
+        let pose = BinauralSourcePose(azimuthDeg: azDeg, elevationDeg: elDeg, distanceMeters: distM)
+        let itdMicros = KEMARHRIRSynthesizer.woodworthSchlosbergITDSeconds(
+            azimuthRad: pose.azimuthRadians,
+            elevationRad: pose.elevationRadians
+        ) * 1_000_000.0
+        let notch1Hz = KEMARHRIRSynthesizer.primaryPinnaNotchFrequencyHz(elevationRad: pose.elevationRadians)
+
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("3D KEMAR HRTF & Shoebox Room", systemImage: "ear.and.waveform")
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+
+                Spacer()
+
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { coordinator.synthParameters.isHRTFSpatializerEnabled },
+                        set: { coordinator.toggleHRTFSpatializer($0) }
+                    )
+                )
+                .labelsHidden()
+                .tint(accent)
+            }
+
+            HStack(spacing: 8) {
+                bioMetricPill(title: "Azimuth θ", value: String(format: "%+.0f°", azDeg))
+                bioMetricPill(title: "Elevation φ", value: String(format: "%+.0f°", elDeg))
+                bioMetricPill(title: "Distance r", value: String(format: "%.2f m", distM))
+                bioMetricPill(title: "ITD / Pinna", value: String(format: "%+.0fµs · %.1fk", itdMicros, notch1Hz / 1000.0))
+            }
+
+            GeometryReader { geo in
+                let size = geo.size
+                let center = CGPoint(x: size.width * 0.5, y: size.height * 0.5)
+                let maxRadius = min(size.width, size.height) * 0.44
+                let minDist: Float = 0.15
+                let maxDist: Float = 6.0
+                let normalizedDist = CGFloat(min(max((distM - minDist) / (maxDist - minDist), 0.0), 1.0))
+                let azRad = CGFloat(azDeg * .pi / 180.0)
+                let sourcePoint = CGPoint(
+                    x: center.x + sin(azRad) * normalizedDist * maxRadius,
+                    y: center.y - cos(azRad) * normalizedDist * maxRadius
+                )
+
+                ZStack {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(.black.opacity(0.36))
+
+                    Canvas { context, canvasSize in
+                        let c = CGPoint(x: canvasSize.width * 0.5, y: canvasSize.height * 0.5)
+                        let rMax = min(canvasSize.width, canvasSize.height) * 0.44
+
+                        for ring in 1...3 {
+                            let r = rMax * CGFloat(ring) / 3.0
+                            let circleRect = CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2)
+                            context.stroke(
+                                Path(ellipseIn: circleRect),
+                                with: .color(.white.opacity(ring == 3 ? 0.22 : 0.11)),
+                                style: StrokeStyle(lineWidth: 0.9, dash: ring == 2 ? [4, 4] : [])
+                            )
+                        }
+
+                        var crosshair = Path()
+                        crosshair.move(to: CGPoint(x: c.x, y: c.y - rMax))
+                        crosshair.addLine(to: CGPoint(x: c.x, y: c.y + rMax))
+                        crosshair.move(to: CGPoint(x: c.x - rMax, y: c.y))
+                        crosshair.addLine(to: CGPoint(x: c.x + rMax, y: c.y))
+                        context.stroke(crosshair, with: .color(.white.opacity(0.12)), lineWidth: 0.8)
+
+                        // Render 18 solved 3D image-source early reflection taps
+                        for tap in coordinator.currentRoomReflectionTaps {
+                            let tapAzRad = CGFloat(tap.listenerAzimuthDeg * .pi / 180.0)
+                            let tapNormDist = CGFloat(min(max(tap.distanceMeters / 12.0, 0.08), 0.98))
+                            let pt = CGPoint(
+                                x: c.x + sin(tapAzRad) * tapNormDist * rMax,
+                                y: c.y - cos(tapAzRad) * tapNormDist * rMax
+                            )
+                            let dotRadius: CGFloat = tap.order == 1 ? 3.4 : 2.3
+                            let rect = CGRect(x: pt.x - dotRadius, y: pt.y - dotRadius, width: dotRadius * 2, height: dotRadius * 2)
+                            let alpha = Double(min(max(tap.effectiveGain * 2.8, 0.16), 0.85))
+                            let color = tap.order == 1 ? Color.cyan.opacity(alpha) : accent.opacity(alpha * 0.8)
+                            context.fill(Path(ellipseIn: rect), with: .color(color))
+                        }
+
+                        // Render active orbiting habit satellites
+                        for sat in coordinator.synthParameters.orbitalSatellites.asArray() where sat.isActive {
+                            let satAzRad = CGFloat(sat.azimuthDeg * .pi / 180.0)
+                            let satNormDist = CGFloat(min(max((sat.distanceMeters - minDist) / (maxDist - minDist), 0.12), 0.92))
+                            let satPt = CGPoint(
+                                x: c.x + sin(satAzRad) * satNormDist * rMax,
+                                y: c.y - cos(satAzRad) * satNormDist * rMax
+                            )
+                            let satRect = CGRect(x: satPt.x - 4.0, y: satPt.y - 4.0, width: 8.0, height: 8.0)
+                            context.fill(Path(ellipseIn: satRect), with: .color(.mint.opacity(0.78)))
+                        }
+
+                        // Listener KEMAR head glyph at origin
+                        let headRect = CGRect(x: c.x - 7, y: c.y - 7, width: 14, height: 14)
+                        context.fill(Path(ellipseIn: headRect), with: .color(.white.opacity(0.90)))
+                    }
+
+                    Circle()
+                        .fill(accent)
+                        .frame(width: 24, height: 24)
+                        .shadow(color: accent, radius: 10)
+                        .overlay {
+                            Circle().strokeBorder(.white, lineWidth: 2)
+                        }
+                        .position(sourcePoint)
+                }
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { drag in
+                            let dx = Float(drag.location.x - center.x)
+                            let dy = Float(center.y - drag.location.y)
+                            let radial = sqrt(dx * dx + dy * dy) / Float(max(maxRadius, 1.0))
+                            let clampedNormDist = min(max(radial, 0.0), 1.0)
+                            let newDistance = minDist + clampedNormDist * (maxDist - minDist)
+                            let newAzimuthDeg = atan2(dx, dy) * 180.0 / .pi
+
+                            if coordinator.isOrbitalSourceAutoLockEnabled {
+                                coordinator.isOrbitalSourceAutoLockEnabled = false
+                            }
+                            coordinator.updateHRTFSourcePose(
+                                azimuthDeg: newAzimuthDeg,
+                                elevationDeg: coordinator.synthParameters.hrtfElevationDeg,
+                                distanceMeters: newDistance
+                            )
+                        }
+                )
+            }
+            .frame(height: 176)
+
+            synthSliderRow(
+                title: "Elevation Dome φ (-45° Floor to +90° Zenith)",
+                valueText: String(format: "%+.0f°", elDeg),
+                value: Binding(
+                    get: { Double(coordinator.synthParameters.hrtfElevationDeg) },
+                    set: { newEl in
+                        coordinator.updateHRTFSourcePose(
+                            azimuthDeg: coordinator.synthParameters.hrtfAzimuthDeg,
+                            elevationDeg: Float(newEl),
+                            distanceMeters: coordinator.synthParameters.hrtfDistanceMeters
+                        )
+                    }
+                ),
+                range: -45.0...90.0
+            )
+
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Orbital Trajectory Auto-Lock")
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white)
+                    Text("Revolve primary HRTF source with orbital phase & 6-DoF head pose")
+                        .font(.system(size: 10, weight: .medium, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.58))
+                }
+                Spacer()
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { coordinator.isOrbitalSourceAutoLockEnabled },
+                        set: { coordinator.toggleOrbitalSourceAutoLock($0) }
+                    )
+                )
+                .labelsHidden()
+                .tint(.cyan)
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(ShoeboxRoomPreset.allCases) { room in
+                        let selected = coordinator.activeRoomPreset == room
+                        Button {
+                            coordinator.selectShoeboxRoomPreset(room)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: room.symbolName)
+                                    .font(.system(size: 11, weight: .semibold))
+                                Text(room.displayName)
+                                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                            }
+                            .foregroundStyle(selected ? .white : .white.opacity(0.68))
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 7)
+                            .background(
+                                selected ? accent.opacity(0.45) : Color.white.opacity(0.08),
+                                in: Capsule()
+                            )
+                            .overlay {
+                                Capsule().strokeBorder(.white.opacity(selected ? 0.55 : 0.12), lineWidth: 0.8)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude, cornerRadius: 24)
+    }
+
+    // MARK: - GPU MPSGraph Neural Trainer Telemetry Card
+
+    private var mpsGraphNeuralTrainerCard: some View {
+        let accent = Color(hue: coordinator.activeAccentHue, saturation: 0.74, brightness: 0.98)
+        let telemetry = coordinator.neuralTelemetry
+        let history = coordinator.lossConvergenceHistory
+        let prediction = coordinator.latestNeuralPrediction
+
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("MPSGraph Autodiff Attention Trainer", systemImage: "memorychip.fill")
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+
+                Spacer()
+
+                Text(telemetry.activeBackend.displayTitle)
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(telemetry.activeBackend == .mpsGraphGPU ? .green : .cyan)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(.white.opacity(0.10), in: Capsule())
+            }
+
+            HStack(spacing: 8) {
+                bioMetricPill(title: "Epochs", value: "\(telemetry.epochCount)")
+                bioMetricPill(title: "Huber Loss", value: String(format: "%.4f", telemetry.latestLoss))
+                bioMetricPill(title: "‖∇L‖₂ Norm", value: String(format: "%.3f", telemetry.gradientL2Norm))
+                bioMetricPill(title: "Step Latency", value: String(format: "%.0f µs", telemetry.gpuExecutionTimeMicroseconds))
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text("Smooth-L1 + Coherence Loss Convergence")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.86))
+                    Spacer()
+                    Text(String(format: "EMA %.4f", telemetry.emaLoss))
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(accent)
+                }
+
+                Canvas { context, size in
+                    let rect = CGRect(origin: .zero, size: size)
+                    context.fill(Path(roundedRect: rect, cornerRadius: 12), with: .color(.black.opacity(0.34)))
+
+                    guard history.count >= 2 else { return }
+                    let minLoss = max(0.0, (history.min() ?? 0.0) * 0.92)
+                    let maxLoss = max(minLoss + 0.001, (history.max() ?? 1.0) * 1.05)
+                    let span = max(0.0001, maxLoss - minLoss)
+
+                    var linePath = Path()
+                    var areaPath = Path()
+                    for (idx, loss) in history.enumerated() {
+                        let nx = CGFloat(idx) / CGFloat(max(1, history.count - 1))
+                        let ny = CGFloat((loss - minLoss) / span)
+                        let px = 8 + nx * (size.width - 16)
+                        let py = size.height - 8 - ny * (size.height - 16)
+                        if idx == 0 {
+                            linePath.move(to: CGPoint(x: px, y: py))
+                            areaPath.move(to: CGPoint(x: px, y: size.height))
+                            areaPath.addLine(to: CGPoint(x: px, y: py))
+                        } else {
+                            linePath.addLine(to: CGPoint(x: px, y: py))
+                            areaPath.addLine(to: CGPoint(x: px, y: py))
+                        }
+                    }
+                    areaPath.addLine(to: CGPoint(x: size.width - 8, y: size.height))
+                    areaPath.closeSubpath()
+                    context.fill(areaPath, with: .color(accent.opacity(0.20)))
+                    context.stroke(linePath, with: .color(accent), lineWidth: 1.8)
+                }
+                .frame(height: 82)
+            }
+
+            if let prediction {
+                HStack(spacing: 8) {
+                    bioMetricPill(title: "Pred Beat", value: String(format: "%.1f Hz", prediction.binauralBeatHz))
+                    bioMetricPill(title: "Carrier", value: String(format: "%.0f Hz", prediction.carrierHz))
+                    bioMetricPill(title: "Orbit ω", value: String(format: "%.2f r/s", prediction.hrtfOrbitSpeed))
+                    bioMetricPill(title: "Coherence", value: "\(Int((prediction.targetCoherence * 100.0).rounded()))%")
+                }
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    Task { await coordinator.run32EpochGPUReplayTrainingBatch(epochs: 32) }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: coordinator.isNeuralTrainingRunning ? "hourglass" : "bolt.horizontal.circle.fill")
+                        Text(coordinator.isNeuralTrainingRunning
+                             ? "Training 32 Epochs..."
+                             : "Run 32-Epoch GPU Replay Training Batch")
+                    }
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(accent.opacity(0.55), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .disabled(coordinator.isNeuralTrainingRunning)
+
+                if prediction != nil {
+                    Button {
+                        coordinator.applyNeuralPredictionToSynth()
+                    } label: {
+                        Text("Apply Setpoint")
+                            .font(.system(size: 12, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                            .background(.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
                 }
             }
         }
@@ -1048,6 +1388,601 @@ public struct SynthLabPanelView: View {
         }
         .padding(16)
         .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude * 0.5, cornerRadius: 24)
+    }
+
+    // MARK: - Phase 7 Card A: 3D Ray-Traced Acoustics & RT60 Octave Analyzer
+
+    private var rayTracedAcousticsInspectorCard: some View {
+        let accent = Color(hue: coordinator.activeAccentHue, saturation: 0.74, brightness: 0.98)
+        let report = coordinator.latestAcousticReport
+        let rt60 = report?.rayTracedRT60PerBand ?? SIMD4<Float>(1.15, 0.92, 0.74, 0.48)
+        let sabine = report?.sabineRT60PerBand ?? SIMD4<Float>(1.24, 0.98, 0.79, 0.52)
+        let eyring = report?.eyringRT60PerBand ?? SIMD4<Float>(1.10, 0.88, 0.70, 0.46)
+
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("3D Ray-Traced Acoustics & RT60 Analyzer", systemImage: "cube.transparent.fill")
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+
+                Spacer()
+
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(coordinator.synthParameters.rayTracedAcousticsEnabled ? Color.green : Color.white.opacity(0.35))
+                        .frame(width: 6, height: 6)
+                    Text((report?.usedHardwareRayTracing == true) ? "MTLAccel HW" : "SIMD SAH-BVH")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(.white.opacity(0.10), in: Capsule())
+
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { coordinator.synthParameters.rayTracedAcousticsEnabled },
+                        set: { coordinator.toggleRayTracedAcoustics($0) }
+                    )
+                )
+                .labelsHidden()
+                .tint(accent)
+            }
+
+            // Chamber Geometry Selector
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(AcousticChamberPreset.allCases) { chamber in
+                        let selected = coordinator.selectedChamberPreset == chamber
+                        Button {
+                            coordinator.selectAcousticChamber(chamber)
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: chamber.symbolName)
+                                    .font(.system(size: 11, weight: .semibold))
+                                Text(chamber.rawValue)
+                                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                            }
+                            .foregroundStyle(selected ? .white : .white.opacity(0.68))
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 6)
+                            .background(
+                                selected ? accent.opacity(0.45) : Color.white.opacity(0.08),
+                                in: Capsule()
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            // Acoustic Surface Material BRDF Selector
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(AcousticSurfaceMaterialPreset.allCases) { mat in
+                        let selected = coordinator.selectedSurfaceMaterialPreset == mat
+                        Button {
+                            coordinator.selectAcousticSurfaceMaterial(mat)
+                        } label: {
+                            Text(mat.rawValue)
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .foregroundStyle(selected ? .white : .white.opacity(0.68))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(
+                                    selected ? Color.cyan.opacity(0.38) : Color.white.opacity(0.06),
+                                    in: Capsule()
+                                )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            // Live 2D/3D Isometric Ray-Path Projection & 4-Band Octave RT60 Bars
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack {
+                        Text("3D Ray Paths (NEE + QMC)")
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.88))
+                        Spacer()
+                        Text("\(report?.triangleCount ?? 64) tris · 0 leak")
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(accent)
+                    }
+
+                    Canvas { context, size in
+                        let rect = CGRect(origin: .zero, size: size)
+                        context.fill(Path(roundedRect: rect, cornerRadius: 12), with: .color(.black.opacity(0.36)))
+
+                        let cx = size.width * 0.5
+                        let cy = size.height * 0.54
+                        let scale = min(size.width, size.height) * 0.085
+
+                        func projectIso(_ p: SIMD3<Float>) -> CGPoint {
+                            let ix = CGFloat(p.x - p.z * 0.55) * scale
+                            let iy = CGFloat(-p.y + (p.x + p.z) * 0.24) * scale
+                            return CGPoint(x: cx + ix, y: cy + iy)
+                        }
+
+                        if let segments = report?.raySegments, !segments.isEmpty {
+                            let bandColors: [Color] = [.orange, .yellow, .cyan, .purple]
+                            for seg in segments.prefix(160) {
+                                var path = Path()
+                                path.move(to: projectIso(seg.start))
+                                path.addLine(to: projectIso(seg.end))
+                                let bCol = bandColors[min(max(seg.dominantBand, 0), 3)]
+                                let alphaFade = max(0.18, 0.82 - Double(seg.bounceIndex) * 0.11)
+                                context.stroke(
+                                    path,
+                                    with: .color(bCol.opacity(alphaFade)),
+                                    lineWidth: seg.bounceIndex == 0 ? 1.35 : 0.85
+                                )
+                            }
+                        } else {
+                            for idx in 0..<24 {
+                                let angle = Double(idx) * (Double.pi * 2.0 / 24.0)
+                                var path = Path()
+                                path.move(to: CGPoint(x: cx, y: cy))
+                                path.addLine(to: CGPoint(
+                                    x: cx + CGFloat(cos(angle)) * size.width * 0.40,
+                                    y: cy + CGFloat(sin(angle)) * size.height * 0.38
+                                ))
+                                context.stroke(path, with: .color(accent.opacity(0.35)), lineWidth: 0.9)
+                            }
+                        }
+
+                        let srcPt = projectIso(SIMD3<Float>(0.0, 0.35, 1.45))
+                        let lstPt = projectIso(SIMD3<Float>(0.0, 0.0, -1.10))
+                        context.fill(Path(ellipseIn: CGRect(x: srcPt.x - 3.5, y: srcPt.y - 3.5, width: 7, height: 7)), with: .color(.cyan))
+                        context.fill(Path(ellipseIn: CGRect(x: lstPt.x - 3.5, y: lstPt.y - 3.5, width: 7, height: 7)), with: .color(.green))
+                    }
+                }
+                .frame(maxWidth: .infinity)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack {
+                        Text("Octave RT60 (s)")
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.88))
+                        Spacer()
+                        Text(String(format: "Sab %.2fs / Eyr %.2fs", sabine.y, eyring.y))
+                            .font(.system(size: 8.5, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.cyan)
+                    }
+
+                    HStack(alignment: .bottom, spacing: 8) {
+                        ForEach(AcousticOctaveBand.allCases) { band in
+                            let val = rt60[band.rawValue]
+                            let norm = CGFloat(min(max(val / 3.5, 0.06), 1.0))
+                            VStack(spacing: 4) {
+                                Text(String(format: "%.2f", val))
+                                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                    .foregroundStyle(.white)
+                                GeometryReader { geo in
+                                    VStack {
+                                        Spacer(minLength: 0)
+                                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                            .fill(
+                                                LinearGradient(
+                                                    colors: [.cyan, accent],
+                                                    startPoint: .top,
+                                                    endPoint: .bottom
+                                                )
+                                            )
+                                            .frame(height: max(6, geo.size.height * norm))
+                                    }
+                                }
+                                Text(band.shortLabel)
+                                    .font(.system(size: 8.5, weight: .semibold, design: .rounded))
+                                    .foregroundStyle(.white.opacity(0.68))
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                    }
+                    .padding(8)
+                    .background(.black.opacity(0.36), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .frame(height: 138)
+        }
+        .padding(16)
+        .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude, cornerRadius: 24)
+    }
+
+    // MARK: - Phase 7 Card B: Neural Latent Diffusion & RVQ Token Matrix Inspector
+
+    private var neuralLatentDiffusionInspectorCard: some View {
+        let accent = Color(hue: coordinator.activeAccentHue, saturation: 0.74, brightness: 0.98)
+        let tele = coordinator.latestNeuralSoundscapeTelemetry
+        let r4Norm = tele.stageResidualNorms.last ?? 0.0
+
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("Neural Latent Diffusion & RVQ Vocoder", systemImage: "waveform.badge.sparkles")
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+
+                Spacer()
+
+                Button {
+                    coordinator.reseedNeuralSoundscape()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "dice.fill")
+                        Text("Reseed ODE")
+                    }
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(accent.opacity(0.45), in: Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+
+            HStack(spacing: 8) {
+                bioMetricPill(title: "Perplexity", value: String(format: "%.1f / 64", tele.codebookPerplexity))
+                bioMetricPill(title: "RVQ Bitrate", value: String(format: "%.1f kbps", tele.bitrateKbps))
+                bioMetricPill(title: "Commit Loss", value: String(format: "%.4f", tele.commitmentLoss))
+                bioMetricPill(title: "Residual ‖r₄‖₂", value: String(format: "%.2f", r4Norm))
+            }
+
+            // 4 x 64 RVQ Codebook Token Matrix Visualizer
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text("4×64 RVQ Codebook Token Matrix (C₁…C₄ × 64 Frames)")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.88))
+                    Spacer()
+                    Text("Seq #\(tele.blockSequence) · \(String(format: "%.2f bits", tele.codebookEntropyBits))")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.cyan)
+                }
+
+                Canvas { context, size in
+                    let rect = CGRect(origin: .zero, size: size)
+                    context.fill(Path(roundedRect: rect, cornerRadius: 10), with: .color(.black.opacity(0.40)))
+
+                    let stages = 4
+                    let frames = 64
+                    let pad: CGFloat = 4.0
+                    let cellW = max(1.0, (size.width - pad * 2.0) / CGFloat(frames))
+                    let cellH = max(4.0, (size.height - pad * 2.0) / CGFloat(stages))
+
+                    let grid = tele.tokenGrid
+                    for s in 0..<min(stages, grid.count) {
+                        let row = grid[s]
+                        for f in 0..<min(frames, row.count) {
+                            let tok = Int(row[f] & 0x3F)
+                            let norm = Double(tok) / 63.0
+                            let hue = (coordinator.activeAccentHue + norm * 0.38).truncatingRemainder(dividingBy: 1.0)
+                            let cellRect = CGRect(
+                                x: pad + CGFloat(f) * cellW,
+                                y: pad + CGFloat(s) * cellH,
+                                width: max(1.0, cellW - 0.6),
+                                height: max(2.0, cellH - 1.5)
+                            )
+                            let color = Color(hue: hue, saturation: 0.78, brightness: 0.35 + norm * 0.65)
+                            context.fill(Path(roundedRect: cellRect, cornerRadius: 1.5), with: .color(color))
+                        }
+                    }
+                }
+                .frame(height: 62)
+            }
+
+            synthSliderRow(
+                title: "Rectified-Flow CFG Guidance (w)",
+                valueText: String(format: "%.2f×", coordinator.synthParameters.latentGuidanceScale),
+                value: Binding(
+                    get: { Double(coordinator.synthParameters.latentGuidanceScale) },
+                    set: { val in
+                        var p = coordinator.synthParameters
+                        p.latentGuidanceScale = Float(val)
+                        coordinator.pushSynthParameters(p, clearingPresetSelection: false)
+                    }
+                ),
+                range: 1.0...4.0
+            )
+
+            synthSliderRow(
+                title: "Latent Prior Entropy Temperature (τ)",
+                valueText: String(format: "%.2f", coordinator.synthParameters.latentTemperature),
+                value: Binding(
+                    get: { Double(coordinator.synthParameters.latentTemperature) },
+                    set: { val in
+                        var p = coordinator.synthParameters
+                        p.latentTemperature = Float(val)
+                        coordinator.pushSynthParameters(p, clearingPresetSelection: false)
+                    }
+                ),
+                range: 0.1...2.0
+            )
+
+            synthSliderRow(
+                title: "Neural Vocoder Stream Mix (50% Hann OLA)",
+                valueText: "\(Int((coordinator.synthParameters.neuralSoundscapeMix * 100).rounded()))%",
+                value: Binding(
+                    get: { Double(coordinator.synthParameters.neuralSoundscapeMix) },
+                    set: { val in
+                        var p = coordinator.synthParameters
+                        p.neuralSoundscapeMix = Float(val)
+                        coordinator.pushSynthParameters(p, clearingPresetSelection: false)
+                    }
+                ),
+                range: 0.0...1.0
+            )
+        }
+        .padding(16)
+        .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude * 0.6, cornerRadius: 24)
+    }
+
+    // MARK: - Phase 8 Card: Distributed Multi-Peer Spatial Orchestra & Wave-Field Array
+
+    private var distributedOrchestraArrayCard: some View {
+        let accent = Color(hue: coordinator.activeAccentHue, saturation: 0.74, brightness: 0.98)
+        let snap = coordinator.orchestraSnapshot
+
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("Distributed PTP Orchestra & Wave-Field Array", systemImage: "dot.radiowaves.left.and.right")
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+
+                Spacer()
+
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(snap.isPhaseLocked
+                              ? Color.green
+                              : (snap.isMeshSyncEnabled ? Color.cyan : Color.white.opacity(0.35)))
+                        .frame(width: 6, height: 6)
+                    Text(snap.isPhaseLocked
+                         ? "PLL LOCKED <250µs"
+                         : (snap.isMeshSyncEnabled ? "SYNCING" : "STANDBY"))
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.88))
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(.white.opacity(0.10), in: Capsule())
+            }
+
+            VStack(spacing: 10) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Conductor / Follower Mesh Sync")
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white)
+                        Text("64B 4-timestamp PTP + Marzullo W=16 + 2nd-Order PI-PLL servo")
+                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.58))
+                    }
+                    Spacer()
+                    Toggle(
+                        "",
+                        isOn: Binding(
+                            get: { snap.isMeshSyncEnabled },
+                            set: { coordinator.toggleOrchestraMeshSync($0) }
+                        )
+                    )
+                    .labelsHidden()
+                    .tint(accent)
+                }
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Simulate 4-Node Acoustic Array")
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white)
+                        Text("2.5D Rayleigh I WFS & 3rd-order Lagrange Time-of-Flight alignment")
+                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.58))
+                    }
+                    Spacer()
+                    Toggle(
+                        "",
+                        isOn: Binding(
+                            get: { snap.isSimulatingQuadArray },
+                            set: { coordinator.toggleSimulateQuadArray($0) }
+                        )
+                    )
+                    .labelsHidden()
+                    .tint(.cyan)
+                }
+            }
+
+            // Live PTP + Marzullo + PI-PLL Telemetry Pills
+            HStack(spacing: 8) {
+                bioMetricPill(
+                    title: "Marzullo PTP",
+                    value: String(format: "%+.1f µs", snap.marzulloOffsetMicroseconds)
+                )
+                bioMetricPill(
+                    title: "Allan σy(τ)",
+                    value: String(format: "%.2e", snap.allanDeviation)
+                )
+                bioMetricPill(
+                    title: "PLL Warp",
+                    value: String(format: "%+.1f ppm", snap.pllFrequencyWarpPPM)
+                )
+                bioMetricPill(
+                    title: "Outliers",
+                    value: "\(snap.rejectedOutliers)/16"
+                )
+            }
+
+            // Active Local Speaker Node Selector
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(snap.nodeSolutions) { sol in
+                        let isSelected = sol.nodeID == snap.activeLocalNodeID
+                        Button {
+                            coordinator.selectOrchestraLocalNode(sol.nodeID)
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: sol.nodeID == 1 ? "crown.fill" : "hifispeaker.fill")
+                                    .font(.system(size: 10, weight: .semibold))
+                                Text("N\(sol.nodeID) · \(String(format: "%.2f ms", sol.tofDelaySeconds * 1000.0))")
+                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            }
+                            .foregroundStyle(isSelected ? .white : .white.opacity(0.70))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(
+                                isSelected ? accent.opacity(0.46) : Color.white.opacity(0.08),
+                                in: Capsule()
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            // Interactive 2D Room Sweet-Spot & Speaker Array Placement Map
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("2D Acoustic Wave-Field Sweet-Spot Map (Drag Selected Speaker Node)")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.88))
+                    Spacer()
+                    Text(String(
+                        format: "Src (%.1f, %.1f)m",
+                        snap.virtualSourcePositionMeters.x,
+                        snap.virtualSourcePositionMeters.z
+                    ))
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.cyan)
+                }
+
+                GeometryReader { geo in
+                    let size = geo.size
+                    let maxMeters: Double = 3.5
+
+                    ZStack {
+                        Canvas { context, canvasSize in
+                            let rect = CGRect(origin: .zero, size: canvasSize)
+                            context.fill(Path(roundedRect: rect, cornerRadius: 14), with: .color(.black.opacity(0.38)))
+
+                            let cx = canvasSize.width * 0.5
+                            let cy = canvasSize.height * 0.5
+
+                            // Room grid & concentric acoustic wavefront rings around Virtual Source
+                            for ring in 1...4 {
+                                let r = CGFloat(ring) * min(canvasSize.width, canvasSize.height) * 0.11
+                                let circleRect = CGRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2)
+                                context.stroke(
+                                    Path(ellipseIn: circleRect),
+                                    with: .color(.white.opacity(0.08)),
+                                    style: StrokeStyle(lineWidth: 0.8, dash: [3, 3])
+                                )
+                            }
+
+                            func mapMetersToPoint(_ pos: SIMD3<Double>) -> CGPoint {
+                                let nx = (pos.x / maxMeters) * 0.44 + 0.5
+                                let ny = 0.5 - (pos.z / maxMeters) * 0.44
+                                return CGPoint(
+                                    x: min(max(nx, 0.06), 0.94) * canvasSize.width,
+                                    y: min(max(ny, 0.08), 0.92) * canvasSize.height
+                                )
+                            }
+
+                            let listenerPt = mapMetersToPoint(snap.listenerPositionMeters)
+                            let sourcePt = mapMetersToPoint(snap.virtualSourcePositionMeters)
+
+                            // Acoustic wavefronts from Virtual Source
+                            for w in 1...3 {
+                                let radius = CGFloat(w) * 24.0
+                                let waveRect = CGRect(
+                                    x: sourcePt.x - radius,
+                                    y: sourcePt.y - radius,
+                                    width: radius * 2,
+                                    height: radius * 2
+                                )
+                                context.stroke(
+                                    Path(ellipseIn: waveRect),
+                                    with: .color(.cyan.opacity(0.28 - Double(w) * 0.06)),
+                                    lineWidth: 1.0
+                                )
+                            }
+
+                            // Draw propagation vectors from each speaker node to Listener Sweet Spot
+                            for sol in snap.nodeSolutions {
+                                let nodePt = mapMetersToPoint(sol.positionMeters)
+                                var ray = Path()
+                                ray.move(to: nodePt)
+                                ray.addLine(to: listenerPt)
+                                let isLocal = sol.nodeID == snap.activeLocalNodeID
+                                context.stroke(
+                                    ray,
+                                    with: .color(isLocal ? accent.opacity(0.85) : .white.opacity(0.26)),
+                                    style: StrokeStyle(lineWidth: isLocal ? 1.6 : 1.0, dash: [4, 3])
+                                )
+
+                                let nodeRadius: CGFloat = isLocal ? 7.5 : 5.5
+                                let nodeRect = CGRect(
+                                    x: nodePt.x - nodeRadius,
+                                    y: nodePt.y - nodeRadius,
+                                    width: nodeRadius * 2,
+                                    height: nodeRadius * 2
+                                )
+                                context.fill(
+                                    Path(ellipseIn: nodeRect),
+                                    with: .color(isLocal ? accent : .white.opacity(0.82))
+                                )
+                            }
+
+                            // Virtual Acoustic Source marker
+                            let srcRect = CGRect(x: sourcePt.x - 6, y: sourcePt.y - 6, width: 12, height: 12)
+                            context.fill(Path(ellipseIn: srcRect), with: .color(.cyan))
+
+                            // Listener Sweet Spot marker at origin
+                            let lstRect = CGRect(x: listenerPt.x - 7, y: listenerPt.y - 7, width: 14, height: 14)
+                            context.fill(Path(ellipseIn: lstRect), with: .color(.green))
+                        }
+                        .gesture(
+                            DragGesture(minimumDistance: 0)
+                                .onChanged { drag in
+                                    let nx = Double((drag.location.x / max(1.0, size.width)) - 0.5) / 0.44
+                                    let nz = Double(0.5 - (drag.location.y / max(1.0, size.height))) / 0.44
+                                    let xMeters = min(max(nx * maxMeters, -3.2), 3.2)
+                                    let zMeters = min(max(nz * maxMeters, -3.2), 3.2)
+                                    coordinator.moveOrchestraSpeakerNode(
+                                        nodeID: snap.activeLocalNodeID,
+                                        xMeters: xMeters,
+                                        zMeters: zMeters
+                                    )
+                                }
+                        )
+                    }
+                }
+                .frame(height: 156)
+            }
+
+            // Per-Node Wave-Field ToF Delay (ms) & Rayleigh Driving Gain Breakdown
+            VStack(spacing: 5) {
+                ForEach(snap.nodeSolutions) { sol in
+                    HStack {
+                        Text("Node \(sol.nodeID): \(sol.label)")
+                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                            .foregroundStyle(sol.nodeID == snap.activeLocalNodeID ? .white : .white.opacity(0.72))
+                        Spacer()
+                        Text(String(
+                            format: "ToF %.2f ms · Gain %.2fx",
+                            sol.tofDelaySeconds * 1000.0,
+                            sol.wfsDrivingAmplitude
+                        ))
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundStyle(sol.nodeID == snap.activeLocalNodeID ? accent : .cyan.opacity(0.85))
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude * 0.65, cornerRadius: 24)
     }
 
     private func synthSliderRow(
