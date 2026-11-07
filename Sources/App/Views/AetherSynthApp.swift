@@ -189,6 +189,9 @@ public struct RootSpatialShellView: View {
         .sheet(isPresented: $coordinator.isMeshSyncSheetPresented) {
             MeshSyncStatusSheetView(coordinator: coordinator)
         }
+        .sheet(isPresented: $coordinator.isCapstoneAuditSheetPresented) {
+            CapstoneAuditRunnerSheetView(coordinator: coordinator)
+        }
         .fileExporter(
             isPresented: $coordinator.isExportingWAV,
             document: coordinator.exportWAVDocument,
@@ -206,7 +209,17 @@ public struct RootSpatialShellView: View {
             defaultFilename: "AetherSynth-Capstone-Audit-\(DayKeyFormatter.dayKey(for: .now)).md"
         ) { result in
             if case .success = result {
-                coordinator.presentTransientBanner("Capstone audit report exported.")
+                coordinator.presentTransientBanner("Capstone Markdown report exported.")
+            }
+        }
+        .fileExporter(
+            isPresented: $coordinator.isExportingCapstoneJSON,
+            document: coordinator.exportCapstoneJSONDocument,
+            contentType: .json,
+            defaultFilename: "AetherSynth-Capstone-Audit-\(DayKeyFormatter.dayKey(for: .now)).json"
+        ) { result in
+            if case .success = result {
+                coordinator.presentTransientBanner("Capstone JSON report exported.")
             }
         }
         .fileExporter(
@@ -253,6 +266,42 @@ public struct RootSpatialShellView: View {
             }
 
             Spacer()
+
+            Menu {
+                Button {
+                    coordinator.isCapstoneAuditSheetPresented = true
+                } label: {
+                    Label("Master Capstone Benchmark Sheet", systemImage: "list.bullet.clipboard.fill")
+                }
+
+                Button {
+                    Task { await coordinator.prepareCapstoneMarkdownExport() }
+                } label: {
+                    Label("Export Master Certification Report (.md)", systemImage: "doc.richtext.fill")
+                }
+
+                Button {
+                    Task { await coordinator.prepareCapstoneJSONExport() }
+                } label: {
+                    Label("Export Master Certification Report (.json)", systemImage: "curlybraces.square.fill")
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "checkmark.shield.fill")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(.cyan)
+                    Text("Certify")
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.90))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.ultraThinMaterial, in: Capsule())
+                .overlay {
+                    Capsule().strokeBorder(.white.opacity(0.18), lineWidth: 0.8)
+                }
+            }
+            .buttonStyle(.plain)
 
             HStack(spacing: 8) {
                 Image(systemName: "waveform")

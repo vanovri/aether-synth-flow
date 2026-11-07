@@ -445,3 +445,91 @@ public struct SpectralCausticsView: View {
         }
     }
 }
+
+// MARK: - 4. ChromaticCausticsViewportView (Direct WaveTank Snapshot Caustics Viewport)
+
+public struct ChromaticCausticsViewportView: View {
+    public let waveTank: FDTD2DWaveTank
+    public let audioAmplitude: Float
+    public let highBandEnergy: Float
+    public let accentHue: Double
+    public let photonCount: Int
+
+    public init(
+        waveTank: FDTD2DWaveTank,
+        audioAmplitude: Float,
+        highBandEnergy: Float,
+        accentHue: Double,
+        photonCount: Int = 3_072
+    ) {
+        self.waveTank = waveTank
+        self.audioAmplitude = audioAmplitude
+        self.highBandEnergy = highBandEnergy
+        self.accentHue = accentHue
+        self.photonCount = max(512, photonCount)
+    }
+
+    public var body: some View {
+        Canvas(rendersAsynchronously: false) { context, canvasSize in
+            let fullN = waveTank.gridSize
+            let renderN = min(40, fullN)
+            let strideStep = max(1, fullN / renderN)
+
+            var sampledPressure = [Float](repeating: 0.0, count: renderN * renderN)
+            let gain: Float = 5.5 + min(max(audioAmplitude, 0.0), 1.0) * 3.0
+            for ry in 0..<renderN {
+                let sy = min(fullN - 1, ry * strideStep)
+                for rx in 0..<renderN {
+                    let sx = min(fullN - 1, rx * strideStep)
+                    sampledPressure[ry * renderN + rx] = waveTank.pressureCurr[sy * fullN + sx] * gain
+                }
+            }
+
+            let caustics = AcoustoOpticCausticsEngine.traceCausticsField(
+                pressureGrid: sampledPressure,
+                gridSize: renderN,
+                photonCount: photonCount
+            )
+
+            context.fill(
+                Path(CGRect(origin: .zero, size: canvasSize)),
+                with: .color(Color(red: 0.015, green: 0.022, blue: 0.048))
+            )
+
+            let cellW = canvasSize.width / CGFloat(renderN)
+            let cellH = canvasSize.height / CGFloat(renderN)
+            let prevBlend = context.blendMode
+            context.blendMode = .plusLighter
+
+            for ry in 0..<renderN {
+                for rx in 0..<renderN {
+                    let rgb = caustics[ry * renderN + rx]
+                    let mapped = SIMD3<Float>(
+                        rgb.x / (1.0 + rgb.x * 0.65),
+                        rgb.y / (1.0 + rgb.y * 0.65),
+                        rgb.z / (1.0 + rgb.z * 0.65)
+                    )
+                    let luma = max(mapped.x, max(mapped.y, mapped.z))
+                    guard luma > 0.015 else { continue }
+
+                    let srgbR = Double(powf(min(max(mapped.x, 0.0), 1.0), 1.0 / 2.2))
+                    let srgbG = Double(powf(min(max(mapped.y, 0.0), 1.0), 1.0 / 2.2))
+                    let srgbB = Double(powf(min(max(mapped.z, 0.0), 1.0), 1.0 / 2.2))
+
+                    let rect = CGRect(
+                        x: CGFloat(rx) * cellW - 0.5,
+                        y: CGFloat(ry) * cellH - 0.5,
+                        width: cellW + 1.0,
+                        height: cellH + 1.0
+                    )
+                    context.fill(
+                        Path(rect),
+                        with: .color(Color(red: srgbR, green: srgbG, blue: srgbB))
+                    )
+                }
+            }
+
+            context.blendMode = prevBlend
+        }
+    }
+}

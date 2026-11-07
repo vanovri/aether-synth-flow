@@ -102,6 +102,11 @@ public struct EEGElectrodeImpedanceReport: Codable, Sendable, Equatable {
         return min(max(1.0 - (kOhm - 5.0) / 95.0, 0.05), 1.0)
     }
 
+    public var tp9Quality: Float { contactQuality(for: .tp9) }
+    public var af7Quality: Float { contactQuality(for: .af7) }
+    public var af8Quality: Float { contactQuality(for: .af8) }
+    public var tp10Quality: Float { contactQuality(for: .tp10) }
+
     public var meanQuality: Float {
         0.25 * (
             contactQuality(for: .tp9) +

@@ -476,14 +476,40 @@ public struct Phase10QuantumAndCapstoneCardView: View {
                         Button {
                             coordinator.isExportingCapstoneMarkdown = true
                         } label: {
-                            Image(systemName: "doc.text.fill")
-                                .font(.system(size: 14, weight: .bold))
+                            Text(".MD")
+                                .font(.system(size: 11, weight: .black, design: .monospaced))
                                 .foregroundStyle(.white)
-                                .padding(10)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 10)
                                 .background(.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                         }
                         .buttonStyle(.plain)
                     }
+
+                    if coordinator.exportCapstoneJSONDocument != nil {
+                        Button {
+                            coordinator.isExportingCapstoneJSON = true
+                        } label: {
+                            Text(".JSON")
+                                .font(.system(size: 11, weight: .black, design: .monospaced))
+                                .foregroundStyle(.cyan)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 10)
+                                .background(.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    Button {
+                        coordinator.isCapstoneAuditSheetPresented = true
+                    } label: {
+                        Image(systemName: "list.bullet.clipboard.fill")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(10)
+                            .background(.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
                 }
 
                 if let report = coordinator.latestCapstoneReport {
@@ -579,6 +605,115 @@ public struct MeshSyncStatusSheetView: View {
                 }
             }
             .navigationTitle("Zero-Knowledge Mesh Sync")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
+// MARK: - 5. Master Capstone 12-Stage Benchmark & Cryptographic Certification Runner Sheet (Track 36)
+
+public struct CapstoneAuditRunnerSheetView: View {
+    @Bindable public var coordinator: AetherAppCoordinator
+    @Environment(\.dismiss) private var dismiss
+
+    public init(coordinator: AetherAppCoordinator) {
+        self.coordinator = coordinator
+    }
+
+    public var body: some View {
+        NavigationStack {
+            List {
+                Section("Master Certification Command") {
+                    Button {
+                        Task { await coordinator.runFullCapstoneAudit() }
+                    } label: {
+                        HStack {
+                            Image(systemName: coordinator.isRunningCapstoneAudit ? "hourglass" : "checkmark.shield.fill")
+                            Text(coordinator.isRunningCapstoneAudit ? "Executing 12-Stage Deterministic Audit…" : "Run Full 12-Stage Capstone Benchmark")
+                                .fontWeight(.bold)
+                        }
+                    }
+                    .disabled(coordinator.isRunningCapstoneAudit)
+
+                    HStack(spacing: 12) {
+                        Button {
+                            Task { await coordinator.prepareCapstoneMarkdownExport() }
+                        } label: {
+                            Label("Export Report (.md)", systemImage: "doc.richtext.fill")
+                                .font(.caption.bold())
+                        }
+                        .buttonStyle(.borderedProminent)
+
+                        Button {
+                            Task { await coordinator.prepareCapstoneJSONExport() }
+                        } label: {
+                            Label("Export Report (.json)", systemImage: "curlybraces.square.fill")
+                                .font(.caption.bold())
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+
+                if let report = coordinator.latestCapstoneReport {
+                    Section("Cryptographic Digest & Latency Summary") {
+                        LabeledContent("Status", value: report.allInvariantsPassed ? "PASS (\(report.passedStageCount)/\(report.totalStageCount))" : "ATTENTION")
+                        LabeledContent("Wall Time", value: String(format: "%.2f ms", report.totalWallTimeMilliseconds))
+                        LabeledContent("Latency p50 / p95 / p99", value: String(format: "%.0f / %.0f / %.0f µs", report.p50Microseconds, report.p95Microseconds, report.p99Microseconds))
+                        LabeledContent("SHA-256 Digest", value: String(report.cryptographicSHA256Digest.prefix(24)) + "…")
+                            .font(.caption.monospaced())
+                    }
+
+                    Section("12-Stage End-to-End Subsystem Benchmarks") {
+                        ForEach(report.stages) { stage in
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text("[\(stage.stageCode)] \(stage.title)")
+                                        .font(.subheadline.bold())
+                                    Spacer()
+                                    Text(stage.invariantPassed ? "PASS" : "FAIL")
+                                        .font(.caption.bold())
+                                        .foregroundStyle(stage.invariantPassed ? .green : .red)
+                                }
+                                Text("\(stage.subsystemName) · p50 \(String(format: "%.1fµs", stage.p50Microseconds)) · p95 \(String(format: "%.1fµs", stage.p95Microseconds)) · p99 \(String(format: "%.1fµs", stage.p99Microseconds))")
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                                Text(stage.numericalInvariantSummary)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.cyan)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+
+                    Section("Repository Subsystem Inventory (\(report.subsystemInventory.count) Modules)") {
+                        ForEach(report.subsystemInventory) { item in
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack {
+                                    Text("Phase \(item.phaseNumber) (\(item.trackRange)) — \(item.moduleName)")
+                                        .font(.caption.bold())
+                                    Spacer()
+                                    Image(systemName: item.verified ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                                        .foregroundStyle(item.verified ? .green : .orange)
+                                        .font(.caption)
+                                }
+                                Text(item.sourcePath)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                                Text(item.mathematicalCore)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Capstone Master Certification")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }

@@ -592,6 +592,20 @@ public actor TelemetryDatabaseActor {
         return try modelContext.fetch(descriptor).map(HabitNodeDTO.init(model:))
     }
 
+    public func fetchAllSessions() throws -> [FocusSessionDTO] {
+        let descriptor = FetchDescriptor<FocusSession>(
+            sortBy: [SortDescriptor(\FocusSession.startedAt, order: .forward)]
+        )
+        return try modelContext.fetch(descriptor).map(FocusSessionDTO.init(model:))
+    }
+
+    public func fetchAllTelemetry() throws -> [DailyTelemetryDTO] {
+        let descriptor = FetchDescriptor<DailyTelemetry>(
+            sortBy: [SortDescriptor(\DailyTelemetry.dayKey, order: .forward)]
+        )
+        return try modelContext.fetch(descriptor).map(DailyTelemetryDTO.init(model:))
+    }
+
     // MARK: - Full Ledger Archive Export / Import & CSV Portability
 
     public func exportFullArchive(exportedAt: Date = .now) throws -> AetherTelemetryArchive {

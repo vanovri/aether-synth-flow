@@ -49,6 +49,18 @@ public struct MeshPeerSummary: Codable, Sendable, Identifiable, Equatable {
         self.lamportClock = lamportClock
         self.isConnected = isConnected
     }
+
+    public var shortFingerprint: String {
+        String(peerID.prefix(8))
+    }
+
+    public var lastLamportClock: UInt64 {
+        lamportClock
+    }
+
+    public var isAuthenticated: Bool {
+        isConnected
+    }
 }
 
 public struct MeshHandshakeHello: Codable, Sendable, Equatable {
@@ -397,6 +409,22 @@ public actor AetherMeshSyncActor {
 
     public func currentLamportClock() -> UInt64 {
         lamportClock
+    }
+
+    public func startBonjourMesh(displayName: String = "AetherNode") {
+        startMesh(displayName: displayName)
+    }
+
+    public func stopBonjourMesh() {
+        stopMesh()
+    }
+
+    public func snapshotMeshStatus() -> (isListening: Bool, lamportClock: UInt64, peers: [MeshPeerSummary]) {
+        (isMeshActive, lamportClock, snapshotPeers())
+    }
+
+    public func broadcastEncryptedArchiveToAllPeers() async -> Int {
+        (try? await broadcastSyncNow()) ?? 0
     }
 
     /// Deterministic in-memory peer exchange helper enabling full E2EE handshake + Lamport clock + SwiftData CRDT

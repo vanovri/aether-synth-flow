@@ -54,6 +54,8 @@ public struct OrbitalFocusArenaView: View {
 
                 orbitalAutonomicStatusStrip
 
+                orbitalQuantumCausticsOverlayCard
+
                 if let activeHabit = selectedHabit {
                     selectedHabitDetailStrip(activeHabit)
                 }
@@ -395,6 +397,60 @@ public struct OrbitalFocusArenaView: View {
         }
         .padding(13)
         .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude * 0.4, cornerRadius: 20)
+    }
+
+    private var orbitalQuantumCausticsOverlayCard: some View {
+        let accent = Color(hue: coordinator.activeAccentHue, saturation: 0.76, brightness: 0.98)
+        let mps = coordinator.latestMPSTelemetry
+        let svn = mps?.vonNeumannEntropyNats ?? 0.0
+        let purity = mps?.renyi2Purity ?? 1.0
+        let spindleRatio = coordinator.latestSPWVDResult?.corticalSpindlePowerRatio ?? 0.0
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: "atom")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.cyan)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Quantum MPS Entanglement Gauge & Acousto-Optic Caustics")
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                    Text(
+                        String(
+                            format: "S_vN %.3f nats · Purity P₂ %.2f · Spindle 11–16Hz %.0f%%",
+                            svn,
+                            purity,
+                            spindleRatio * 100.0
+                        )
+                    )
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.72))
+                }
+
+                Spacer()
+
+                Toggle("Caustics", isOn: $coordinator.showOpticalCausticsMode)
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(.cyan)
+                    .tint(accent)
+                    .fixedSize()
+            }
+
+            if coordinator.showOpticalCausticsMode {
+                SpectralCausticsView(
+                    waveTankController: coordinator.waveTankController,
+                    spectrumBars: coordinator.fftBins,
+                    dominantSpectrumHz: coordinator.synthParameters.carrierFrequencyHz,
+                    liveAudioAmplitude: Double(coordinator.liveAudioAmplitude),
+                    photonCount: 2_048
+                )
+                .frame(height: 112)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+        }
+        .padding(13)
+        .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude * 0.45, cornerRadius: 20)
     }
 }
 

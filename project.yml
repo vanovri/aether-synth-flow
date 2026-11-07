@@ -20,8 +20,8 @@ targets:
     type: application
     platform: iOS
     deploymentTarget: "18.0"
-    # Includes Phase 7 AcousticRayTracingKernels.metal, MetalAcousticRayTracer.swift & NeuralLatentSoundscapeEngine.swift
-    # and Phase 8 AUv3 Instrument/Effect Extension & Distributed PTP Orchestra
+    # Includes Phases 1–10: Procedural DSP, KEMAR HRTF, MPSGraph, Ray Tracing, Neural Latent Flow,
+    # AUv3/PTP Orchestra, 2D FDTD + 4-Ch EEG BCI, SPWVD/HHT, Quantum MPS/DMRG, Volumetric Caustics & Capstone Audit
     sources:
       - path: Sources/Shared
       - path: Sources/App
@@ -84,6 +84,8 @@ targets:
       - path: Sources/Shared/PersistenceModels.swift
       - path: Sources/Shared/DistributedOrchestraEngine.swift
       - path: Sources/Shared/NeuralLatentSoundscapeEngine.swift
+      - path: Sources/Shared/WignerVilleHilbertHuangAnalyzer.swift
+      - path: Sources/Shared/TensorNetworkQuantumOptimizer.swift
       - path: Sources/App/Audio/AudioSynthEngine.swift
       - path: Sources/App/Audio/ReverbAndFMDSP.swift
       - path: Sources/App/Audio/SpectralFFTAnalyzer.swift
@@ -93,6 +95,7 @@ targets:
       - path: Sources/App/Audio/FDTDWaveguideSolver.swift
       - path: Sources/App/Graphics/AcousticRayTracingKernels.metal
       - path: Sources/App/Graphics/FDTDWaveguideKernels.metal
+      - path: Sources/App/Graphics/VolumetricCausticsKernels.metal
     info:
       path: Config/AetherSynthAUv3-Info.plist
     entitlements:

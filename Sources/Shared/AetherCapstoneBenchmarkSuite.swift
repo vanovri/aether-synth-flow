@@ -92,6 +92,22 @@ public struct CapstoneAuditReport: Codable, Sendable, Equatable {
     public let subsystemInventory: [SubsystemInventoryEntry]
     public let cryptographicSHA256Digest: String
 
+    public var reportSHA256Hex: String {
+        cryptographicSHA256Digest
+    }
+
+    public var p50Microseconds: Double {
+        overallP50Microseconds
+    }
+
+    public var p95Microseconds: Double {
+        overallP95Microseconds
+    }
+
+    public var p99Microseconds: Double {
+        overallP99Microseconds
+    }
+
     public init(
         schemaVersion: String = "AETHER-CAPSTONE-PHASE10-V1",
         generatedAtISO8601: String,
@@ -183,6 +199,10 @@ public struct CapstoneMarkdownReportDocument: FileDocument, Sendable {
         self.markdownText = markdownText
     }
 
+    public init(report: CapstoneAuditReport) {
+        self.markdownText = report.renderMarkdownReport()
+    }
+
     public init(configuration: ReadConfiguration) throws {
         if let data = configuration.file.regularFileContents,
            let str = String(data: data, encoding: .utf8) {
@@ -205,6 +225,10 @@ public struct CapstoneJSONReportDocument: FileDocument, Sendable {
         self.jsonData = jsonData
     }
 
+    public init(report: CapstoneAuditReport) {
+        self.jsonData = (try? report.renderJSONData()) ?? Data()
+    }
+
     public init(configuration: ReadConfiguration) throws {
         self.jsonData = configuration.file.regularFileContents ?? Data()
     }
@@ -223,6 +247,10 @@ public actor AetherCapstoneBenchmarkSuite {
     public static let shared = AetherCapstoneBenchmarkSuite()
 
     public init() {}
+
+    public static func runFullAudit() async throws -> CapstoneAuditReport {
+        await shared.runFullAudit()
+    }
 
     /// Executes all 12 deterministic stress benchmark stages across Phases 1–10 and returns a cryptographically signed `CapstoneAuditReport`.
     public func runFullAudit() async -> CapstoneAuditReport {

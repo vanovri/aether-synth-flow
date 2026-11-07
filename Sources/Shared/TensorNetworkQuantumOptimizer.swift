@@ -43,6 +43,23 @@ public struct MPSTelemetrySnapshot: Codable, Sendable, Equatable {
     public var mappedSpectralInharmonicity: Float {
         Float(1.0 + 1.5 * min(max(1.0 - renyi2Purity, 0.0), 1.0))
     }
+
+    public var maxEntanglementEntropyNats: Double {
+        vonNeumannEntropyNats
+    }
+
+    public var groundStateEnergy: Double {
+        variationalEnergy
+    }
+
+    public var effectiveSchmidtRank: Double {
+        1.0 / max(1e-12, renyi2Purity)
+    }
+
+    public var totalTruncationError: Double {
+        let sumSq = schmidtSingularValues.reduce(0.0) { $0 + $1 * $1 }
+        return max(0.0, 1.0 - sumSq)
+    }
 }
 
 public struct MPSCoreTensor: Codable, Sendable, Equatable {

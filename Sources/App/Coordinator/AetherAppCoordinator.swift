@@ -131,12 +131,16 @@ public final class AetherAppCoordinator {
     public var latestSPWVDResult: SPWVDResult?
     public var latestHHTResult: HilbertHuangResult?
     public var latestMPSTelemetry: MPSTelemetrySnapshot?
+    public var latestOptimalBioAcousticControl: OptimalBioAcousticControl?
     public var dmrgSweepSnapshots: [MPSTelemetrySnapshot] = []
     public var selectedMPSBondDimension: Int = 8
     public var latestCapstoneReport: CapstoneAuditReport?
     public var isRunningCapstoneAudit: Bool = false
+    public var isCapstoneAuditSheetPresented: Bool = false
     public var exportCapstoneMarkdownDocument: CapstoneReportMarkdownDocument?
     public var isExportingCapstoneMarkdown: Bool = false
+    public var exportCapstoneJSONDocument: CapstoneReportJSONDocument?
+    public var isExportingCapstoneJSON: Bool = false
 
     // Underlying Actors, DSP, Haptics & System Bridges
     public let hapticDirector = HapticDirector()
@@ -1472,6 +1476,8 @@ public final class AetherAppCoordinator {
         )
         dmrgSweepSnapshots = sweeps
         latestMPSTelemetry = sweeps.last
+        let mpsEngine = MatrixProductStateEngine(stateVector: bell, maxBondDim: selectedMPSBondDimension)
+        latestOptimalBioAcousticControl = DMRGVariationalOptimizer.extractOptimalBioAcousticControl(from: mpsEngine)
         if let last = sweeps.last {
             var updated = synthParameters
             updated.padDetuneCents = last.mappedHarmonicTension * 24.0
@@ -1491,6 +1497,7 @@ public final class AetherAppCoordinator {
             let report = try await AetherCapstoneBenchmarkSuite.runFullAudit()
             latestCapstoneReport = report
             exportCapstoneMarkdownDocument = CapstoneReportMarkdownDocument(report: report)
+            exportCapstoneJSONDocument = CapstoneReportJSONDocument(report: report)
             hapticDirector.playSessionCompletionSymphony()
             presentTransientBanner(
                 "12-Stage Capstone Audit Passed · SHA-256 \(report.reportSHA256Hex.prefix(12))…"
@@ -1499,6 +1506,24 @@ public final class AetherAppCoordinator {
             presentTransientBanner("Capstone audit error: \(error.localizedDescription)")
         }
         isRunningCapstoneAudit = false
+    }
+
+    public func prepareCapstoneMarkdownExport() async {
+        if latestCapstoneReport == nil {
+            await runFullCapstoneAudit()
+        }
+        guard let report = latestCapstoneReport else { return }
+        exportCapstoneMarkdownDocument = CapstoneReportMarkdownDocument(report: report)
+        isExportingCapstoneMarkdown = true
+    }
+
+    public func prepareCapstoneJSONExport() async {
+        if latestCapstoneReport == nil {
+            await runFullCapstoneAudit()
+        }
+        guard let report = latestCapstoneReport else { return }
+        exportCapstoneJSONDocument = CapstoneReportJSONDocument(report: report)
+        isExportingCapstoneJSON = true
     }
 
     public func presentTransientBanner(_ message: String) {
