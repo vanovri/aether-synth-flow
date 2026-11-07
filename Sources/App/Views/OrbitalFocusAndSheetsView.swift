@@ -440,8 +440,8 @@ public struct OrbitalFocusArenaView: View {
             if coordinator.showOpticalCausticsMode {
                 SpectralCausticsView(
                     waveTankController: coordinator.waveTankController,
-                    spectrumBars: coordinator.fftBins,
-                    dominantSpectrumHz: coordinator.synthParameters.carrierFrequencyHz,
+                    spectrumBars: coordinator.spectrumBars,
+                    dominantSpectrumHz: Double(coordinator.synthParameters.carrierFrequencyHz),
                     liveAudioAmplitude: Double(coordinator.liveAudioAmplitude),
                     photonCount: 2_048
                 )

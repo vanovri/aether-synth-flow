@@ -82,6 +82,8 @@ targets:
     sources:
       - path: Sources/AUv3
       - path: Sources/Shared/PersistenceModels.swift
+      - path: Sources/Shared/CognitiveEntrainmentEngine.swift
+      - path: Sources/Shared/SpatialPoseTelemeter.swift
       - path: Sources/Shared/DistributedOrchestraEngine.swift
       - path: Sources/Shared/NeuralLatentSoundscapeEngine.swift
       - path: Sources/Shared/WignerVilleHilbertHuangAnalyzer.swift

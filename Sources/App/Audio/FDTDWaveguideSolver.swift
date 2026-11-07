@@ -571,6 +571,8 @@ public struct RealtimeFDTDResonatorKernel: @unchecked Sendable {
 
 // MARK: - 4. High-Resolution 2D Isotropic 9-Point Wave Tank with Cubic PML (> 35 dB Suppression)
 
+public typealias FDTD2DWaveTank = FDTDWaveTankGrid2D
+
 public struct FDTDWaveTankGrid2D: Sendable {
     public enum BoundaryMode: UInt32, Sendable, Equatable {
         case absorbingPML = 0
@@ -1217,6 +1219,10 @@ public final class VisualFDTDWaveTankController {
     public var micRightNormalized: SIMD2<Float> = SIMD2<Float>(0.68, 0.64)
     public var sourceNormalized: SIMD2<Float> = SIMD2<Float>(0.24, 0.50)
     public private(set) var isUsingMetalCompute: Bool = false
+
+    public var latestRMSPressure: Float {
+        waveTank.interiorRMSPressure()
+    }
 
     private var oscillatorPhase: Float = 0.0
 

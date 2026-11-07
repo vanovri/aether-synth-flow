@@ -701,6 +701,16 @@ public struct OrbitalSatelliteBank: Sendable, Equatable {
         self.voices = (idle, idle, idle, idle, idle, idle)
     }
 
+    public static func == (lhs: OrbitalSatelliteBank, rhs: OrbitalSatelliteBank) -> Bool {
+        lhs.activeCount == rhs.activeCount
+            && lhs.voices.0 == rhs.voices.0
+            && lhs.voices.1 == rhs.voices.1
+            && lhs.voices.2 == rhs.voices.2
+            && lhs.voices.3 == rhs.voices.3
+            && lhs.voices.4 == rhs.voices.4
+            && lhs.voices.5 == rhs.voices.5
+    }
+
     @inline(__always)
     public subscript(index: Int) -> OrbitalSatelliteVoice {
         get {

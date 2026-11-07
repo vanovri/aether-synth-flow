@@ -577,11 +577,17 @@ public actor TelemetryDatabaseActor {
     public func fetchAllAudioPresets() throws -> [AudioPresetDTO] {
         let descriptor = FetchDescriptor<AudioPreset>(
             sortBy: [
-                SortDescriptor(\AudioPreset.isBuiltIn, order: .reverse),
                 SortDescriptor(\AudioPreset.name, order: .forward)
             ]
         )
-        return try modelContext.fetch(descriptor).map(AudioPresetDTO.init(model:))
+        return try modelContext.fetch(descriptor)
+            .map(AudioPresetDTO.init(model:))
+            .sorted { lhs, rhs in
+                if lhs.isBuiltIn != rhs.isBuiltIn {
+                    return lhs.isBuiltIn && !rhs.isBuiltIn
+                }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
     }
 
     public func fetchActiveHabits() throws -> [HabitNodeDTO] {

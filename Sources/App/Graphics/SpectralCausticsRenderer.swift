@@ -467,14 +467,14 @@ public struct SpectralCausticsView: View {
 // MARK: - 4. ChromaticCausticsViewportView (Direct WaveTank Snapshot Caustics Viewport)
 
 public struct ChromaticCausticsViewportView: View {
-    public let waveTank: FDTD2DWaveTank
+    public let waveTank: FDTDWaveTankGrid2D
     public let audioAmplitude: Float
     public let highBandEnergy: Float
     public let accentHue: Double
     public let photonCount: Int
 
     public init(
-        waveTank: FDTD2DWaveTank,
+        waveTank: FDTDWaveTankGrid2D,
         audioAmplitude: Float,
         highBandEnergy: Float,
         accentHue: Double,

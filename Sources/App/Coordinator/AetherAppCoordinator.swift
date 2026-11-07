@@ -75,6 +75,7 @@ public final class AetherAppCoordinator {
     public var latestSpatialModulation: SpatialPoseModulationOutput?
     public var sessionPeakAmplitude: Float = 0.0
     public var spectrumBars: [Float] = [Float](repeating: 0, count: SpectralFFTAnalyzer.outputBarCount)
+    public var fftBins: [Float] { spectrumBars }
     public var dominantSpectrumHz: Float = 0.0
     public var isHeadTrackingEnabled: Bool = false
     public var isOrbitalSourceAutoLockEnabled: Bool = false
