@@ -49,7 +49,7 @@ public final class MacStudioWorkspaceModel {
     public let fftAnalyzer = SpectralFFTAnalyzer()
     public let dacManager = CoreAudioDeviceManager()
     public let hudController = FloatingOrbitalHUDController()
-    public let shortcutController = MacGlobalShortcutController()
+    public var shortcutController = MacGlobalShortcutController()
     public let hapticDirector = HapticDirector()
     public let databaseActor: TelemetryDatabaseActor
 
@@ -474,11 +474,12 @@ public struct MacStudioThreeColumnWorkspaceView: View {
 
     private var spatial120HzOrbitalCanvasCard: some View {
         ZStack {
-            SpatialBackdropCanvasView(
+            AetherSpatialBackdropView(
                 audioAmplitude: model.liveRMSAmplitude,
                 highBandEnergy: model.highBandEnergy,
+                beatFrequencyHz: model.synthParameters.binauralBeatHz,
                 accentHue: model.activeAccentHue,
-                isActive: model.isFocusRunning
+                focusProgress: model.focusProgress
             )
             .frame(height: 268)
             .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))

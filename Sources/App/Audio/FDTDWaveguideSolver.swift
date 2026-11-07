@@ -329,6 +329,9 @@ public struct RealtimeFDTDResonatorKernel: @unchecked Sendable {
     private var dcBlockXRight: Float = 0.0
     private var dcBlockYRight: Float = 0.0
 
+    public var leftMicNormalized: SIMD2<Float> = SIMD2<Float>(0.30, 0.44)
+    public var rightMicNormalized: SIMD2<Float> = SIMD2<Float>(0.70, 0.56)
+
     public var pNextPointer: UnsafeMutablePointer<Float> { arena.pNext }
     public var pCurrPointer: UnsafeMutablePointer<Float> { arena.pCurr }
     public var pPrevPointer: UnsafeMutablePointer<Float> { arena.pPrev }

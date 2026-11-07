@@ -289,6 +289,14 @@ public struct EntrainmentRampSchedule: Codable, Sendable, Equatable {
         self.circadianHour = min(max(circadianHour, 0), 23)
     }
 
+    public func sampleCurve(pointCount: Int = 48) -> [EntrainmentSplineSample] {
+        let n = max(2, pointCount)
+        return (0..<n).map { idx in
+            let t = Double(idx) / Double(n - 1)
+            return sample(at: t)
+        }
+    }
+
     /// Evaluates the C1-continuous Cubic Hermite Spline (`h00, h10, h01, h11`) across 5 phase knots
     /// (`0.0, 0.18, 0.42, 0.85, 1.0`) with circadian carrier & filter cutoff adaptation.
     public func sample(at normalizedProgress: Double) -> EntrainmentSplineSample {

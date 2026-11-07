@@ -662,7 +662,7 @@ public actor AetherCapstoneBenchmarkSuite {
             )
             let elapsedUs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000.0
             samplesUs.append(elapsedUs)
-            blockSeq = tele.blockSequence
+            blockSeq = UInt64(tele.blockSequence)
             availableFrames = ring.availableFramesToRead
         }
 
@@ -701,17 +701,7 @@ public actor AetherCapstoneBenchmarkSuite {
             let trueOffsetNs: Int64 = 1_250_000 // +1.25 ms
             let baseOriginNs: UInt64 = 10_000_000_000 + UInt64(iter * 1_000_000_000)
 
-            var latestEst = MarzulloConsensusEstimate(
-                consensusOffsetSeconds: 0,
-                confidenceRadiusSeconds: 0,
-                intersectionLowSeconds: 0,
-                intersectionHighSeconds: 0,
-                survivingIntervalCount: 0,
-                totalIntervalCount: 0,
-                rejectedOutlierCount: 0,
-                minimumRTTDelaySeconds: 0,
-                allanDeviation: 0
-            )
+            var latestEst = MarzulloConsensusEstimate()
 
             for idx in 0..<8 {
                 let t1 = baseOriginNs + UInt64(idx) * 100_000_000
@@ -723,7 +713,7 @@ public actor AetherCapstoneBenchmarkSuite {
 
                 let pkt = OrchestraPTPClockPacket(
                     packetKind: .delayResponse,
-                    sequenceNumber: UInt32(idx + 1),
+                    sequenceNumber: UInt16(idx + 1),
                     peerNodeID: 2,
                     t1OriginNs: t1,
                     t2ResponderIngressNs: t2,
@@ -1119,7 +1109,8 @@ public actor AetherCapstoneBenchmarkSuite {
                 let archive = AetherTelemetryArchive(
                     habits: HabitNodeDTO.defaultSeeds,
                     sessions: [],
-                    presets: AudioPresetDTO.defaultPresets
+                    presets: AudioPresetDTO.defaultPresets,
+                    dailyTelemetry: []
                 )
 
                 let aliceKey = MeshCryptoSession.makeKeyPair()

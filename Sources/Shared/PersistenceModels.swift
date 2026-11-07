@@ -492,6 +492,38 @@ public struct HabitNodeDTO: Codable, Sendable, Identifiable, Equatable {
         self.updatedAt = model.updatedAt
         self.revision = model.revision
     }
+
+    public static var defaultSeeds: [HabitNodeDTO] {
+        [
+            HabitNodeDTO(
+                habitID: UUID(uuidString: "20000000-0000-0000-0000-000000000001")!,
+                title: "Deep Systems Architecture",
+                symbolName: "cpu.fill",
+                accentHue: 0.54,
+                orbitalMass: 1.35,
+                targetMinutesPerDay: 60,
+                sortOrder: 0
+            ),
+            HabitNodeDTO(
+                habitID: UUID(uuidString: "20000000-0000-0000-0000-000000000002")!,
+                title: "Mathematical DSP & Audio",
+                symbolName: "waveform.path.ecg",
+                accentHue: 0.76,
+                orbitalMass: 1.20,
+                targetMinutesPerDay: 45,
+                sortOrder: 1
+            ),
+            HabitNodeDTO(
+                habitID: UUID(uuidString: "20000000-0000-0000-0000-000000000003")!,
+                title: "Spatial Graphics & Shaders",
+                symbolName: "sparkles",
+                accentHue: 0.12,
+                orbitalMass: 1.10,
+                targetMinutesPerDay: 45,
+                sortOrder: 2
+            )
+        ]
+    }
 }
 
 public struct AudioPresetDTO: Codable, Sendable, Identifiable, Equatable {

@@ -946,6 +946,11 @@ public struct RealtimeOrchestraSyncControl: Sendable, Equatable {
     public var wfsGainScale: Float
     public var masterPhaseSyncTarget: Double?
 
+    public var isMeshSyncActive: Bool {
+        get { isEnabled }
+        set { isEnabled = newValue }
+    }
+
     public init(
         isEnabled: Bool = false,
         pllSampleRateScale: Double = 1.0,

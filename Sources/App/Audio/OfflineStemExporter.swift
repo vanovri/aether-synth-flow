@@ -238,13 +238,16 @@ public struct WAVStemDocument: FileDocument, Transferable, Sendable {
     public static let readableContentTypes: [UTType] = [.wav]
 
     public var wavData: Data
+    public var suggestedFilename: String
 
-    public init(wavData: Data = Data()) {
+    public init(wavData: Data = Data(), suggestedFilename: String = "AetherSynth-Stem.wav") {
         self.wavData = wavData
+        self.suggestedFilename = suggestedFilename
     }
 
     public init(configuration: ReadConfiguration) throws {
         self.wavData = configuration.file.regularFileContents ?? Data()
+        self.suggestedFilename = "AetherSynth-Stem.wav"
     }
 
     public func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
@@ -258,10 +261,58 @@ public struct WAVStemDocument: FileDocument, Transferable, Sendable {
     }
 }
 
+public struct StemRenderRequest: Sendable {
+    public var title: String
+    public var parameters: SynthParameters
+    public var category: FocusCategory
+    public var durationSeconds: Double
+    public var crossfadeSeconds: Double
+    public var sampleRate: UInt32
+    public var bitDepth: WAVBitDepth
+    public var applyEntrainmentEnvelope: Bool
+
+    public init(
+        title: String = "AetherSynth-Stem",
+        parameters: SynthParameters,
+        category: FocusCategory = .deepWork,
+        durationSeconds: Double = 12.0,
+        crossfadeSeconds: Double = 1.5,
+        sampleRate: UInt32 = 48_000,
+        bitDepth: WAVBitDepth = .pcm24Bit,
+        applyEntrainmentEnvelope: Bool = true
+    ) {
+        self.title = title
+        self.parameters = parameters
+        self.category = category
+        self.durationSeconds = durationSeconds
+        self.crossfadeSeconds = crossfadeSeconds
+        self.sampleRate = sampleRate
+        self.bitDepth = bitDepth
+        self.applyEntrainmentEnvelope = applyEntrainmentEnvelope
+    }
+}
+
 // MARK: - Background Actor Offline Stem & Seamless Loop Renderer
 
 public actor OfflineStemExporter {
     public init() {}
+
+    public func renderStemDocument(request: StemRenderRequest) throws -> WAVStemDocument {
+        let ramp = request.applyEntrainmentEnvelope ? EntrainmentRampSchedule(category: request.category) : nil
+        let data = try renderSeamlessLoopWAV(
+            baseParameters: request.parameters,
+            rampSchedule: ramp,
+            durationSeconds: request.durationSeconds,
+            loopCrossfadeSeconds: request.crossfadeSeconds,
+            sampleRate: request.sampleRate,
+            bitDepth: request.bitDepth
+        )
+        let sanitized = request.title
+            .replacingOccurrences(of: " ", with: "-")
+            .filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+        let baseName = sanitized.isEmpty ? "AetherSynth-Stem" : sanitized
+        return WAVStemDocument(wavData: data, suggestedFilename: "\(baseName).wav")
+    }
 
     public func renderSeamlessLoopWAV(
         baseParameters: SynthParameters,

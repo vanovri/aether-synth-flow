@@ -164,6 +164,19 @@ public struct ListenerHeadPose3D: Sendable, Equatable {
         self.up = u
         self.forward = fwd
     }
+
+    public init(
+        position: SIMD3<Float>,
+        orientation: simd_quatf,
+        captureRadiusMeters: Float = 0.28
+    ) {
+        self.position = position
+        self.captureRadiusMeters = max(0.08, captureRadiusMeters)
+        let q = orientation.length > 1.0e-5 ? orientation.normalized : simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+        self.right = simd_normalize(q.act(SIMD3<Float>(1, 0, 0)))
+        self.up = simd_normalize(q.act(SIMD3<Float>(0, 1, 0)))
+        self.forward = simd_normalize(q.act(SIMD3<Float>(0, 0, 1)))
+    }
 }
 
 public struct TracedAcousticRaySegment: Sendable, Equatable {
