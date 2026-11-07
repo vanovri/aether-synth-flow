@@ -24,6 +24,8 @@
     <string>public.app-category.productivity</string>
     <key>LSMinimumSystemVersion</key>
     <string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>AetherSynth Studio connects to 4-channel Bluetooth Low Energy EEG headbands (TP9, AF7, AF8, TP10) for real-time cortical entrainment, ocular blink rejection, and Bispectral Index telemetry.</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2026 AetherSynth &amp; Flow. All rights reserved.</string>
 </dict>

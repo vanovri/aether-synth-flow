@@ -27,6 +27,22 @@ public struct MPSTelemetrySnapshot: Codable, Sendable, Equatable {
         self.renyi2Purity = min(max(renyi2Purity, 0.0), 1.0)
         self.variationalEnergy = variationalEnergy
     }
+
+    public var centralEntanglementEntropy: Float {
+        Float(vonNeumannEntropyNats)
+    }
+
+    public var groundStateEnergyEstimate: Float {
+        Float(variationalEnergy)
+    }
+
+    public var mappedHarmonicTension: Float {
+        Float(min(max(vonNeumannEntropyNats / log(16.0), 0.0), 1.0))
+    }
+
+    public var mappedSpectralInharmonicity: Float {
+        Float(1.0 + 1.5 * min(max(1.0 - renyi2Purity, 0.0), 1.0))
+    }
 }
 
 public struct MPSCoreTensor: Codable, Sendable, Equatable {
@@ -47,6 +63,12 @@ public struct MPSCoreTensor: Codable, Sendable, Equatable {
     public func index(_ alphaL: Int, _ phys: Int, _ alphaR: Int) -> Int {
         (alphaL * physicalDim + phys) * rightBond + alphaR
     }
+
+    @inline(__always)
+    public subscript(alphaL: Int, phys: Int, alphaR: Int) -> Double {
+        get { storage[index(alphaL, phys, alphaR)] }
+        set { storage[index(alphaL, phys, alphaR)] = newValue }
+    }
 }
 
 // MARK: - 2. 6-Site Tensor-Train Matrix Product State Engine & One-Sided Jacobi SVD
@@ -60,6 +82,10 @@ public struct MatrixProductStateEngine: Sendable, Equatable {
     public var cores: [MPSCoreTensor]
     public let maxBondDim: Int
     public let midCutSingularValues: [Double]
+
+    public init(stateVector: [Float], maxBondDim: Int = 16) {
+        self.init(stateVector: stateVector.map(Double.init), maxBondDim: maxBondDim)
+    }
 
     /// Decomposes any 4096-element quantum state vector (`d = 4`, `N = 6` sites) into a left/mixed-canonical
     /// Matrix Product State `cores[0..<6]` using exact One-Sided Jacobi SVD.
@@ -509,7 +535,34 @@ public struct MatrixProductStateEngine: Sendable, Equatable {
 // MARK: - 3. 2-Site DMRG Variational Optimizer (6-Site Transverse-Field Spin-3/2 Ising/Heisenberg MPO)
 
 public struct DMRGVariationalOptimizer: Sendable {
-    public init() {}
+    public let anisotropyDelta: Double
+    public let maxBondDim: Int
+    public let lanczosIterations: Int
+
+    public init(
+        anisotropyDelta: Double = 1.0,
+        maxBondDim: Int = 16,
+        lanczosIterations: Int = 8
+    ) {
+        self.anisotropyDelta = anisotropyDelta
+        self.maxBondDim = min(max(2, maxBondDim), MatrixProductStateEngine.hardMaxBondCap)
+        self.lanczosIterations = max(2, lanczosIterations)
+    }
+
+    public func runSweeps(
+        mps: inout MatrixProductStateEngine,
+        sweepCount: Int = 2
+    ) -> MPSTelemetrySnapshot {
+        let initialVec = mps.reconstructStateVector()
+        let snaps = runSweeps(
+            initialState: initialVec,
+            couplingJ: anisotropyDelta,
+            transverseFieldH: 0.5,
+            sweeps: max(1, sweepCount),
+            maxBondDim: maxBondDim
+        )
+        return snaps.last ?? mps.evaluateEntanglement()
+    }
 
     /// Evaluates the exact variational expectation energy `<psi | H | psi> / <psi | psi>` on the 4096D 6-site state
     /// for `H = -J * sum_{i=0..4} Z_i Z_{i+1} - h * sum_{i=0..5} X_i`.
@@ -1346,6 +1399,40 @@ extension MatrixProductStateEngine {
         let invNorm = 1.0 / sqrt(max(1e-30, normSq))
         return psi.map { Float($0 * invNorm) }
     }
+
+    /// Computes the maximum Frobenius orthogonality defect `||U^T U - I||_F` across all left-canonical cores `0..<(cores.count - 1)`.
+    public func verifyLeftCanonicalOrthogonality() -> Double {
+        guard cores.count > 1 else { return 0.0 }
+        var maxDefect = 0.0
+        for site in 0..<(cores.count - 1) {
+            let core = cores[site]
+            let rows = core.leftBond * core.physicalDim
+            let cols = core.rightBond
+            var defectSq = 0.0
+            for i in 0..<cols {
+                for j in 0..<cols {
+                    var dot = 0.0
+                    for r in 0..<rows {
+                        dot += core.storage[r * cols + i] * core.storage[r * cols + j]
+                    }
+                    let target = (i == j) ? 1.0 : 0.0
+                    let err = dot - target
+                    defectSq += err * err
+                }
+            }
+            maxDefect = max(maxDefect, sqrt(defectSq))
+        }
+        return maxDefect
+    }
+
+    /// Evaluates the expectation value `<psi | H | psi>` under the 6-site bio-acoustic Hamiltonian.
+    public func expectationValueNearestNeighborXXZ(anisotropyDelta: Double = 1.0) -> Double {
+        DMRGVariationalOptimizer.expectationEnergy(
+            stateVector: reconstructStateVector(),
+            couplingJ: anisotropyDelta,
+            transverseFieldH: 0.5
+        )
+    }
 }
 
 extension DMRGVariationalOptimizer {
@@ -1395,7 +1482,7 @@ extension DMRGVariationalOptimizer {
             recommendedHRTFOrbitSpeed: orbitSpeed,
             recommendedFDTDWaveguideStiffness: stiffness,
             centralEntanglementEntropy: telemetry.centralEntanglementEntropy,
-            renyi2Purity: telemetry.renyi2Purity,
+            renyi2Purity: Float(telemetry.renyi2Purity),
             groundStateEnergy: groundEnergy
         )
     }

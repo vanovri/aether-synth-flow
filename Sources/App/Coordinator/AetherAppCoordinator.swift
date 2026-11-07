@@ -107,9 +107,41 @@ public final class AetherAppCoordinator {
     // Phase 8: Distributed Multi-Peer Spatial Orchestra & Wave-Field Array State
     public var orchestraSnapshot: OrchestraMeshStatusSnapshot = OrchestraMeshStatusSnapshot()
 
+    // Phase 3: WAV Stem Export, 3D SDF Core, Kalman Entrainment & P2P E2EE Mesh Sync State (Tracks 5, 6, 7, 8)
+    public var exportWAVDocument: WAVStemDocument?
+    public var isExportingWAV: Bool = false
+    public var selectedWAVBitDepth: WAVBitDepth = .pcm24Bit
+    public var use3DRaymarchedCore: Bool = true
+    public var isEntrainmentCurveEnabled: Bool = true
+    public var kalmanFilter = FocusStateKalmanFilter()
+    public var latestKalmanEstimate: KalmanFocusEstimate = FocusStateKalmanFilter().currentEstimate
+    public var isMeshSyncSheetPresented: Bool = false
+    public var isMeshBonjourActive: Bool = false
+    public var meshPeers: [MeshPeerSummary] = []
+    public var meshLamportClock: UInt64 = 1
+
+    // Phases 9 & 10: 2D FDTD Wave Tank, Chromatic Caustics, 4-Ch EEG BCI, SPWVD/HHT, Quantum MPS/DMRG & Capstone Audit (Tracks 30–36)
+    public let waveTankController = VisualFDTDWaveTankController()
+    public let eegBCI = EEGBrainComputerInterface()
+    public var showOpticalCausticsMode: Bool = false
+    public var latestEEGMetrics: CorticalSpectralMetrics?
+    public var isClosedLoopIAFLockEnabled: Bool = false
+    public var isCorticalIAFLockEnabled: Bool = false
+    public var useGoldenRatioIAFSubharmonic: Bool = false
+    public var latestSPWVDResult: SPWVDResult?
+    public var latestHHTResult: HilbertHuangResult?
+    public var latestMPSTelemetry: MPSTelemetrySnapshot?
+    public var dmrgSweepSnapshots: [MPSTelemetrySnapshot] = []
+    public var selectedMPSBondDimension: Int = 8
+    public var latestCapstoneReport: CapstoneAuditReport?
+    public var isRunningCapstoneAudit: Bool = false
+    public var exportCapstoneMarkdownDocument: CapstoneReportMarkdownDocument?
+    public var isExportingCapstoneMarkdown: Bool = false
+
     // Underlying Actors, DSP, Haptics & System Bridges
     public let hapticDirector = HapticDirector()
     public let audioEngine = AudioSynthEngine()
+    public let stemExporter = OfflineStemExporter()
     public let fftAnalyzer = SpectralFFTAnalyzer()
     public let mediaAndMotion = MediaSessionAndHeadTrackingController()
     public let neuralTrainer = MPSGraphBrainwaveTrainer()
@@ -119,11 +151,14 @@ public final class AetherAppCoordinator {
     public let neuralSoundscapeEngine = NeuralLatentSoundscapeEngine()
     public let orchestraEngine = DistributedOrchestraEngine()
     public let databaseActor: TelemetryDatabaseActor
+    public let meshSyncActor: AetherMeshSyncActor
 
     #if canImport(ActivityKit) && os(iOS)
     private let liveActivityController = FocusLiveActivityController()
     #endif
 
+    private var eegGenerator = SyntheticCorticalEEGGenerator()
+    private var eegFilterBank = EEGArtifactFilterBank()
     private var pidController = EntrainmentPIDController()
     private var physiologySimulator = SyntheticPhysiologySimulator(initialStressLevel: 0.58)
     private var lastBioEntrainmentTickDate: Date = .distantPast
@@ -144,10 +179,16 @@ public final class AetherAppCoordinator {
     private var frameCounter: Int = 0
 
     public init(modelContainer: ModelContainer) {
-        self.databaseActor = TelemetryDatabaseActor(modelContainer: modelContainer)
+        let db = TelemetryDatabaseActor(modelContainer: modelContainer)
+        self.databaseActor = db
+        self.meshSyncActor = AetherMeshSyncActor(databaseActor: db)
         refreshRoomReflectionPreview()
         wireMediaAndMotionCallbacks()
         wireExternalIntentNotifications()
+    }
+
+    public var currentEntrainmentSchedule: EntrainmentRampSchedule {
+        EntrainmentRampSchedule(category: activeFocusCategory)
     }
 
     public var focusProgress: Double {
@@ -292,6 +333,9 @@ public final class AetherAppCoordinator {
         await refreshRayTracedAcoustics()
         await pumpNeuralSoundscapeRingBufferIfNeeded(forceInitialBlock: true)
         orchestraSnapshot = orchestraEngine.snapshot()
+        await assimilateKalmanHistoryFromDB()
+        await refreshCorticalEEGAndTFR()
+        await refreshQuantumMPSAndDMRG()
 
         await refreshSharedWidgetSnapshotFromDB()
         startTelemetryPollingLoop()
@@ -391,6 +435,27 @@ public final class AetherAppCoordinator {
             }
         }
 
+        // Phase 9: Step 128x128 Visual FDTD Waveguide Tank & 4-Channel Cortical EEG BCI
+        eegBCI.stepRealtimeFrame(dtSeconds: 0.033, activeBinauralBeatHz: synthParameters.binauralBeatHz)
+        if isSynthPlaying || isTimerRunning || synthParameters.fdtdResonatorMix > 0.001 {
+            waveTankController.stepVisualFrame(substeps: 2)
+        }
+        if isCorticalIAFLockEnabled {
+            let iaf = eegBCI.latestMetrics.individualAlphaFrequencyHz
+            let targetBeat = useGoldenRatioIAFSubharmonic ? (iaf / 1.6180339887) : iaf
+            let clampedTargetBeat = min(max(targetBeat, 0.5), 40.0)
+            let nextBeat = synthParameters.binauralBeatHz + 0.15 * (clampedTargetBeat - synthParameters.binauralBeatHz)
+            let pacMI = eegBCI.latestMetrics.thetaGammaPACModulationIndex
+            let targetKappa = min(max(0.14 + pacMI * 2.4, 0.05), 0.92)
+            let nextKappa = synthParameters.fdtdStiffness + 0.18 * (targetKappa - synthParameters.fdtdStiffness)
+
+            if abs(nextBeat - synthParameters.binauralBeatHz) > 0.015 || abs(nextKappa - synthParameters.fdtdStiffness) > 0.004 {
+                synthParameters.binauralBeatHz = nextBeat
+                synthParameters.fdtdStiffness = nextKappa
+                await audioEngine.updateParameters(synthParameters)
+            }
+        }
+
         guard isTimerRunning, let anchor = timerAnchorDate else { return }
         let totalPlanned = Double(selectedDurationMinutes * 60)
         let currentElapsed = accumulatedElapsedBeforePause + Date.now.timeIntervalSince(anchor)
@@ -402,6 +467,15 @@ public final class AetherAppCoordinator {
         } else {
             elapsedSeconds = currentElapsed
             remainingSeconds = max(0, totalPlanned - currentElapsed)
+            if isEntrainmentCurveEnabled && !isBioEntrainmentEnabled && (frameCounter & 15) == 0 {
+                let splinePoint = currentEntrainmentSchedule.sample(at: focusProgress)
+                var next = synthParameters
+                next.carrierFrequencyHz = splinePoint.carrierFrequencyHz
+                next.binauralBeatHz = splinePoint.binauralBeatHz
+                next.filterCutoffHz = splinePoint.filterCutoffHz
+                synthParameters = next
+                await audioEngine.updateParameters(next)
+            }
         }
     }
 
@@ -849,6 +923,11 @@ public final class AetherAppCoordinator {
         #endif
         syncSystemSurfaces(liveActivityActive: false)
 
+        latestKalmanEstimate = kalmanFilter.update(
+            measuredQuality: quality,
+            sessionDurationSeconds: actual,
+            aborted: !completedNaturally && ratio < 0.75
+        )
         pendingCompletedSession = dto
     }
 
@@ -1199,6 +1278,56 @@ public final class AetherAppCoordinator {
         }
     }
 
+    // MARK: - Phase 9: 2D/3D FDTD Waveguide Tank & Closed-Loop Cortical EEG BCI Controls
+
+    public func toggleCorticalIAFLock(_ enabled: Bool) {
+        isCorticalIAFLockEnabled = enabled
+        isClosedLoopIAFLockEnabled = enabled
+        hapticDirector.playSegmentSnap()
+        if enabled {
+            let iaf = eegBCI.latestMetrics.individualAlphaFrequencyHz
+            let targetBeat = useGoldenRatioIAFSubharmonic ? (iaf / 1.6180339887) : iaf
+            synthParameters.binauralBeatHz = min(max(targetBeat, 0.5), 40.0)
+            let pacMI = eegBCI.latestMetrics.thetaGammaPACModulationIndex
+            synthParameters.fdtdStiffness = min(max(0.14 + pacMI * 2.4, 0.05), 0.92)
+            Task { await audioEngine.updateParameters(synthParameters) }
+            presentTransientBanner(String(
+                format: "Cortical IAF Lock active · Target %.2f Hz · PAC MI %.3f",
+                synthParameters.binauralBeatHz,
+                pacMI
+            ))
+        } else {
+            presentTransientBanner("Cortical IAF Lock disengaged")
+        }
+    }
+
+    public func toggleGoldenRatioIAFSubharmonic(_ enabled: Bool) {
+        useGoldenRatioIAFSubharmonic = enabled
+        hapticDirector.playParameterDetentTick(intensity: 0.45)
+        if isCorticalIAFLockEnabled {
+            let iaf = eegBCI.latestMetrics.individualAlphaFrequencyHz
+            let targetBeat = enabled ? (iaf / 1.6180339887) : iaf
+            synthParameters.binauralBeatHz = min(max(targetBeat, 0.5), 40.0)
+            Task { await audioEngine.updateParameters(synthParameters) }
+        }
+    }
+
+    public func updateFDTDMicrophoneProbes(leftXY: SIMD2<Float>, rightXY: SIMD2<Float>) {
+        let clampedLeft = SIMD2<Float>(min(max(leftXY.x, 0.08), 0.92), min(max(leftXY.y, 0.08), 0.92))
+        let clampedRight = SIMD2<Float>(min(max(rightXY.x, 0.08), 0.92), min(max(rightXY.y, 0.08), 0.92))
+        synthParameters.fdtdMicLeftXY = clampedLeft
+        synthParameters.fdtdMicRightXY = clampedRight
+        waveTankController.micLeftNormalized = clampedLeft
+        waveTankController.micRightNormalized = clampedRight
+        Task { await audioEngine.updateParameters(synthParameters) }
+    }
+
+    public func triggerFDTDWaveTankShockwave(normalizedX: Float, normalizedY: Float, amplitude: Float = 1.25) {
+        waveTankController.triggerTouchPulse(normalizedX: normalizedX, normalizedY: normalizedY, amplitude: amplitude)
+        Task { await audioEngine.triggerHarmonicBloom(intensity: min(max(amplitude * 0.75, 0.2), 1.0)) }
+        hapticDirector.playParameterDetentTick(intensity: 0.62)
+    }
+
     // MARK: - Archive Portability Actions (JSON & CSV Export / Import)
 
     public func prepareJSONArchiveExport() async {
@@ -1242,6 +1371,134 @@ public final class AetherAppCoordinator {
         } catch {
             presentTransientBanner("Import error: \(error.localizedDescription)")
         }
+    }
+
+    // MARK: - Phase 3 & Phases 9–10 Actions (WAV Stem Export, Kalman, P2P Mesh, EEG/TFR, MPS/DMRG & Capstone Audit)
+
+    public func prepareWAVStemExport() async {
+        do {
+            let req = StemRenderRequest(
+                title: activePresetName,
+                parameters: synthParameters,
+                category: activeFocusCategory,
+                durationSeconds: 12.0,
+                crossfadeSeconds: 1.5,
+                sampleRate: 48_000,
+                bitDepth: selectedWAVBitDepth,
+                applyEntrainmentEnvelope: isEntrainmentCurveEnabled
+            )
+            exportWAVDocument = try await stemExporter.renderStemDocument(request: req)
+            isExportingWAV = true
+            hapticDirector.playOrbitalSnap(mass: 1.45)
+        } catch {
+            presentTransientBanner("WAV stem export failed: \(error.localizedDescription)")
+        }
+    }
+
+    public func assimilateKalmanHistoryFromDB() async {
+        let sessions = (try? await databaseActor.fetchAllSessions()) ?? []
+        let telemetry = (try? await databaseActor.fetchAllTelemetry()) ?? []
+        latestKalmanEstimate = kalmanFilter.assimilateHistory(sessions: sessions, telemetry: telemetry)
+    }
+
+    public func toggleBonjourMesh(_ active: Bool) async {
+        if active {
+            await meshSyncActor.startBonjourMesh()
+        } else {
+            await meshSyncActor.stopBonjourMesh()
+        }
+        await refreshMeshStatus()
+        hapticDirector.playSegmentSnap()
+    }
+
+    public func refreshMeshStatus() async {
+        let status = await meshSyncActor.snapshotMeshStatus()
+        isMeshBonjourActive = status.isListening
+        meshLamportClock = status.lamportClock
+        meshPeers = status.peers
+    }
+
+    public func triggerMeshBroadcastSync() async {
+        let sentCount = await meshSyncActor.broadcastEncryptedArchiveToAllPeers()
+        await refreshMeshStatus()
+        hapticDirector.playOrbitalSnap(mass: 1.4)
+        presentTransientBanner("Broadcasted E2EE archive to \(sentCount) peer(s) · Lamport #\(meshLamportClock)")
+    }
+
+    public func triggerManualEEGBlink() {
+        eegGenerator.triggerManualOcularBlink(amplitudeUV: 175.0)
+        eegBCI.injectManualOcularBlink()
+        Task { await refreshCorticalEEGAndTFR() }
+    }
+
+    public func refreshCorticalEEGAndTFR() async {
+        var cleanedAF7: [Float] = []
+        var cleanedAF8: [Float] = []
+        cleanedAF7.reserveCapacity(128)
+        cleanedAF8.reserveCapacity(128)
+        eegGenerator.entrain(toBinauralBeatHz: synthParameters.binauralBeatHz, dtSeconds: 0.5)
+        for i in 0..<128 {
+            let raw = eegGenerator.nextSample(injectBlinkAmplitude: i == 32 ? 120.0 : 0.0)
+            let filtered = eegFilterBank.processQuadSample(raw)
+            cleanedAF7.append(filtered.cleaned.af7)
+            cleanedAF8.append(filtered.cleaned.af8)
+        }
+        let metrics = CorticalSpectralAnalyzer.analyze(
+            channelSamples: cleanedAF7,
+            frontalLeft: cleanedAF7,
+            frontalRight: cleanedAF8,
+            sampleRate: 256.0
+        )
+        latestEEGMetrics = metrics
+        if isClosedLoopIAFLockEnabled {
+            var updated = synthParameters
+            updated.binauralBeatHz = metrics.individualAlphaFrequencyHz
+            pushSynthParameters(updated, clearingPresetSelection: false)
+        }
+        let subWindow = Array(cleanedAF7.suffix(64))
+        latestSPWVDResult = SPWVDAnalyzer.analyze(signal: subWindow, sampleRate: 256.0, freqBins: 32)
+        latestHHTResult = HilbertHuangSifter.sift(signal: subWindow, sampleRate: 256.0, maxIMFs: 4)
+    }
+
+    public func refreshQuantumMPSAndDMRG(bondDim: Int? = nil) async {
+        if let bondDim {
+            selectedMPSBondDimension = min(max(bondDim, 2), 16)
+        }
+        let bell = MatrixProductStateEngine.makeMaximallyEntangledBellState(schmidtRank: 8)
+        let sweeps = DMRGVariationalOptimizer.runSweeps(
+            initialState: bell,
+            sweeps: 4,
+            maxBondDim: selectedMPSBondDimension
+        )
+        dmrgSweepSnapshots = sweeps
+        latestMPSTelemetry = sweeps.last
+        if let last = sweeps.last {
+            var updated = synthParameters
+            updated.padDetuneCents = last.mappedHarmonicTension * 24.0
+            updated.fmHarmonicRatio = last.mappedSpectralInharmonicity
+            synthParameters = updated
+            if isSynthPlaying || isTimerRunning {
+                await audioEngine.updateParameters(updated)
+            }
+        }
+    }
+
+    public func runFullCapstoneAudit() async {
+        guard !isRunningCapstoneAudit else { return }
+        isRunningCapstoneAudit = true
+        hapticDirector.playTimerIgnition(starting: true)
+        do {
+            let report = try await AetherCapstoneBenchmarkSuite.runFullAudit()
+            latestCapstoneReport = report
+            exportCapstoneMarkdownDocument = CapstoneReportMarkdownDocument(report: report)
+            hapticDirector.playSessionCompletionSymphony()
+            presentTransientBanner(
+                "12-Stage Capstone Audit Passed · SHA-256 \(report.reportSHA256Hex.prefix(12))…"
+            )
+        } catch {
+            presentTransientBanner("Capstone audit error: \(error.localizedDescription)")
+        }
+        isRunningCapstoneAudit = false
     }
 
     public func presentTransientBanner(_ message: String) {

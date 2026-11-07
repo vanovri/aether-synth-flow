@@ -43,7 +43,21 @@ public struct SynthParameters: Sendable, Equatable {
     public var fmMix: Float                    // [0.0 ... 1.0] 4-Operator TZFM voice mix
     public var fdtdResonatorMix: Float         // [0.0 ... 1.0] 24x24 SIMD4 2D FDTD physical plate resonator mix
     public var fdtdStiffness: Float            // [0.0 ... 1.0] 2D FDTD biharmonic stiffness kappa
+    public var fdtdWaveSpeed: Float            // [120.0 ... 680.0] 2D FDTD acoustic wave speed c (m/s)
+    public var fdtdDampingSigma: Float         // [0.05 ... 12.0] 2D FDTD visco-thermal damping sigma_0
+    public var fdtdMicLeftXY: SIMD2<Float>     // [0.08 ... 0.92]^2 virtual left microphone probe (x_L, y_L)
+    public var fdtdMicRightXY: SIMD2<Float>    // [0.08 ... 0.92]^2 virtual right microphone probe (x_R, y_R)
     public var isMuted: Bool
+
+    public var fdtdWaveguideMix: Float {
+        get { fdtdResonatorMix }
+        set { fdtdResonatorMix = min(max(newValue, 0.0), 1.0) }
+    }
+
+    public var fdtdStiffnessKappa: Float {
+        get { fdtdStiffness }
+        set { fdtdStiffness = min(max(newValue, 0.0), 1.0) }
+    }
 
     public init(
         carrierFrequencyHz: Float = 216.0,
@@ -77,6 +91,10 @@ public struct SynthParameters: Sendable, Equatable {
         fmMix: Float = 0.0,
         fdtdResonatorMix: Float = 0.0,
         fdtdStiffness: Float = 0.22,
+        fdtdWaveSpeed: Float = 343.0,
+        fdtdDampingSigma: Float = 1.4,
+        fdtdMicLeftXY: SIMD2<Float> = SIMD2<Float>(0.30, 0.44),
+        fdtdMicRightXY: SIMD2<Float> = SIMD2<Float>(0.70, 0.56),
         isMuted: Bool = false
     ) {
         self.carrierFrequencyHz = min(max(carrierFrequencyHz, 60.0), 880.0)
@@ -110,6 +128,10 @@ public struct SynthParameters: Sendable, Equatable {
         self.fmMix = min(max(fmMix, 0.0), 1.0)
         self.fdtdResonatorMix = min(max(fdtdResonatorMix, 0.0), 1.0)
         self.fdtdStiffness = min(max(fdtdStiffness, 0.0), 1.0)
+        self.fdtdWaveSpeed = min(max(fdtdWaveSpeed, 120.0), 680.0)
+        self.fdtdDampingSigma = min(max(fdtdDampingSigma, 0.05), 12.0)
+        self.fdtdMicLeftXY = simd_clamp(fdtdMicLeftXY, SIMD2<Float>(repeating: 0.08), SIMD2<Float>(repeating: 0.92))
+        self.fdtdMicRightXY = simd_clamp(fdtdMicRightXY, SIMD2<Float>(repeating: 0.08), SIMD2<Float>(repeating: 0.92))
         self.isMuted = isMuted
     }
 
@@ -415,6 +437,8 @@ public struct ProceduralSynthKernel: Sendable {
         if wantsFM || wantsFDTD || wantsFDN {
             if wantsFDTD {
                 fdtdResonator.detachCopyIfShared()
+                fdtdResonator.leftMicNormalized = target.fdtdMicLeftXY
+                fdtdResonator.rightMicNormalized = target.fdtdMicRightXY
             }
             let postSlew = Float(min(1.0, 35.0 * invSampleRate))
             let targetFMMix: Float = target.isMuted ? 0.0 : target.fmMix
@@ -437,9 +461,9 @@ public struct ProceduralSynthKernel: Sendable {
                     let excite = 0.5 * (l + r)
                     let fdtdPair = fdtdResonator.stepSample(
                         excitation: excite,
-                        waveSpeed: 280.0 + smoothCutoffHz * 0.04,
+                        waveSpeed: target.fdtdWaveSpeed + smoothCutoffHz * 0.02,
                         stiffnessKappa: target.fdtdStiffness,
-                        dampingSigma: 1.4
+                        dampingSigma: target.fdtdDampingSigma
                     )
                     l = l * (1.0 - 0.35 * smoothFDTDMix) + fdtdPair.0 * smoothFDTDMix
                     r = r * (1.0 - 0.35 * smoothFDTDMix) + fdtdPair.1 * smoothFDTDMix

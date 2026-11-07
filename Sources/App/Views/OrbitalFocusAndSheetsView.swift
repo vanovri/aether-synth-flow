@@ -63,59 +63,91 @@ public struct OrbitalFocusArenaView: View {
         }
     }
 
+    @ViewBuilder
     private var centralTimerWell: some View {
-        let hue = coordinator.activeAccentHue
-        let ringAccent = Color(hue: hue, saturation: 0.72, brightness: 0.98)
-        let ringSecondary = Color(hue: (hue + 0.16).truncatingRemainder(dividingBy: 1.0), saturation: 0.68, brightness: 0.95)
-
-        return ZStack {
-            Circle()
-                .fill(.ultraThinMaterial)
-                .overlay {
-                    Circle().strokeBorder(.white.opacity(0.14), lineWidth: 1)
+        if coordinator.use3DRaymarchedCore {
+            OrbitalSDFCoreView(
+                title: selectedHabit?.title ?? "Free Spatial Flow",
+                formattedRemainingTime: coordinator.formattedRemainingTime,
+                binauralBeatHz: coordinator.synthParameters.binauralBeatHz,
+                isTimerRunning: coordinator.isTimerRunning,
+                focusProgress: coordinator.focusProgress,
+                accentHue: coordinator.activeAccentHue,
+                lowEnergy: coordinator.liveLowBandEnergy,
+                midEnergy: coordinator.liveMidBandEnergy,
+                highEnergy: coordinator.liveHighBandEnergy,
+                diameter: 188
+            )
+            .contextMenu {
+                Button {
+                    coordinator.use3DRaymarchedCore.toggle()
+                    coordinator.hapticDirector.playSegmentSnap()
+                } label: {
+                    Label("Switch to 2D Glass Ring", systemImage: "circle.dashed")
                 }
-                .shadow(color: ringAccent.opacity(0.28 + Double(coordinator.liveAudioAmplitude) * 0.35), radius: 22)
+            }
+        } else {
+            let hue = coordinator.activeAccentHue
+            let ringAccent = Color(hue: hue, saturation: 0.72, brightness: 0.98)
+            let ringSecondary = Color(hue: (hue + 0.16).truncatingRemainder(dividingBy: 1.0), saturation: 0.68, brightness: 0.95)
 
-            Circle()
-                .stroke(.white.opacity(0.10), lineWidth: 9)
-                .padding(12)
+            ZStack {
+                Circle()
+                    .fill(.ultraThinMaterial)
+                    .overlay {
+                        Circle().strokeBorder(.white.opacity(0.14), lineWidth: 1)
+                    }
+                    .shadow(color: ringAccent.opacity(0.28 + Double(coordinator.liveAudioAmplitude) * 0.35), radius: 22)
 
-            Circle()
-                .trim(from: 0, to: max(0.015, coordinator.focusProgress))
-                .stroke(
-                    AngularGradient(
-                        colors: [ringAccent, ringSecondary, .white, ringAccent],
-                        center: .center
-                    ),
-                    style: StrokeStyle(lineWidth: 9, lineCap: .round)
-                )
-                .rotationEffect(.degrees(-90))
-                .padding(12)
-                .animation(.linear(duration: 0.15), value: coordinator.focusProgress)
+                Circle()
+                    .stroke(.white.opacity(0.10), lineWidth: 9)
+                    .padding(12)
 
-            VStack(spacing: 4) {
-                Text(selectedHabit?.title ?? "Free Spatial Flow")
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.68))
-                    .lineLimit(1)
-                    .frame(maxWidth: 122)
+                Circle()
+                    .trim(from: 0, to: max(0.015, coordinator.focusProgress))
+                    .stroke(
+                        AngularGradient(
+                            colors: [ringAccent, ringSecondary, .white, ringAccent],
+                            center: .center
+                        ),
+                        style: StrokeStyle(lineWidth: 9, lineCap: .round)
+                    )
+                    .rotationEffect(.degrees(-90))
+                    .padding(12)
+                    .animation(.linear(duration: 0.15), value: coordinator.focusProgress)
 
-                Text(coordinator.formattedRemainingTime)
-                    .font(.system(size: 34, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.white)
-                    .contentTransition(.numericText())
+                VStack(spacing: 4) {
+                    Text(selectedHabit?.title ?? "Free Spatial Flow")
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.68))
+                        .lineLimit(1)
+                        .frame(maxWidth: 122)
 
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(coordinator.isTimerRunning ? Color.green : Color.white.opacity(0.35))
-                        .frame(width: 6, height: 6)
-                    Text(String(format: "%.1f Hz", coordinator.synthParameters.binauralBeatHz))
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(ringAccent)
+                    Text(coordinator.formattedRemainingTime)
+                        .font(.system(size: 34, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.white)
+                        .contentTransition(.numericText())
+
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(coordinator.isTimerRunning ? Color.green : Color.white.opacity(0.35))
+                            .frame(width: 6, height: 6)
+                        Text(String(format: "%.1f Hz", coordinator.synthParameters.binauralBeatHz))
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(ringAccent)
+                    }
+                }
+            }
+            .frame(width: 184, height: 184)
+            .contextMenu {
+                Button {
+                    coordinator.use3DRaymarchedCore.toggle()
+                    coordinator.hapticDirector.playSegmentSnap()
+                } label: {
+                    Label("Switch to 3D Raymarched SDF Core", systemImage: "cube.transparent.fill")
                 }
             }
         }
-        .frame(width: 184, height: 184)
     }
 
     private func habitSatelliteNode(_ habit: HabitNode) -> some View {
@@ -392,12 +424,17 @@ public struct SynthLabPanelView: View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 18) {
                 presetHeaderCard
+                Phase3AndDSPExpansionCardView(coordinator: coordinator)
                 sphericalHRTFRadarAndRoomCard
                 mpsGraphNeuralTrainerCard
                 bioEntrainmentInspectorCard
                 rayTracedAcousticsInspectorCard
                 neuralLatentDiffusionInspectorCard
                 distributedOrchestraArrayCard
+                fdtdAcousticWaveguideTankCard
+                eegBCIBispectrumAndPACCard
+                Phase9WaveguideAndCorticalEEGCardView(coordinator: coordinator)
+                Phase10QuantumAndCapstoneCardView(coordinator: coordinator)
                 realtimeSpectrumAndSpatialCard
                 filterXYPadCard
                 oscillatorAndMixerCard
@@ -1983,6 +2020,529 @@ public struct SynthLabPanelView: View {
         }
         .padding(16)
         .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude * 0.65, cornerRadius: 24)
+    }
+
+    // MARK: - Phase 9 Track 32.1: Interactive 2D FDTD Acoustic Waveguide Tank Card
+
+    private var fdtdAcousticWaveguideTankCard: some View {
+        let tankCtrl = coordinator.waveTankController
+        let tank = tankCtrl.waveTank
+        let accent = Color(hue: coordinator.activeAccentHue, saturation: 0.78, brightness: 0.98)
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "waveform.path.ecg.rectangle")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(accent)
+                        Text("2D/3D FDTD Acoustic Waveguide Tank")
+                            .font(.system(size: 14, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white)
+                    }
+                    Text(
+                        tankCtrl.isUsingMetalCompute
+                            ? "128×128 Metal Compute + 24×24 48kHz SIMD4 Resonator · Cubic PML (>35 dB)"
+                            : "128×128 SIMD9 Stencil + 24×24 48kHz Resonator · Biharmonic Plate Stiffness κ"
+                    )
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.65))
+                }
+
+                Spacer()
+
+                Button {
+                    coordinator.triggerFDTDWaveTankShockwave(normalizedX: 0.32, normalizedY: 0.50, amplitude: 1.35)
+                } label: {
+                    Label("Pulse", systemImage: "dot.radiowaves.left.and.right")
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(accent.opacity(0.45), in: Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+
+            // Scenario Presets (Anechoic, Double-Slit, Metamaterial Lens, Helmholtz)
+            HStack(spacing: 6) {
+                ForEach(VisualFDTDWaveTankController.TankPresetScenario.allCases) { scenario in
+                    let isSelected = (tankCtrl.activeScenario == scenario)
+                    Button {
+                        tankCtrl.applyScenario(scenario)
+                        coordinator.hapticDirector.playSegmentSnap()
+                    } label: {
+                        Text(scenario.rawValue)
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .foregroundStyle(isSelected ? .black : .white.opacity(0.84))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6)
+                            .background(
+                                isSelected ? accent : Color.white.opacity(0.08),
+                                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // Brush Tool Selector
+            HStack(spacing: 6) {
+                ForEach(VisualFDTDWaveTankController.WaveTankBrushTool.allCases) { tool in
+                    let isSelected = (tankCtrl.activeBrushTool == tool)
+                    Button {
+                        tankCtrl.activeBrushTool = tool
+                        coordinator.hapticDirector.playParameterDetentTick(intensity: 0.45)
+                    } label: {
+                        Text(tool.rawValue)
+                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                            .foregroundStyle(isSelected ? .white : .white.opacity(0.70))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 5)
+                            .background(
+                                isSelected ? Color.cyan.opacity(0.32) : Color.white.opacity(0.05),
+                                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // Live 128x128 Pressure Field Canvas (+p cyan, -p magenta, obstacles gold, draggable stereo mics L/R)
+            GeometryReader { geo in
+                let size = geo.size
+                Canvas { context, canvasSize in
+                    let bgRect = CGRect(origin: .zero, size: canvasSize)
+                    context.fill(Path(roundedRect: bgRect, cornerRadius: 14), with: .color(Color.black.opacity(0.55)))
+
+                    let n = tank.gridSize
+                    let downsample = 2
+                    let cells = n / downsample
+                    let cellW = canvasSize.width / CGFloat(cells)
+                    let cellH = canvasSize.height / CGFloat(cells)
+
+                    for cy in 0..<cells {
+                        let gy = cy * downsample
+                        let row = gy * n
+                        for cx in 0..<cells {
+                            let gx = cx * downsample
+                            let idx = row + gx
+                            let rect = CGRect(
+                                x: CGFloat(cx) * cellW,
+                                y: CGFloat(cy) * cellH,
+                                width: cellW + 0.6,
+                                height: cellH + 0.6
+                            )
+                            let code = tank.obstacleCodes[idx]
+                            if code == 1 || code == 2 {
+                                context.fill(Path(rect), with: .color(Color.yellow.opacity(0.85)))
+                                continue
+                            } else if code == 3 {
+                                context.fill(Path(rect), with: .color(Color.mint.opacity(0.20)))
+                            }
+
+                            let p = tank.pressureCurr[idx] * 3.2
+                            if abs(p) > 0.015 {
+                                let mag = Double(min(abs(p), 1.0))
+                                let cellColor = p >= 0
+                                    ? Color.cyan.opacity(mag * 0.88)
+                                    : Color.pink.opacity(mag * 0.88)
+                                context.fill(Path(rect), with: .color(cellColor))
+                            }
+                        }
+                    }
+
+                    // PML Absorbing Sponge Boundary Indicator
+                    let pmlFrac = CGFloat(tank.pmlThickness) / CGFloat(max(1, n))
+                    let innerRect = CGRect(
+                        x: canvasSize.width * pmlFrac,
+                        y: canvasSize.height * pmlFrac,
+                        width: canvasSize.width * (1.0 - 2.0 * pmlFrac),
+                        height: canvasSize.height * (1.0 - 2.0 * pmlFrac)
+                    )
+                    context.stroke(
+                        Path(roundedRect: innerRect, cornerRadius: 6),
+                        with: .color(.white.opacity(0.18)),
+                        style: StrokeStyle(lineWidth: 1, dash: [4, 4])
+                    )
+
+                    // Virtual Stereo Microphone Probes (L & R)
+                    let leftPt = CGPoint(
+                        x: CGFloat(tankCtrl.micLeftNormalized.x) * canvasSize.width,
+                        y: CGFloat(tankCtrl.micLeftNormalized.y) * canvasSize.height
+                    )
+                    let rightPt = CGPoint(
+                        x: CGFloat(tankCtrl.micRightNormalized.x) * canvasSize.width,
+                        y: CGFloat(tankCtrl.micRightNormalized.y) * canvasSize.height
+                    )
+                    let leftCircle = CGRect(x: leftPt.x - 8, y: leftPt.y - 8, width: 16, height: 16)
+                    let rightCircle = CGRect(x: rightPt.x - 8, y: rightPt.y - 8, width: 16, height: 16)
+                    context.fill(Path(ellipseIn: leftCircle), with: .color(.cyan))
+                    context.fill(Path(ellipseIn: rightCircle), with: .color(.orange))
+                    context.draw(
+                        Text("L").font(.system(size: 9, weight: .black, design: .monospaced)).foregroundStyle(.black),
+                        at: leftPt
+                    )
+                    context.draw(
+                        Text("R").font(.system(size: 9, weight: .black, design: .monospaced)).foregroundStyle(.black),
+                        at: rightPt
+                    )
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(.white.opacity(0.14), lineWidth: 1)
+                )
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            let nx = Float(min(max(value.location.x / max(1, size.width), 0.04), 0.96))
+                            let ny = Float(min(max(value.location.y / max(1, size.height), 0.04), 0.96))
+                            let touch = SIMD2<Float>(nx, ny)
+                            let dLeft = simd_distance(touch, tankCtrl.micLeftNormalized)
+                            let dRight = simd_distance(touch, tankCtrl.micRightNormalized)
+                            if dLeft < 0.09 {
+                                coordinator.updateFDTDMicrophoneProbes(leftXY: touch, rightXY: tankCtrl.micRightNormalized)
+                            } else if dRight < 0.09 {
+                                coordinator.updateFDTDMicrophoneProbes(leftXY: tankCtrl.micLeftNormalized, rightXY: touch)
+                            } else if tankCtrl.activeBrushTool == .shockwaveImpulse {
+                                coordinator.triggerFDTDWaveTankShockwave(normalizedX: nx, normalizedY: ny, amplitude: 1.25)
+                            } else {
+                                tankCtrl.applyInteractiveBrush(normalizedX: nx, normalizedY: ny)
+                            }
+                        }
+                )
+            }
+            .frame(height: 176)
+
+            // FDTD Resonator & Waveguide Physical Parameters
+            synthSliderRow(
+                title: "FDTD Waveguide Mix",
+                valueText: String(format: "%.0f%%", coordinator.synthParameters.fdtdWaveguideMix * 100),
+                value: Binding(
+                    get: { Double(coordinator.synthParameters.fdtdWaveguideMix) },
+                    set: { val in
+                        var next = coordinator.synthParameters
+                        next.fdtdWaveguideMix = Float(val)
+                        coordinator.pushSynthParameters(next, clearingPresetSelection: false)
+                    }
+                ),
+                range: 0.0...1.0
+            )
+
+            synthSliderRow(
+                title: "Wave Speed c (m/s)",
+                valueText: String(format: "%.0f m/s", coordinator.synthParameters.fdtdWaveSpeed),
+                value: Binding(
+                    get: { Double(coordinator.synthParameters.fdtdWaveSpeed) },
+                    set: { val in
+                        var next = coordinator.synthParameters
+                        next.fdtdWaveSpeed = Float(val)
+                        coordinator.pushSynthParameters(next, clearingPresetSelection: false)
+                    }
+                ),
+                range: 120.0...520.0
+            )
+
+            synthSliderRow(
+                title: "Biharmonic Plate Stiffness κ",
+                valueText: String(format: "%.2f", coordinator.synthParameters.fdtdStiffnessKappa),
+                value: Binding(
+                    get: { Double(coordinator.synthParameters.fdtdStiffnessKappa) },
+                    set: { val in
+                        var next = coordinator.synthParameters
+                        next.fdtdStiffnessKappa = Float(val)
+                        coordinator.pushSynthParameters(next, clearingPresetSelection: false)
+                    }
+                ),
+                range: 0.0...0.95
+            )
+
+            synthSliderRow(
+                title: "Visco-Thermal Damping σ₀",
+                valueText: String(format: "%.2f s⁻¹", coordinator.synthParameters.fdtdDampingSigma),
+                value: Binding(
+                    get: { Double(coordinator.synthParameters.fdtdDampingSigma) },
+                    set: { val in
+                        var next = coordinator.synthParameters
+                        next.fdtdDampingSigma = Float(val)
+                        coordinator.pushSynthParameters(next, clearingPresetSelection: false)
+                    }
+                ),
+                range: 0.1...8.0
+            )
+        }
+        .padding(16)
+        .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude * 0.68, cornerRadius: 24)
+    }
+
+    // MARK: - Phase 9 Track 32.2: 4-Channel EEG BCI, Bicoherence Triangle & PAC Polar Rose Card
+
+    private var eegBCIBispectrumAndPACCard: some View {
+        let bci = coordinator.eegBCI
+        let metrics = bci.latestMetrics
+        let imp = bci.latestImpedanceReport
+        let accent = Color(hue: coordinator.activeAccentHue, saturation: 0.78, brightness: 0.98)
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "brain.head.profile")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(accent)
+                        Text("4-Ch EEG BCI · Bispectrum & Theta–Gamma PAC")
+                            .font(.system(size: 14, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white)
+                    }
+                    Text(
+                        bci.isBLEHardwareConnected
+                            ? "CoreBluetooth 256Hz GATT Stream · 4-Tap RLS (λ=0.992) + Kalman EOG Subtractor"
+                            : "Jansen-Rit RK4 Cortical Column Simulator · 4-Tap RLS + Kalman Ocular Canceler"
+                    )
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.65))
+                }
+
+                Spacer()
+
+                Button {
+                    bci.injectManualOcularBlink()
+                    coordinator.hapticDirector.playParameterDetentTick(intensity: 0.55)
+                } label: {
+                    Label("Blink", systemImage: "eye.trianglebadge.exclamationmark")
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 6)
+                        .background(Color.orange.opacity(0.42), in: Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+
+            // 4-Channel Electrode Contact Quality Pills (TP9, AF7, AF8, TP10)
+            HStack(spacing: 6) {
+                eegElectrodePill(label: "TP9", kOhm: imp.tp9KOhm, quality: imp.tp9Quality)
+                eegElectrodePill(label: "AF7", kOhm: imp.af7KOhm, quality: imp.af7Quality)
+                eegElectrodePill(label: "AF8", kOhm: imp.af8KOhm, quality: imp.af8Quality)
+                eegElectrodePill(label: "TP10", kOhm: imp.tp10KOhm, quality: imp.tp10Quality)
+            }
+
+            // Closed-Loop Cortical IAF Lock & Golden-Ratio Subharmonic Toggles
+            HStack(spacing: 10) {
+                Toggle(
+                    isOn: Binding(
+                        get: { coordinator.isCorticalIAFLockEnabled },
+                        set: { coordinator.toggleCorticalIAFLock($0) }
+                    )
+                ) {
+                    Text("Closed-Loop Cortical IAF Lock")
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.90))
+                }
+                .toggleStyle(.switch)
+                .tint(accent)
+
+                Toggle(
+                    isOn: Binding(
+                        get: { coordinator.useGoldenRatioIAFSubharmonic },
+                        set: { coordinator.toggleGoldenRatioIAFSubharmonic($0) }
+                    )
+                ) {
+                    Text("φ Subharmonic")
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.82))
+                }
+                .toggleStyle(.switch)
+                .tint(.cyan)
+            }
+
+            // Clinical Cortical Telemetry Readout Pills (BIS, IAF, FAA, PAC MI)
+            HStack(spacing: 8) {
+                corticalMetricBadge(
+                    title: "BIS Index",
+                    value: String(format: "%.1f", metrics.bispectralIndex),
+                    tint: .cyan
+                )
+                corticalMetricBadge(
+                    title: "IAF Peak",
+                    value: String(format: "%.2f Hz", metrics.individualAlphaFrequencyHz),
+                    tint: accent
+                )
+                corticalMetricBadge(
+                    title: "Frontal FAA",
+                    value: String(format: "%+.2f", metrics.frontalAlphaAsymmetry),
+                    tint: .mint
+                )
+                corticalMetricBadge(
+                    title: "PAC Tort MI",
+                    value: String(format: "%.3f", metrics.thetaGammaPACModulationIndex),
+                    tint: .orange
+                )
+            }
+
+            // Pre-RLS (Raw AF7 + EOG Blink) vs Post-RLS (Cleaned Cortical AF7) Waveform Scope
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("AF7 Ocular Artifact Rejection (Raw EOG orange vs RLS+Kalman Clean cyan)")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.68))
+                    Spacer()
+                    Text(String(format: "vEOG %.0f µV", bci.latestEOGVerticalUV))
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.orange)
+                }
+
+                Canvas { context, size in
+                    let rect = CGRect(origin: .zero, size: size)
+                    context.fill(Path(roundedRect: rect, cornerRadius: 10), with: .color(.black.opacity(0.45)))
+
+                    let raw = bci.rawAF7Scope
+                    let clean = bci.cleanedAF7Scope
+                    guard raw.count > 1, clean.count > 1 else { return }
+
+                    let midY = size.height * 0.5
+                    let scaleY = size.height / 360.0
+
+                    var rawPath = Path()
+                    for (i, sample) in raw.enumerated() {
+                        let x = CGFloat(i) / CGFloat(raw.count - 1) * size.width
+                        let y = midY - CGFloat(min(max(sample, -170.0), 170.0)) * scaleY
+                        if i == 0 { rawPath.move(to: CGPoint(x: x, y: y)) }
+                        else { rawPath.addLine(to: CGPoint(x: x, y: y)) }
+                    }
+                    context.stroke(rawPath, with: .color(.orange.opacity(0.65)), lineWidth: 1.2)
+
+                    var cleanPath = Path()
+                    for (i, sample) in clean.enumerated() {
+                        let x = CGFloat(i) / CGFloat(clean.count - 1) * size.width
+                        let y = midY - CGFloat(min(max(sample, -170.0), 170.0)) * scaleY
+                        if i == 0 { cleanPath.move(to: CGPoint(x: x, y: y)) }
+                        else { cleanPath.addLine(to: CGPoint(x: x, y: y)) }
+                    }
+                    context.stroke(cleanPath, with: .color(.cyan), lineWidth: 1.8)
+                }
+                .frame(height: 64)
+            }
+
+            // Side-by-Side: Squared Bicoherence b²(f1, f2) Principal Domain Triangle & 18-Bin Theta-Gamma PAC Polar Rose
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(String(format: "Bicoherence b²(f₁,f₂) · Max %.2f", metrics.maxBicoherence))
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.75))
+
+                    Canvas { context, size in
+                        let rect = CGRect(origin: .zero, size: size)
+                        context.fill(Path(roundedRect: rect, cornerRadius: 12), with: .color(.black.opacity(0.48)))
+
+                        let tri = metrics.bicoherenceTriangle
+                        let n = tri.count
+                        guard n > 0 else { return }
+                        let cellW = size.width / CGFloat(n)
+                        let cellH = size.height / CGFloat(n)
+
+                        for f1 in 0..<n {
+                            for f2 in 0...f1 where (f1 + f2) < n {
+                                let val = Double(min(max(tri[f1][f2], 0.0), 1.0))
+                                let cellRect = CGRect(
+                                    x: CGFloat(f1) * cellW,
+                                    y: size.height - CGFloat(f2 + 1) * cellH,
+                                    width: cellW + 0.5,
+                                    height: cellH + 0.5
+                                )
+                                let color = Color(
+                                    hue: 0.56 - val * 0.48,
+                                    saturation: 0.85,
+                                    brightness: 0.25 + val * 0.75
+                                ).opacity(0.30 + val * 0.70)
+                                context.fill(Path(cellRect), with: .color(color))
+                            }
+                        }
+                    }
+                    .frame(height: 118)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("θ–γ PAC Polar Rose (18 Bins)")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.75))
+
+                    Canvas { context, size in
+                        let rect = CGRect(origin: .zero, size: size)
+                        context.fill(Path(roundedRect: rect, cornerRadius: 12), with: .color(.black.opacity(0.48)))
+
+                        let center = CGPoint(x: size.width * 0.5, y: size.height * 0.5)
+                        let maxR = min(size.width, size.height) * 0.44
+                        let hist = metrics.pacPhaseAmplitudeHistogram
+                        let bins = max(1, hist.count)
+                        let maxBin = max(0.08, hist.max() ?? 0.08)
+
+                        for ring in 1...2 {
+                            let r = maxR * CGFloat(ring) / 2.0
+                            let circleRect = CGRect(x: center.x - r, y: center.y - r, width: r * 2, height: r * 2)
+                            context.stroke(Path(ellipseIn: circleRect), with: .color(.white.opacity(0.12)), lineWidth: 1)
+                        }
+
+                        for idx in 0..<bins {
+                            let a0 = (Double(idx) / Double(bins)) * 2.0 * Double.pi - Double.pi * 0.5
+                            let a1 = (Double(idx + 1) / Double(bins)) * 2.0 * Double.pi - Double.pi * 0.5
+                            let norm = CGFloat(min(max(hist[idx] / maxBin, 0.08), 1.0))
+                            let r = maxR * norm
+
+                            var wedge = Path()
+                            wedge.move(to: center)
+                            wedge.addArc(
+                                center: center,
+                                radius: r,
+                                startAngle: .radians(a0),
+                                endAngle: .radians(a1),
+                                clockwise: false
+                            )
+                            wedge.closeSubpath()
+                            context.fill(wedge, with: .color(accent.opacity(0.35 + Double(norm) * 0.55)))
+                            context.stroke(wedge, with: .color(.cyan.opacity(0.75)), lineWidth: 0.8)
+                        }
+                    }
+                    .frame(height: 118)
+                }
+            }
+        }
+        .padding(16)
+        .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude * 0.68, cornerRadius: 24)
+    }
+
+    private func eegElectrodePill(label: String, kOhm: Float, quality: Float) -> some View {
+        let dotColor: Color = quality > 0.75 ? .green : (quality > 0.45 ? .yellow : .red)
+        return HStack(spacing: 5) {
+            Circle()
+                .fill(dotColor)
+                .frame(width: 7, height: 7)
+            Text(label)
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundStyle(.white)
+            Text(String(format: "%.0fkΩ", kOhm))
+                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.68))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 5)
+        .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func corticalMetricBadge(title: String, value: String, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 9, weight: .semibold, design: .rounded))
+                .foregroundStyle(.white.opacity(0.62))
+            Text(value)
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundStyle(tint)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
     }
 
     private func synthSliderRow(

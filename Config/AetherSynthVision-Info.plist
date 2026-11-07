@@ -20,6 +20,8 @@
     <string>1.0.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>AetherSynth Spatial connects to 4-channel Bluetooth Low Energy EEG headbands (TP9, AF7, AF8, TP10) for real-time cortical entrainment, ocular blink rejection, and Bispectral Index telemetry.</string>
     <key>NSHandsTrackingUsageDescription</key>
     <string>AetherSynth reads bimanual pinch distance and wrist roll to modulate binaural entrainment frequencies and spatial filter harmonics in real time.</string>
     <key>NSWorldSensingUsageDescription</key>

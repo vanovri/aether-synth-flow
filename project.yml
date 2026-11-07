@@ -43,6 +43,7 @@ targets:
         embed: true
       - sdk: AudioToolbox.framework
       - sdk: CoreAudioKit.framework
+      - sdk: CoreBluetooth.framework
       - sdk: AVFoundation.framework
       - sdk: Accelerate.framework
       - sdk: Metal.framework
@@ -55,6 +56,8 @@ targets:
     deploymentTarget: "18.0"
     sources:
       - path: Sources/Shared
+        excludes:
+          - "AetherCapstoneBenchmarkSuite.swift"
       - path: Sources/Widgets
     info:
       path: Config/AetherSynthWidgets-Info.plist
@@ -82,11 +85,14 @@ targets:
       - path: Sources/Shared/DistributedOrchestraEngine.swift
       - path: Sources/Shared/NeuralLatentSoundscapeEngine.swift
       - path: Sources/App/Audio/AudioSynthEngine.swift
+      - path: Sources/App/Audio/ReverbAndFMDSP.swift
       - path: Sources/App/Audio/SpectralFFTAnalyzer.swift
       - path: Sources/App/Audio/SpatialHRTFConvolver.swift
       - path: Sources/App/Audio/ShoeboxRoomAcoustics.swift
       - path: Sources/App/Audio/MetalAcousticRayTracer.swift
+      - path: Sources/App/Audio/FDTDWaveguideSolver.swift
       - path: Sources/App/Graphics/AcousticRayTracingKernels.metal
+      - path: Sources/App/Graphics/FDTDWaveguideKernels.metal
     info:
       path: Config/AetherSynthAUv3-Info.plist
     entitlements:
@@ -129,6 +135,7 @@ targets:
       - sdk: RealityKit.framework
       - sdk: ARKit.framework
       - sdk: CompositorServices.framework
+      - sdk: CoreBluetooth.framework
       - sdk: Metal.framework
       - sdk: MetalPerformanceShaders.framework
       - sdk: MetalPerformanceShadersGraph.framework
@@ -163,6 +170,7 @@ targets:
       - sdk: AVFoundation.framework
       - sdk: Accelerate.framework
       - sdk: ServiceManagement.framework
+      - sdk: CoreBluetooth.framework
       - sdk: Metal.framework
       - sdk: MetalPerformanceShaders.framework
       - sdk: MetalPerformanceShadersGraph.framework
@@ -173,6 +181,8 @@ targets:
     deploymentTarget: "11.0"
     sources:
       - path: Sources/Shared
+        excludes:
+          - "AetherCapstoneBenchmarkSuite.swift"
       - path: Sources/WatchOS
     info:
       path: Config/AetherSynthWatch-Info.plist

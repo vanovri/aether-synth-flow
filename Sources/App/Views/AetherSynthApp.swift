@@ -186,6 +186,29 @@ public struct RootSpatialShellView: View {
                 }
             )
         }
+        .sheet(isPresented: $coordinator.isMeshSyncSheetPresented) {
+            MeshSyncStatusSheetView(coordinator: coordinator)
+        }
+        .fileExporter(
+            isPresented: $coordinator.isExportingWAV,
+            document: coordinator.exportWAVDocument,
+            contentType: .wav,
+            defaultFilename: coordinator.exportWAVDocument?.suggestedFilename ?? "AetherSynth-Stem.wav"
+        ) { result in
+            if case .success = result {
+                coordinator.presentTransientBanner("RIFF/WAVE stem exported.")
+            }
+        }
+        .fileExporter(
+            isPresented: $coordinator.isExportingCapstoneMarkdown,
+            document: coordinator.exportCapstoneMarkdownDocument,
+            contentType: .plainText,
+            defaultFilename: "AetherSynth-Capstone-Audit-\(DayKeyFormatter.dayKey(for: .now)).md"
+        ) { result in
+            if case .success = result {
+                coordinator.presentTransientBanner("Capstone audit report exported.")
+            }
+        }
         .fileExporter(
             isPresented: $coordinator.isExportingJSON,
             document: coordinator.exportJSONDocument,

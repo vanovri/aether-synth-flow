@@ -319,6 +319,33 @@ public final class HapticDirector {
         #endif
     }
 
+    public func playParameterDetentTick(intensity: Float = 0.60) {
+        playTick(intensity: intensity, sharpness: 0.76)
+    }
+
+    public func playTick(intensity: Float = 0.55, sharpness: Float = 0.75) {
+        #if os(macOS)
+        if !supportsHaptics {
+            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .default)
+            return
+        }
+        #endif
+        #if canImport(CoreHaptics)
+        guard let engine = ensureRunning() else { return }
+        let clampedIntensity = min(max(intensity, 0.08), 1.0)
+        let clampedSharpness = min(max(sharpness, 0.08), 1.0)
+        let event = CHHapticEvent(
+            eventType: .hapticTransient,
+            parameters: [
+                CHHapticEventParameter(parameterID: .hapticIntensity, value: clampedIntensity),
+                CHHapticEventParameter(parameterID: .hapticSharpness, value: clampedSharpness)
+            ],
+            relativeTime: 0
+        )
+        playEvents([event], curves: [], on: engine)
+        #endif
+    }
+
     #if canImport(CoreHaptics)
     private func playEvents(
         _ events: [CHHapticEvent],
