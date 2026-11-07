@@ -172,6 +172,15 @@ public struct HadamardFDNReverbKernel: Sendable {
     }
 
     @inline(__always)
+    public static func multiplyHadamard8(
+        _ input: (Float, Float, Float, Float, Float, Float, Float, Float)
+    ) -> (Float, Float, Float, Float, Float, Float, Float, Float) {
+        var vec = SIMD8<Float>(input.0, input.1, input.2, input.3, input.4, input.5, input.6, input.7)
+        applyNormalizedWalshHadamard8(&vec)
+        return (vec[0], vec[1], vec[2], vec[3], vec[4], vec[5], vec[6], vec[7])
+    }
+
+    @inline(__always)
     private mutating func updateFeedbackGainsIfNeeded(decaySeconds: Float) {
         let safeDecay = max(0.15, decaySeconds)
         guard abs(safeDecay - cachedDecaySeconds) > 1.0e-5 else { return }

@@ -1635,17 +1635,7 @@ struct AetherSynthTests {
             +44.0, 0.0, -36.0, +29.0, -15.0, +21.0, 0.0, -11.0
         ]
 
-        var latestEstimate = MarzulloConsensusEstimate(
-            consensusOffsetSeconds: 0,
-            confidenceRadiusSeconds: 0,
-            intersectionLowSeconds: 0,
-            intersectionHighSeconds: 0,
-            survivingIntervalCount: 0,
-            totalIntervalCount: 0,
-            rejectedOutlierCount: 0,
-            minimumRTTDelaySeconds: 0,
-            allanDeviation: 0
-        )
+        var latestEstimate = MarzulloConsensusEstimate()
 
         let baseOriginNs: UInt64 = 10_000_000_000
         for idx in 0..<16 {
@@ -1663,7 +1653,7 @@ struct AetherSynthTests {
 
                 let packet = OrchestraPTPClockPacket(
                     packetKind: .delayResponse,
-                    sequenceNumber: UInt32(idx + 1),
+                    sequenceNumber: UInt16(idx + 1),
                     peerNodeID: 2,
                     t1OriginNs: t1,
                     t2ResponderIngressNs: t2,
@@ -1688,7 +1678,7 @@ struct AetherSynthTests {
 
                 let packet = OrchestraPTPClockPacket(
                     packetKind: .delayResponse,
-                    sequenceNumber: UInt32(idx + 1),
+                    sequenceNumber: UInt16(idx + 1),
                     peerNodeID: 2,
                     t1OriginNs: t1,
                     t2ResponderIngressNs: t2,
@@ -1935,7 +1925,11 @@ struct AetherSynthTests {
         #expect(preNotePeak < 1.0e-6)
 
         // 2. Assert frames [128 ..< 512] initiate phase-coherent oscillation with non-zero energy
-        let postNoteRMS = sqrt((128..<512).reduce(Float(0.0)) { $0 + leftOut[$1] * leftOut[$1] } / Float(512 - 128))
+        var postNoteSumSq: Float = 0.0
+        for i in 128..<512 {
+            postNoteSumSq += leftOut[i] * leftOut[i]
+        }
+        let postNoteRMS = sqrtf(postNoteSumSq / Float(512 - 128))
         #expect(postNoteRMS > 0.01)
 
         // 3. Assert linear parameter ramp across [128 ..< 384] interpolates accurately from 1200 Hz -> 3000 Hz -> 4800 Hz
@@ -2003,8 +1997,14 @@ struct AetherSynthTests {
         let (irL, irR) = fdn.renderImpulseResponse(frameCount: 8_192, decaySeconds: 1.4, damping: 0.40)
         #expect(irL.count == 8_192 && irR.count == 8_192)
         #expect(irL.allSatisfy { $0.isFinite && abs($0) <= 1.5 })
-        let earlyWindowEnergy = (0..<2_048).reduce(Float(0)) { $0 + irL[$1] * irL[$1] + irR[$1] * irR[$1] }
-        let lateWindowEnergy = (6_144..<8_192).reduce(Float(0)) { $0 + irL[$1] * irL[$1] + irR[$1] * irR[$1] }
+        var earlyWindowEnergy: Float = 0.0
+        for i in 0..<2_048 {
+            earlyWindowEnergy += irL[i] * irL[i] + irR[i] * irR[i]
+        }
+        var lateWindowEnergy: Float = 0.0
+        for i in 6_144..<8_192 {
+            lateWindowEnergy += irL[i] * irL[i] + irR[i] * irR[i]
+        }
         #expect(earlyWindowEnergy > lateWindowEnergy)
 
         // 3. Verify 4-Operator Through-Zero FM voice engine across negative/positive instantaneous frequencies
@@ -2193,7 +2193,7 @@ struct AetherSynthTests {
 
         // 2. Matrix Product State (MPS) Bell state entanglement entropy S_vN == ln(8) & 2-site DMRG energy minimization
         let bellState = MatrixProductStateEngine.makeMaximallyEntangledBellState(schmidtRank: 8)
-        var mps = MatrixProductStateEngine.decompose(stateVector: bellState, maxBondDim: 16)
+        let mps = MatrixProductStateEngine.decompose(stateVector: bellState, maxBondDim: 16)
         let snap = mps.evaluateEntanglement()
         #expect(abs(snap.maxEntanglementEntropyNats - log(8.0)) < 1.0e-3)
         #expect(abs(snap.effectiveSchmidtRank - 8.0) < 1.0e-2)

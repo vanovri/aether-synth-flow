@@ -318,6 +318,16 @@ public actor AetherMeshSyncActor {
         self.lamportClock = max(1, initialLamportClock)
     }
 
+    public init(
+        databaseActor: TelemetryDatabaseActor,
+        localPeerName: String
+    ) {
+        self.init(
+            databaseActor: databaseActor,
+            displayName: localPeerName
+        )
+    }
+
     public func startMesh(displayName: String) {
         let sanitizedName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         self.localDisplayName = sanitizedName.isEmpty ? "AetherNode" : sanitizedName

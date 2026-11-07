@@ -8,6 +8,8 @@ public enum WAVBitDepth: String, Codable, CaseIterable, Sendable, Identifiable {
     case pcm24Bit = "pcm_24bit"
     case ieeeFloat32Bit = "float_32bit"
 
+    public static var float32IEEE: WAVBitDepth { .ieeeFloat32Bit }
+
     public var id: String { rawValue }
 
     public var displayName: String {
@@ -62,6 +64,7 @@ public struct WAVHeaderMetadata: Sendable, Equatable {
     public let blockAlign: UInt16
     public let bitsPerSample: UInt16
     public let dataByteCount: UInt32
+    public var dataPayloadByteCount: UInt32 { dataByteCount }
     public let frameCount: Int
 }
 

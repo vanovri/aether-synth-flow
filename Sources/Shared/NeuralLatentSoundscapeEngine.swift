@@ -141,6 +141,20 @@ public struct LatentAudioTensor: Sendable, Equatable {
         data.allSatisfy(\.isFinite)
     }
 
+    public var isAllFinite: Bool {
+        allFinite
+    }
+
+    public static func l2Distance(_ a: LatentAudioTensor, _ b: LatentAudioTensor) -> Float {
+        var sumSq: Double = 0.0
+        let count = min(a.data.count, b.data.count)
+        for i in 0..<count {
+            let d = Double(a.data[i] - b.data[i])
+            sumSq += d * d
+        }
+        return Float(sqrt(sumSq))
+    }
+
     /// Samples Gaussian prior `Z_0 ~ N(0, temperature^2 * I)` via deterministic SplitMix64 + Box-Muller transform.
     public static func sampleGaussianPrior(seed: UInt64, temperature: Float = 1.0) -> LatentAudioTensor {
         let temp = min(max(temperature, 0.05), 2.5)

@@ -105,6 +105,7 @@ public enum OrchestraWireProtocolError: LocalizedError, Sendable, Equatable {
 /// - `[56..<64]` `fnv1aIntegrityTag` (`UInt64` FNV-1a over `[0..<56]`)
 public struct OrchestraPTPClockPacket: Sendable, Equatable {
     public static let encodedByteSize: Int = 64
+    public static let byteLength: Int = 64
     public static let payloadByteSizeWithoutTag: Int = 56
     public static let magicHeader: UInt16 = 0x4145
     public static let currentProtocolVersion: UInt8 = 1
@@ -374,6 +375,9 @@ public struct MarzulloConsensusEstimate: Sendable, Equatable {
     public let intersectingCliqueSize: Int
     public let totalWindowSamples: Int
     public let rejectedOutlierCount: Int
+
+    public var survivingIntervalCount: Int { intersectingCliqueSize }
+    public var totalIntervalCount: Int { totalWindowSamples }
 
     public init(
         consensusOffsetSeconds: Double = 0,
@@ -671,6 +675,18 @@ public struct PhaseLockedLoopClockServo: Sendable {
         self.kp = 2.0 * safeZeta * wn
         self.ki = wn * wn
         self.phaseAssistWeight = min(max(phaseAssistWeight, 0.0), 1.0)
+    }
+
+    public init(
+        naturalBandwidthHz: Double,
+        dampingRatio: Double,
+        phaseAssistWeight: Double = 0.15
+    ) {
+        self.init(
+            dampingRatio: dampingRatio,
+            naturalBandwidthHz: naturalBandwidthHz,
+            phaseAssistWeight: phaseAssistWeight
+        )
     }
 
     public mutating func reset() {

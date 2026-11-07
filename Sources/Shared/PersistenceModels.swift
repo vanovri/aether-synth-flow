@@ -12,6 +12,9 @@ public enum FocusCategory: String, Codable, CaseIterable, Sendable, Identifiable
     case gammaCognition = "gamma_cognition"
     case deltaRecovery = "delta_recovery"
 
+    public static var creativeFlow: FocusCategory { .alphaFlow }
+    public static var meditation: FocusCategory { .thetaMeditation }
+
     public var id: String { rawValue }
 
     public var displayName: String {

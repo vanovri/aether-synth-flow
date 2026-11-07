@@ -133,6 +133,14 @@ public struct ImageSourceReflectionTap: Sendable, Equatable, Identifiable {
     public let leftEarGain: Float               // Gain * ipsilateral/contralateral head-shadow weight
     public let rightEarGain: Float
 
+    public var order: Int { reflectionOrder }
+    public var delaySeconds: Float { propagationDelaySeconds }
+    public var distanceMeters: Float { pathLengthMeters }
+    public var effectiveGain: Float { linearGain }
+    public var airAbsorptionLP: Float { airLowPassCoeff }
+    public var listenerAzimuthDeg: Float { incidenceAzimuthDeg }
+    public var listenerElevationDeg: Float { incidenceElevationDeg }
+
     public init(
         tapIndex: Int,
         reflectionOrder: Int,

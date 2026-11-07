@@ -340,6 +340,7 @@ public actor MPSGraphBrainwaveTrainer {
     private var telemetry: TrainingTelemetrySnapshot
     private let preferredBackend: NeuralComputeBackend
     private let customCheckpointURL: URL?
+    private let configuredLearningRate: Float
 
     #if canImport(Metal) && canImport(MetalPerformanceShaders) && canImport(MetalPerformanceShadersGraph) && !os(watchOS)
     private struct CompiledGPUTrainingGraph {
@@ -366,12 +367,14 @@ public actor MPSGraphBrainwaveTrainer {
     public init(
         seed: UInt64 = 0xAE74_2200_2026,
         forceCPUFallback: Bool = false,
-        customCheckpointURL: URL? = nil
+        customCheckpointURL: URL? = nil,
+        configuredLearningRate: Float = MPSGraphBrainwaveTrainer.defaultLearningRate
     ) {
         self.weights = BrainwaveModelWeights.makeGlorotSeeded(seed: seed)
         self.adamM = BrainwaveModelWeights.makeZeros()
         self.adamV = BrainwaveModelWeights.makeZeros()
         self.customCheckpointURL = customCheckpointURL
+        self.configuredLearningRate = configuredLearningRate
 
         #if canImport(Metal) && canImport(MetalPerformanceShaders) && canImport(MetalPerformanceShadersGraph) && !os(watchOS)
         if !forceCPUFallback,
@@ -400,6 +403,22 @@ public actor MPSGraphBrainwaveTrainer {
         )
     }
 
+    public init(
+        forceCPUFallback: Bool = false,
+        learningRate: Float = MPSGraphBrainwaveTrainer.defaultLearningRate,
+        weightDecay: Float = MPSGraphBrainwaveTrainer.weightDecay,
+        gradientClipNorm: Float = MPSGraphBrainwaveTrainer.maxGradientL2Norm,
+        checkpointURL: URL? = nil
+    ) {
+        _ = weightDecay
+        _ = gradientClipNorm
+        self.init(
+            forceCPUFallback: forceCPUFallback,
+            customCheckpointURL: checkpointURL,
+            configuredLearningRate: learningRate
+        )
+    }
+
     // MARK: - Telemetry, Inference & Multi-Epoch Training Entrypoints
 
     public func snapshotTelemetry() -> TrainingTelemetrySnapshot {
@@ -408,6 +427,25 @@ public actor MPSGraphBrainwaveTrainer {
 
     public func currentWeightsSnapshot() -> BrainwaveModelWeights {
         weights
+    }
+
+    public func snapshotWeights() -> BrainwaveModelWeights {
+        weights
+    }
+
+    public func evaluateLoss(batch: BiometricTrainingBatch) -> Float {
+        var tempW = weights
+        var tempM = adamM
+        var tempV = adamV
+        let res = Self.executeSIMDCPUAutodiffStep(
+            batch: batch,
+            learningRate: 0.0,
+            stepIndex: max(1, telemetry.epochCount + 1),
+            weights: &tempW,
+            adamM: &tempM,
+            adamV: &tempV
+        )
+        return res.loss
     }
 
     /// Predicts optimal `[binauralBeatHz, carrierHz, filterCutoffHz, hrtfOrbitSpeed, targetCoherence]`
@@ -496,13 +534,14 @@ public actor MPSGraphBrainwaveTrainer {
     public func trainEpochs(
         batch: BiometricTrainingBatch,
         epochs: Int,
-        learningRate: Float = MPSGraphBrainwaveTrainer.defaultLearningRate
+        learningRate: Float? = nil
     ) -> [TrainingTelemetrySnapshot] {
+        let lr = learningRate ?? configuredLearningRate
         let count = max(1, epochs)
         var history: [TrainingTelemetrySnapshot] = []
         history.reserveCapacity(count)
         for _ in 0..<count {
-            history.append(trainEpoch(batch: batch, learningRate: learningRate))
+            history.append(trainEpoch(batch: batch, learningRate: lr))
         }
         return history
     }

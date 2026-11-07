@@ -137,6 +137,8 @@ public final class MPEPolyphonicVoiceBank: @unchecked Sendable {
     private var mpeSlewCoeff: Float = 0.015
 
     public private(set) var totalStolenVoiceCount: UInt64 = 0
+    public private(set) var lastStolenVoiceIndex: Int = 0
+    public var totalVoiceStealCount: Int { Int(totalStolenVoiceCount) }
 
     public init(sampleRate: Double = 48_000.0) {
         let safeRate = max(8_000.0, sampleRate)
@@ -204,7 +206,36 @@ public final class MPEPolyphonicVoiceBank: @unchecked Sendable {
             channelsPtr[ch] = MPEChannelExpressionState()
         }
         totalStolenVoiceCount = 0
+        lastStolenVoiceIndex = 0
         eventOrderCounter = 1
+    }
+
+    @inline(__always)
+    public func handleMIDIMessage(status: UInt8, data1: UInt8, data2: UInt8) {
+        handleMIDIPacket(status: status, data1: data1, data2: data2)
+    }
+
+    @inline(__always)
+    public func renderAndAccumulate(
+        leftOutput: UnsafeMutablePointer<Float>,
+        rightOutput: UnsafeMutablePointer<Float>,
+        frameCount: Int,
+        baseCutoffHz: Float,
+        resonance: Float,
+        masterGain: Float
+    ) {
+        let bank = RealtimeParameterBank()
+        bank.setHostValue(baseCutoffHz, for: .filterCutoffHz)
+        bank.setHostValue(resonance, for: .filterResonance)
+        bank.setHostValue(masterGain, for: .masterGain)
+        bank.resetRenderStateFromAtomics()
+        renderSubBlock(
+            leftOut: leftOutput,
+            rightOut: rightOutput,
+            frameCount: frameCount,
+            parameterBank: bank,
+            accumulate: true
+        )
     }
 
     @inline(__always)
@@ -274,6 +305,7 @@ public final class MPEPolyphonicVoiceBank: @unchecked Sendable {
             slot.stealCrossfadeIndex = 0
             slot.stealCrossfadeLength = stealCrossfadeSamples
             totalStolenVoiceCount &+= 1
+            lastStolenVoiceIndex = targetSlotIndex
         } else {
             slot.stealCrossfadeIndex = 0
             slot.stealCrossfadeLength = 0
