@@ -1,39 +1,62 @@
 # AetherSynth & Flow
 
-Offline-first **iOS 18 & watchOS 11 / Swift 6** Spatial Focus Timer, Gravitational Habit Matrix, Wrist HealthKit HRV Biometric Streamer, On-Device CoreML Neural Brainwave Predictor, and Real-Time Procedural Audio/Visual Synthesizer with zero external package dependencies.
+Offline-first **iOS 18, visionOS 2, macOS 15 Sequoia, watchOS 11 & AUv3 / Swift 6** Spatial Focus Timer, Gravitational Habit Matrix, 6-DoF Bimanual Hand-Tracking Synthesizer, Stereoscopic `CompositorServices` Metal Engine, Wrist HealthKit HRV Biometric Streamer, On-Device CoreML Neural Brainwave Predictor, and Real-Time Procedural Audio/Visual Workstation with zero external package dependencies.
 
 ## System Architecture
 
 | Layer | Implementation |
 | --- | --- |
 | **SwiftData & Concurrency** | `FocusSession`, `HabitNode`, `AudioPreset`, `DailyTelemetry` managed by `@ModelActor TelemetryDatabaseActor` with App Group container sharing (`group.com.aethersynth.flow`), chunked batch ingestion, and deterministic conflict policies (`higherRevisionWins`, `newerTimestampWins`, `mergeAccumulate`, `keepExisting`). |
-| **Procedural DSP & vDSP FFT** | Allocation-free `ProceduralSynthKernel` inside `AVAudioSourceNode` (`os_unfair_lock_trylock` wait-free bridge) synthesizing stereo binaural beats, Paul Kellet 7-pole $1/f$ pink noise, 5-voice detuned ambient pads, and cascaded 24dB/oct Cytomic TPT SVF filtering, paired with `SpectralFFTAnalyzer` (`Accelerate/vDSP` 256-point Hann DFT → 64 perceptual bars). |
+| **Procedural DSP & vDSP FFT** | Allocation-free `ProceduralSynthKernel` inside `AVAudioSourceNode` (`os_unfair_lock_trylock` wait-free bridge) synthesizing stereo binaural beats, 4-operator through-zero FM, Paul Kellet 7-pole $1/f$ pink noise, 5-voice detuned ambient pads, and cascaded 24dB/oct Cytomic TPT SVF filtering, paired with `SpectralFFTAnalyzer` (`Accelerate/vDSP` 256-point Hann DFT → 64 perceptual bars + sub/low/mid/high energy bands). |
+| **6-DoF Spatial Telemetry & Procedural Meshes** | Pure-SIMD `SpatialPoseTelemeter` mapping left-hand thumb–index pinch (`0.005m...0.12m`) to logarithmic `binauralBeatHz` (`1.5...40.0 Hz`) with Schmitt-trigger hysteresis, right-hand pinch to Cytomic SVF `filterCutoffHz` (`120...12,000 Hz`) + quaternion wrist roll to `filterResonance` (`0.08...0.92`), and bimanual palm span (`0.10m...0.85m`) to `padDetuneCents`, `bloomBoost`, and `orbitalRadiusScale`. `ProceduralMeshGenerator` builds manifold geodesic icosahedron and Keplerian $(p,q)$ torus-knot buffers. |
+| **visionOS 2 `RealityKit` & `ARKit` Hand Tracking** | `AetherVisionApp` coordinates a 2D glass control deck (`aether-control-deck`), a `0.85m³` volumetric orbital window (`VolumetricOrbitalRealityView`) with inclined 3D Keplerian habit satellites emitting phase-continuous spatial overtones, and `BimanualHandTrackingActor` (`ARKitSession` + `HandTrackingProvider` at 90Hz with deterministic Lissajous Gesture Simulator fallback). |
+| **visionOS 2 `CompositorServices` Metal Engine** | `AetherCompositorRenderer` & `AetherCompositorShaders.metal` running a 90Hz background `LayerRenderer` loop (`.rgba16Float` HDR, `.depth32Float` reverse-Z, `.layered` layout, foveated rendering `isFoveationEnabled`) with a double-buffered 16,384-particle 3D curl-noise compute kernel (`aetherCurlNoiseParticleKernel`) and single-pass stereoscopic vertex/fragment shaders (`[[render_target_array_index]]`). |
+| **macOS 15 Sequoia Studio, `MenuBarExtra` & CoreAudio HAL** | `AetherMacApp` 3-column `NavigationSplitView` desktop workstation, native `.menuBarExtraStyle(.window)` live countdown + waveform bar, borderless always-on-top floating `NSPanel` PiP HUD (`FloatingOrbitalHUDController`), global hotkey monitor (`MacGlobalShortcutController`: `⌘⇧F`, `⌘⇧B`, `⌘⇧H`, `⌘⇧]`), and zero-dependency `CoreAudioDeviceManager` HAL output router with hot-plug listeners. |
 | **HRV Signal Processing & Lomb-Scargle** | `BiometricTelemetryModels` (`HRVSignalProcessor`) computing ectopic-filtered SDNN, RMSSD, pNN50, Baevsky Stress Index ($SI$), Poincaré $\text{SD1}/\text{SD2}$ geometry, and uneven-grid Lomb-Scargle periodogram (`0.04–0.15 Hz` Mayer LF & `0.15–0.40 Hz` vagal HF bands). |
 | **CoreML + SIMD Neural Entrainment** | `AdaptiveBrainwaveMLPredictor` packing `[1, 12]` `MLMultiArray` / `BiometricFeatureProvider` tensors into a 3-layer SIMD MLP (`12 -> 24 -> 16 -> 5` with LayerNorm, GELU, skip connections, Huber-loss online personalization) + `EntrainmentPIDController` closed-loop audio damping. |
 | **watchOS 11 & WatchConnectivity** | `WatchHealthKitBiometricEngine` (`HKWorkoutSession` + `HKLiveWorkoutBuilder` + `HKHeartbeatSeriesQuery` + `.mindfulSession`), Digital Crown + Double-Tap (`WatchOrbitalCrownView`), `WatchSmartStackWidget` complications, and 64-bit FNV-1a binary `WatchBiometricBridgeActor` + `SyntheticPhysiologySimulator`. |
+| **3D Acoustics, AUv3 & Neural DSP** | KEMAR HRTF UPOLS convolver (`SpatialHRTFConvolver`), 2D/3D FDTD PML acoustic waveguide (`FDTDWaveguideSolver`), Metal ray-traced directional room impulse response (`MetalAcousticRayTracer`), RVQ + Snake rectified-flow neural soundscape (`NeuralLatentSoundscapeEngine`), `AetherSynthAUv3` DAW plugin (`AUParameterTreeBridge`), and sub-ms PTP/Marzullo WFS orchestra (`DistributedOrchestraEngine`). |
 | **Metal & 120Hz Particles** | Stitchable `aetherAurora` triple-stage fluid domain-warping FBM shader + `interactiveRipple` refractive wave-equation layer shader with RGB optical dispersion + 120Hz ProMotion `TimelineView(.animation)` & `Canvas` vortex/wake particle simulation. |
-| **iOS 18 System Surfaces** | Lock Screen & Dynamic Island `ActivityKit` Live Activities (`FocusLiveActivityWidget`), Interactive Home Screen `WidgetKit` 7-day heatmap (`HabitMatrixHomeWidget` + `LogHabitPulseIntent`), and iOS 18 Control Center toggle (`SpatialFocusControlWidget`). |
-| **Ledger Portability** | Verified FNV-1a 64-bit checksum JSON archive backup/restore (`AetherTelemetryArchive`) and RFC-4180 CSV session exporter (`TelemetryCSVSerializer`). |
+| **iOS 18 System Surfaces & Portability** | Lock Screen & Dynamic Island `ActivityKit` Live Activities (`FocusLiveActivityWidget`), Home Screen `WidgetKit` 7-day heatmap (`HabitMatrixHomeWidget`), Control Center toggle (`SpatialFocusControlWidget`), FNV-1a 64-bit checksum JSON archive (`AetherTelemetryArchive`), and RFC-4180 CSV exporter (`TelemetryCSVSerializer`). |
 
 ## Targets (`project.yml`)
 
 - **`AetherSynthFlow`**: Main iOS 18.0+ application (`SWIFT_VERSION = 6.0`, `SWIFT_STRICT_CONCURRENCY = complete`).
 - **`AetherSynthWidgets`**: Embedded iOS 18 WidgetKit / ActivityKit / ControlWidget extension.
+- **`AetherSynthVision`**: Native visionOS 2.0+ volumetric `RealityKit`, `ARKit` bimanual hand tracking, and `CompositorServices` stereoscopic Metal target.
+- **`AetherSynthMac`**: Native macOS 15.0+ Sequoia 3-column desktop studio, `MenuBarExtra`, floating `NSPanel` HUD, and `CoreAudio` HAL router.
 - **`AetherSynthWatch`**: Companion watchOS 11.0+ HealthKit HRV streamer, Digital Crown controller, and Smart Stack complication target.
-- **`AetherSynthTests`**: `Swift Testing` (`@Suite`, `@Test`) verification suite covering concurrency, DSP/FFT, Lomb-Scargle HRV, CoreML/MLP online SGD, and WatchConnectivity closed-loop convergence.
+- **`AetherSynthAUv3`**: Audio Unit v3 (`aufx`/`aumu`) DAW instrument & spatial effect extension.
+- **`AetherSynthTests` & `AetherSynthMacTests`**: `Swift Testing` (`@Suite`, `@Test`) verification suites covering concurrency, multi-sample-rate DSP/FFT (`44.1/48/96 kHz`), 6-DoF `SpatialPoseTelemeter`, manifold `ProceduralMeshGenerator`, Lomb-Scargle HRV, CoreML/MLP online SGD, and AUv3/acoustics invariants.
 
-## Build & Verify (macOS / Xcode 16+)
+## Build & Verify (macOS 15 / Xcode 16+)
 
 ```bash
 brew install xcodegen
 xcodegen generate
 
+# macOS 15 Native Build & Swift Testing Suite
+xcodebuild test \
+  -project AetherSynthFlow.xcodeproj \
+  -scheme AetherSynthMac \
+  -destination 'platform=macOS' \
+  CODE_SIGNING_ALLOWED=NO
+
+# iOS 18 Simulator Build & Test
 xcodebuild test \
   -project AetherSynthFlow.xcodeproj \
   -scheme AetherSynthFlow \
   -destination 'platform=iOS Simulator,name=iPhone 16 Pro' \
   CODE_SIGNING_ALLOWED=NO
 
+# visionOS 2 Simulator Build
+xcodebuild build \
+  -project AetherSynthFlow.xcodeproj \
+  -scheme AetherSynthVision \
+  -destination 'generic/platform=visionOS Simulator' \
+  CODE_SIGNING_ALLOWED=NO
+
+# watchOS 11 Simulator Build
 xcodebuild build \
   -project AetherSynthFlow.xcodeproj \
   -scheme AetherSynthWatch \
@@ -41,4 +64,4 @@ xcodebuild build \
   CODE_SIGNING_ALLOWED=NO
 ```
 
-Automated macOS-15 / Xcode 16 CI runs on every push via `.github/workflows/ios-ci.yml`.
+Automated macOS-15 / Xcode 16 multi-platform matrix CI runs on every push via `.github/workflows/ios-ci.yml`.
