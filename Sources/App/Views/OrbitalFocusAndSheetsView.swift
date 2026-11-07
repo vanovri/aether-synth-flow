@@ -601,23 +601,7 @@ public struct SynthLabPanelView: View {
         let notch1Hz = KEMARHRIRSynthesizer.primaryPinnaNotchFrequencyHz(elevationRad: pose.elevationRadians)
 
         return VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Label("3D KEMAR HRTF & Shoebox Room", systemImage: "ear.and.waveform")
-                    .font(.system(size: 14, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
-
-                Spacer()
-
-                Toggle(
-                    "",
-                    isOn: Binding(
-                        get: { coordinator.synthParameters.isHRTFSpatializerEnabled },
-                        set: { coordinator.toggleHRTFSpatializer($0) }
-                    )
-                )
-                .labelsHidden()
-                .tint(accent)
-            }
+            hrtfRadarHeaderRow(accent: accent)
 
             HStack(spacing: 8) {
                 bioMetricPill(title: "Azimuth θ", value: String(format: "%+.0f°", azDeg))
@@ -626,108 +610,8 @@ public struct SynthLabPanelView: View {
                 bioMetricPill(title: "ITD / Pinna", value: String(format: "%+.0fµs · %.1fk", itdMicros, notch1Hz / 1000.0))
             }
 
-            GeometryReader { geo in
-                let size = geo.size
-                let center = CGPoint(x: size.width * 0.5, y: size.height * 0.5)
-                let maxRadius = min(size.width, size.height) * 0.44
-                let minDist: Float = 0.15
-                let maxDist: Float = 6.0
-                let normalizedDist = CGFloat(min(max((distM - minDist) / (maxDist - minDist), 0.0), 1.0))
-                let azRad = CGFloat(azDeg * .pi / 180.0)
-                let sourcePoint = CGPoint(
-                    x: center.x + sin(azRad) * normalizedDist * maxRadius,
-                    y: center.y - cos(azRad) * normalizedDist * maxRadius
-                )
-
-                ZStack {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .fill(.black.opacity(0.36))
-
-                    Canvas { context, canvasSize in
-                        let c = CGPoint(x: canvasSize.width * 0.5, y: canvasSize.height * 0.5)
-                        let rMax = min(canvasSize.width, canvasSize.height) * 0.44
-
-                        for ring in 1...3 {
-                            let r = rMax * CGFloat(ring) / 3.0
-                            let circleRect = CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2)
-                            context.stroke(
-                                Path(ellipseIn: circleRect),
-                                with: .color(.white.opacity(ring == 3 ? 0.22 : 0.11)),
-                                style: StrokeStyle(lineWidth: 0.9, dash: ring == 2 ? [4, 4] : [])
-                            )
-                        }
-
-                        var crosshair = Path()
-                        crosshair.move(to: CGPoint(x: c.x, y: c.y - rMax))
-                        crosshair.addLine(to: CGPoint(x: c.x, y: c.y + rMax))
-                        crosshair.move(to: CGPoint(x: c.x - rMax, y: c.y))
-                        crosshair.addLine(to: CGPoint(x: c.x + rMax, y: c.y))
-                        context.stroke(crosshair, with: .color(.white.opacity(0.12)), lineWidth: 0.8)
-
-                        // Render 18 solved 3D image-source early reflection taps
-                        for tap in coordinator.currentRoomReflectionTaps {
-                            let tapAzRad = CGFloat(tap.listenerAzimuthDeg * .pi / 180.0)
-                            let tapNormDist = CGFloat(min(max(tap.distanceMeters / 12.0, 0.08), 0.98))
-                            let pt = CGPoint(
-                                x: c.x + sin(tapAzRad) * tapNormDist * rMax,
-                                y: c.y - cos(tapAzRad) * tapNormDist * rMax
-                            )
-                            let dotRadius: CGFloat = tap.order == 1 ? 3.4 : 2.3
-                            let rect = CGRect(x: pt.x - dotRadius, y: pt.y - dotRadius, width: dotRadius * 2, height: dotRadius * 2)
-                            let alpha = Double(min(max(tap.effectiveGain * 2.8, 0.16), 0.85))
-                            let color = tap.order == 1 ? Color.cyan.opacity(alpha) : accent.opacity(alpha * 0.8)
-                            context.fill(Path(ellipseIn: rect), with: .color(color))
-                        }
-
-                        // Render active orbiting habit satellites
-                        for sat in coordinator.synthParameters.orbitalSatellites.asArray() where sat.isActive {
-                            let satAzRad = CGFloat(sat.azimuthDeg * .pi / 180.0)
-                            let satNormDist = CGFloat(min(max((sat.distanceMeters - minDist) / (maxDist - minDist), 0.12), 0.92))
-                            let satPt = CGPoint(
-                                x: c.x + sin(satAzRad) * satNormDist * rMax,
-                                y: c.y - cos(satAzRad) * satNormDist * rMax
-                            )
-                            let satRect = CGRect(x: satPt.x - 4.0, y: satPt.y - 4.0, width: 8.0, height: 8.0)
-                            context.fill(Path(ellipseIn: satRect), with: .color(.mint.opacity(0.78)))
-                        }
-
-                        // Listener KEMAR head glyph at origin
-                        let headRect = CGRect(x: c.x - 7, y: c.y - 7, width: 14, height: 14)
-                        context.fill(Path(ellipseIn: headRect), with: .color(.white.opacity(0.90)))
-                    }
-
-                    Circle()
-                        .fill(accent)
-                        .frame(width: 24, height: 24)
-                        .shadow(color: accent, radius: 10)
-                        .overlay {
-                            Circle().strokeBorder(.white, lineWidth: 2)
-                        }
-                        .position(sourcePoint)
-                }
-                .contentShape(Rectangle())
-                .gesture(
-                    DragGesture(minimumDistance: 0)
-                        .onChanged { drag in
-                            let dx = Float(drag.location.x - center.x)
-                            let dy = Float(center.y - drag.location.y)
-                            let radial = sqrt(dx * dx + dy * dy) / Float(max(maxRadius, 1.0))
-                            let clampedNormDist = min(max(radial, 0.0), 1.0)
-                            let newDistance = minDist + clampedNormDist * (maxDist - minDist)
-                            let newAzimuthDeg = atan2(dx, dy) * 180.0 / .pi
-
-                            if coordinator.isOrbitalSourceAutoLockEnabled {
-                                coordinator.isOrbitalSourceAutoLockEnabled = false
-                            }
-                            coordinator.updateHRTFSourcePose(
-                                azimuthDeg: newAzimuthDeg,
-                                elevationDeg: coordinator.synthParameters.hrtfElevationDeg,
-                                distanceMeters: newDistance
-                            )
-                        }
-                )
-            }
-            .frame(height: 176)
+            hrtfRadarInteractiveCanvas(accent: accent, azDeg: azDeg, distM: distM)
+                .frame(height: 176)
 
             synthSliderRow(
                 title: "Elevation Dome φ (-45° Floor to +90° Zenith)",
@@ -745,58 +629,187 @@ public struct SynthLabPanelView: View {
                 range: -45.0...90.0
             )
 
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Orbital Trajectory Auto-Lock")
-                        .font(.system(size: 12, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.white)
-                    Text("Revolve primary HRTF source with orbital phase & 6-DoF head pose")
-                        .font(.system(size: 10, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.58))
-                }
-                Spacer()
-                Toggle(
-                    "",
-                    isOn: Binding(
-                        get: { coordinator.isOrbitalSourceAutoLockEnabled },
-                        set: { coordinator.toggleOrbitalSourceAutoLock($0) }
-                    )
-                )
-                .labelsHidden()
-                .tint(.cyan)
-            }
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(ShoeboxRoomPreset.allCases) { room in
-                        let selected = coordinator.activeRoomPreset == room
-                        Button {
-                            coordinator.selectShoeboxRoomPreset(room)
-                        } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: room.symbolName)
-                                    .font(.system(size: 11, weight: .semibold))
-                                Text(room.displayName)
-                                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                            }
-                            .foregroundStyle(selected ? .white : .white.opacity(0.68))
-                            .padding(.horizontal, 11)
-                            .padding(.vertical, 7)
-                            .background(
-                                selected ? accent.opacity(0.45) : Color.white.opacity(0.08),
-                                in: Capsule()
-                            )
-                            .overlay {
-                                Capsule().strokeBorder(.white.opacity(selected ? 0.55 : 0.12), lineWidth: 0.8)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
+            hrtfOrbitalAutoLockRow
+            shoeboxRoomPresetSelector(accent: accent)
         }
         .padding(16)
         .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude, cornerRadius: 24)
+    }
+
+    private func hrtfRadarHeaderRow(accent: Color) -> some View {
+        HStack {
+            Label("3D KEMAR HRTF & Shoebox Room", systemImage: "ear.and.waveform")
+                .font(.system(size: 14, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+
+            Spacer()
+
+            Toggle(
+                "",
+                isOn: Binding(
+                    get: { coordinator.synthParameters.isHRTFSpatializerEnabled },
+                    set: { coordinator.toggleHRTFSpatializer($0) }
+                )
+            )
+            .labelsHidden()
+            .tint(accent)
+        }
+    }
+
+    private func hrtfRadarInteractiveCanvas(accent: Color, azDeg: Float, distM: Float) -> some View {
+        GeometryReader { geo in
+            let size = geo.size
+            let center = CGPoint(x: size.width * 0.5, y: size.height * 0.5)
+            let maxRadius = min(size.width, size.height) * 0.44
+            let minDist: Float = 0.15
+            let maxDist: Float = 6.0
+            let normalizedDist = CGFloat(min(max((distM - minDist) / (maxDist - minDist), 0.0), 1.0))
+            let azRad = CGFloat(azDeg * .pi / 180.0)
+            let sourcePoint = CGPoint(
+                x: center.x + sin(azRad) * normalizedDist * maxRadius,
+                y: center.y - cos(azRad) * normalizedDist * maxRadius
+            )
+
+            ZStack {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(.black.opacity(0.36))
+
+                Canvas { context, canvasSize in
+                    let c = CGPoint(x: canvasSize.width * 0.5, y: canvasSize.height * 0.5)
+                    let rMax = min(canvasSize.width, canvasSize.height) * 0.44
+
+                    for ring in 1...3 {
+                        let r = rMax * CGFloat(ring) / 3.0
+                        let circleRect = CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2)
+                        context.stroke(
+                            Path(ellipseIn: circleRect),
+                            with: .color(.white.opacity(ring == 3 ? 0.22 : 0.11)),
+                            style: StrokeStyle(lineWidth: 0.9, dash: ring == 2 ? [4, 4] : [])
+                        )
+                    }
+
+                    var crosshair = Path()
+                    crosshair.move(to: CGPoint(x: c.x, y: c.y - rMax))
+                    crosshair.addLine(to: CGPoint(x: c.x, y: c.y + rMax))
+                    crosshair.move(to: CGPoint(x: c.x - rMax, y: c.y))
+                    crosshair.addLine(to: CGPoint(x: c.x + rMax, y: c.y))
+                    context.stroke(crosshair, with: .color(.white.opacity(0.12)), lineWidth: 0.8)
+
+                    // Render 18 solved 3D image-source early reflection taps
+                    for tap in coordinator.currentRoomReflectionTaps {
+                        let tapAzRad = CGFloat(tap.listenerAzimuthDeg * .pi / 180.0)
+                        let tapNormDist = CGFloat(min(max(tap.distanceMeters / 12.0, 0.08), 0.98))
+                        let pt = CGPoint(
+                            x: c.x + sin(tapAzRad) * tapNormDist * rMax,
+                            y: c.y - cos(tapAzRad) * tapNormDist * rMax
+                        )
+                        let dotRadius: CGFloat = tap.order == 1 ? 3.4 : 2.3
+                        let rect = CGRect(x: pt.x - dotRadius, y: pt.y - dotRadius, width: dotRadius * 2, height: dotRadius * 2)
+                        let alpha = Double(min(max(tap.effectiveGain * 2.8, 0.16), 0.85))
+                        let color = tap.order == 1 ? Color.cyan.opacity(alpha) : accent.opacity(alpha * 0.8)
+                        context.fill(Path(ellipseIn: rect), with: .color(color))
+                    }
+
+                    // Render active orbiting habit satellites
+                    for sat in coordinator.synthParameters.orbitalSatellites.asArray() where sat.isActive {
+                        let satAzRad = CGFloat(sat.azimuthDeg * .pi / 180.0)
+                        let satNormDist = CGFloat(min(max((sat.distanceMeters - minDist) / (maxDist - minDist), 0.12), 0.92))
+                        let satPt = CGPoint(
+                            x: c.x + sin(satAzRad) * satNormDist * rMax,
+                            y: c.y - cos(satAzRad) * satNormDist * rMax
+                        )
+                        let satRect = CGRect(x: satPt.x - 4.0, y: satPt.y - 4.0, width: 8.0, height: 8.0)
+                        context.fill(Path(ellipseIn: satRect), with: .color(.mint.opacity(0.78)))
+                    }
+
+                    // Listener KEMAR head glyph at origin
+                    let headRect = CGRect(x: c.x - 7, y: c.y - 7, width: 14, height: 14)
+                    context.fill(Path(ellipseIn: headRect), with: .color(.white.opacity(0.90)))
+                }
+
+                Circle()
+                    .fill(accent)
+                    .frame(width: 24, height: 24)
+                    .shadow(color: accent, radius: 10)
+                    .overlay {
+                        Circle().strokeBorder(.white, lineWidth: 2)
+                    }
+                    .position(sourcePoint)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { drag in
+                        let dx = Float(drag.location.x - center.x)
+                        let dy = Float(center.y - drag.location.y)
+                        let radial = sqrt(dx * dx + dy * dy) / Float(max(maxRadius, 1.0))
+                        let clampedNormDist = min(max(radial, 0.0), 1.0)
+                        let newDistance = minDist + clampedNormDist * (maxDist - minDist)
+                        let newAzimuthDeg = atan2(dx, dy) * 180.0 / .pi
+
+                        if coordinator.isOrbitalSourceAutoLockEnabled {
+                            coordinator.isOrbitalSourceAutoLockEnabled = false
+                        }
+                        coordinator.updateHRTFSourcePose(
+                            azimuthDeg: newAzimuthDeg,
+                            elevationDeg: coordinator.synthParameters.hrtfElevationDeg,
+                            distanceMeters: newDistance
+                        )
+                    }
+            )
+        }
+    }
+
+    private var hrtfOrbitalAutoLockRow: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Orbital Trajectory Auto-Lock")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white)
+                Text("Revolve primary HRTF source with orbital phase & 6-DoF head pose")
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.58))
+            }
+            Spacer()
+            Toggle(
+                "",
+                isOn: Binding(
+                    get: { coordinator.isOrbitalSourceAutoLockEnabled },
+                    set: { coordinator.toggleOrbitalSourceAutoLock($0) }
+                )
+            )
+            .labelsHidden()
+            .tint(.cyan)
+        }
+    }
+
+    private func shoeboxRoomPresetSelector(accent: Color) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(ShoeboxRoomPreset.allCases) { room in
+                    let selected = coordinator.activeRoomPreset == room
+                    let bgCol: Color = selected ? accent.opacity(0.45) : Color.white.opacity(0.08)
+                    Button {
+                        coordinator.selectShoeboxRoomPreset(room)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: room.symbolName)
+                                .font(.system(size: 11, weight: .semibold))
+                            Text(room.displayName)
+                                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        }
+                        .foregroundStyle(selected ? Color.white : Color.white.opacity(0.68))
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 7)
+                        .background(bgCol, in: Capsule())
+                        .overlay {
+                            Capsule().strokeBorder(.white.opacity(selected ? 0.55 : 0.12), lineWidth: 0.8)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
     }
 
     // MARK: - GPU MPSGraph Neural Trainer Telemetry Card

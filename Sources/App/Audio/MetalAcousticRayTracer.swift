@@ -132,6 +132,14 @@ public enum AcousticChamberPreset: String, CaseIterable, Codable, Sendable, Iden
         case .hexagonalDiffuserStudio: return "Hexagonal Studio"
         }
     }
+
+    public var symbolName: String {
+        switch self {
+        case .geodesicSanctuary: return "Pentagon"
+        case .vaultedCathedral: return "building.columns.fill"
+        case .hexagonalDiffuserStudio: return "hexagon.fill"
+        }
+    }
 }
 
 public struct ListenerHeadPose3D: Sendable, Equatable {

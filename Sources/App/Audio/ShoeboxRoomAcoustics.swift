@@ -73,6 +73,19 @@ public enum ShoeboxRoomPreset: Int, CaseIterable, Codable, Sendable, Identifiabl
         }
     }
 
+    public var symbolName: String {
+        switch self {
+        case .anechoicChamber:
+            return "waveform.slash"
+        case .obsidianStudio:
+            return "hifispeaker.2.fill"
+        case .glassConservatory:
+            return "cube.transparent"
+        case .cathedralVault:
+            return "building.columns.fill"
+        }
+    }
+
     public var configuration: ShoeboxRoomConfiguration {
         switch self {
         case .anechoicChamber:
