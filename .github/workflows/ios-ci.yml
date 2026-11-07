@@ -38,12 +38,20 @@ jobs:
 
       - name: Build Native macOS 15 Studio & Execute Swift Testing Suite
         run: |
-          xcodebuild test \
+          xcodebuild build \
             -project AetherSynthFlow.xcodeproj \
             -scheme AetherSynthMac \
             -destination "platform=macOS" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO
+          xcodebuild test \
+            -project AetherSynthFlow.xcodeproj \
+            -scheme AetherSynthMacTests \
+            -destination "platform=macOS" \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
             COMPILER_INDEX_STORE_ENABLE=NO
 
       - name: Resolve Available iOS 18 Simulator
@@ -72,12 +80,20 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             COMPILER_INDEX_STORE_ENABLE=NO
-          xcodebuild test \
+          xcodebuild build \
             -project AetherSynthFlow.xcodeproj \
             -scheme AetherSynthFlow \
             -destination "platform=iOS Simulator,id=${{ steps.ios_sim.outputs.udid }}" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO
+          xcodebuild test \
+            -project AetherSynthFlow.xcodeproj \
+            -scheme AetherSynthTests \
+            -destination "platform=iOS Simulator,id=${{ steps.ios_sim.outputs.udid }}" \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
             COMPILER_INDEX_STORE_ENABLE=NO
 
       - name: Resolve visionOS 2 Simulator Destination & Compile AetherSynthVision

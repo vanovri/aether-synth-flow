@@ -10,13 +10,6 @@ import CoreML
 #if canImport(AudioToolbox)
 import AudioToolbox
 #endif
-#if os(macOS)
-@testable import AetherSynthMac
-#elseif os(visionOS)
-@testable import AetherSynthVision
-#else
-@testable import AetherSynthFlow
-#endif
 
 @Suite("AetherSynth & Flow Full-Stack Concurrency, DSP, FFT & Portability Suite")
 struct AetherSynthTests {

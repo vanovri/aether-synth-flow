@@ -213,33 +213,59 @@ targets:
     platform: iOS
     deploymentTarget: "18.0"
     sources:
+      - path: Sources/Shared
+      - path: Sources/App/Audio
+      - path: Sources/App/Graphics
+      - path: Sources/App/Haptics
+      - path: Sources/AUv3
       - path: Tests/AetherSynthTests
     dependencies:
-      - target: AetherSynthFlow
+      - sdk: SwiftUI.framework
+      - sdk: SwiftData.framework
+      - sdk: AudioToolbox.framework
+      - sdk: CoreAudioKit.framework
+      - sdk: CoreBluetooth.framework
+      - sdk: AVFoundation.framework
+      - sdk: Accelerate.framework
+      - sdk: Metal.framework
+      - sdk: MetalPerformanceShaders.framework
+      - sdk: MetalPerformanceShadersGraph.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aethersynth.flow.tests
         IPHONEOS_DEPLOYMENT_TARGET: "18.0"
         TARGETED_DEVICE_FAMILY: "1,2"
         GENERATE_INFOPLIST_FILE: YES
-        BUNDLE_LOADER: "$(TEST_HOST)"
-        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/AetherSynthFlow.app/$(BUNDLE_EXECUTABLE_PATH)"
 
   AetherSynthMacTests:
     type: bundle.unit-test
     platform: macOS
     deploymentTarget: "15.0"
     sources:
+      - path: Sources/Shared
+      - path: Sources/App/Audio
+      - path: Sources/App/Graphics
+      - path: Sources/App/Haptics
+      - path: Sources/AUv3
       - path: Tests/AetherSynthTests
     dependencies:
-      - target: AetherSynthMac
+      - sdk: SwiftUI.framework
+      - sdk: SwiftData.framework
+      - sdk: AppKit.framework
+      - sdk: CoreAudio.framework
+      - sdk: AudioToolbox.framework
+      - sdk: CoreAudioKit.framework
+      - sdk: AVFoundation.framework
+      - sdk: Accelerate.framework
+      - sdk: CoreBluetooth.framework
+      - sdk: Metal.framework
+      - sdk: MetalPerformanceShaders.framework
+      - sdk: MetalPerformanceShadersGraph.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aethersynth.flow.mac.tests
         MACOSX_DEPLOYMENT_TARGET: "15.0"
         GENERATE_INFOPLIST_FILE: YES
-        BUNDLE_LOADER: "$(TEST_HOST)"
-        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/AetherSynthMac.app/Contents/MacOS/AetherSynthMac"
 
 schemes:
   AetherSynthFlow:
@@ -248,14 +274,18 @@ schemes:
         AetherSynthFlow: all
         AetherSynthWidgets: all
         AetherSynthAUv3: all
-        AetherSynthTests: [test]
     run:
       config: Debug
+
+  AetherSynthTests:
+    build:
+      targets:
+        AetherSynthTests: [test, run]
     test:
       config: Debug
       targets:
         - name: AetherSynthTests
-          parallelizable: true
+          parallelizable: false
 
   AetherSynthVision:
     build:
@@ -268,14 +298,18 @@ schemes:
     build:
       targets:
         AetherSynthMac: all
-        AetherSynthMacTests: [test]
     run:
       config: Debug
+
+  AetherSynthMacTests:
+    build:
+      targets:
+        AetherSynthMacTests: [test, run]
     test:
       config: Debug
       targets:
         - name: AetherSynthMacTests
-          parallelizable: true
+          parallelizable: false
 
   AetherSynthWatch:
     build:
