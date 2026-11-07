@@ -2,6 +2,7 @@
 
 import SwiftUI
 import SwiftData
+import simd
 
 // MARK: - 1. Orbital Focus Arena (RadialOrbitalLayout + Spatial Timer + Habit Satellites)
 
@@ -1493,197 +1494,209 @@ public struct SynthLabPanelView: View {
         let eyring = report?.eyringRT60PerBand ?? SIMD4<Float>(1.10, 0.88, 0.70, 0.46)
 
         return VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Label("3D Ray-Traced Acoustics & RT60 Analyzer", systemImage: "cube.transparent.fill")
-                    .font(.system(size: 14, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
-
-                Spacer()
-
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(coordinator.synthParameters.rayTracedAcousticsEnabled ? Color.green : Color.white.opacity(0.35))
-                        .frame(width: 6, height: 6)
-                    Text((report?.usedHardwareRayTracing == true) ? "MTLAccel HW" : "SIMD SAH-BVH")
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.85))
-                }
-                .padding(.horizontal, 9)
-                .padding(.vertical, 4)
-                .background(.white.opacity(0.10), in: Capsule())
-
-                Toggle(
-                    "",
-                    isOn: Binding(
-                        get: { coordinator.synthParameters.rayTracedAcousticsEnabled },
-                        set: { coordinator.toggleRayTracedAcoustics($0) }
-                    )
-                )
-                .labelsHidden()
-                .tint(accent)
-            }
-
-            // Chamber Geometry Selector
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(AcousticChamberPreset.allCases) { chamber in
-                        let selected = coordinator.selectedChamberPreset == chamber
-                        Button {
-                            coordinator.selectAcousticChamber(chamber)
-                        } label: {
-                            HStack(spacing: 5) {
-                                Image(systemName: chamber.symbolName)
-                                    .font(.system(size: 11, weight: .semibold))
-                                Text(chamber.rawValue)
-                                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                            }
-                            .foregroundStyle(selected ? .white : .white.opacity(0.68))
-                            .padding(.horizontal, 11)
-                            .padding(.vertical, 6)
-                            .background(
-                                selected ? accent.opacity(0.45) : Color.white.opacity(0.08),
-                                in: Capsule()
-                            )
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-
-            // Acoustic Surface Material BRDF Selector
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(AcousticSurfaceMaterialPreset.allCases) { mat in
-                        let selected = coordinator.selectedSurfaceMaterialPreset == mat
-                        Button {
-                            coordinator.selectAcousticSurfaceMaterial(mat)
-                        } label: {
-                            Text(mat.rawValue)
-                                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                .foregroundStyle(selected ? .white : .white.opacity(0.68))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(
-                                    selected ? Color.cyan.opacity(0.38) : Color.white.opacity(0.06),
-                                    in: Capsule()
-                                )
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-
-            // Live 2D/3D Isometric Ray-Path Projection & 4-Band Octave RT60 Bars
-            HStack(spacing: 10) {
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack {
-                        Text("3D Ray Paths (NEE + QMC)")
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
-                            .foregroundStyle(.white.opacity(0.88))
-                        Spacer()
-                        Text("\(report?.triangleCount ?? 64) tris · 0 leak")
-                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(accent)
-                    }
-
-                    Canvas { context, size in
-                        let rect = CGRect(origin: .zero, size: size)
-                        context.fill(Path(roundedRect: rect, cornerRadius: 12), with: .color(.black.opacity(0.36)))
-
-                        let cx = size.width * 0.5
-                        let cy = size.height * 0.54
-                        let scale = min(size.width, size.height) * 0.085
-
-                        func projectIso(_ p: SIMD3<Float>) -> CGPoint {
-                            let ix = CGFloat(p.x - p.z * 0.55) * scale
-                            let iy = CGFloat(-p.y + (p.x + p.z) * 0.24) * scale
-                            return CGPoint(x: cx + ix, y: cy + iy)
-                        }
-
-                        if let segments = report?.raySegments, !segments.isEmpty {
-                            let bandColors: [Color] = [.orange, .yellow, .cyan, .purple]
-                            for seg in segments.prefix(160) {
-                                var path = Path()
-                                path.move(to: projectIso(seg.start))
-                                path.addLine(to: projectIso(seg.end))
-                                let bCol = bandColors[min(max(seg.dominantBand, 0), 3)]
-                                let alphaFade = max(0.18, 0.82 - Double(seg.bounceIndex) * 0.11)
-                                context.stroke(
-                                    path,
-                                    with: .color(bCol.opacity(alphaFade)),
-                                    lineWidth: seg.bounceIndex == 0 ? 1.35 : 0.85
-                                )
-                            }
-                        } else {
-                            for idx in 0..<24 {
-                                let angle = Double(idx) * (Double.pi * 2.0 / 24.0)
-                                var path = Path()
-                                path.move(to: CGPoint(x: cx, y: cy))
-                                path.addLine(to: CGPoint(
-                                    x: cx + CGFloat(cos(angle)) * size.width * 0.40,
-                                    y: cy + CGFloat(sin(angle)) * size.height * 0.38
-                                ))
-                                context.stroke(path, with: .color(accent.opacity(0.35)), lineWidth: 0.9)
-                            }
-                        }
-
-                        let srcPt = projectIso(SIMD3<Float>(0.0, 0.35, 1.45))
-                        let lstPt = projectIso(SIMD3<Float>(0.0, 0.0, -1.10))
-                        context.fill(Path(ellipseIn: CGRect(x: srcPt.x - 3.5, y: srcPt.y - 3.5, width: 7, height: 7)), with: .color(.cyan))
-                        context.fill(Path(ellipseIn: CGRect(x: lstPt.x - 3.5, y: lstPt.y - 3.5, width: 7, height: 7)), with: .color(.green))
-                    }
-                }
-                .frame(maxWidth: .infinity)
-
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack {
-                        Text("Octave RT60 (s)")
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
-                            .foregroundStyle(.white.opacity(0.88))
-                        Spacer()
-                        Text(String(format: "Sab %.2fs / Eyr %.2fs", sabine.y, eyring.y))
-                            .font(.system(size: 8.5, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(.cyan)
-                    }
-
-                    HStack(alignment: .bottom, spacing: 8) {
-                        ForEach(AcousticOctaveBand.allCases) { band in
-                            let val = rt60[band.rawValue]
-                            let norm = CGFloat(min(max(val / 3.5, 0.06), 1.0))
-                            VStack(spacing: 4) {
-                                Text(String(format: "%.2f", val))
-                                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                                    .foregroundStyle(.white)
-                                GeometryReader { geo in
-                                    VStack {
-                                        Spacer(minLength: 0)
-                                        RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                            .fill(
-                                                LinearGradient(
-                                                    colors: [.cyan, accent],
-                                                    startPoint: .top,
-                                                    endPoint: .bottom
-                                                )
-                                            )
-                                            .frame(height: max(6, geo.size.height * norm))
-                                    }
-                                }
-                                Text(band.shortLabel)
-                                    .font(.system(size: 8.5, weight: .semibold, design: .rounded))
-                                    .foregroundStyle(.white.opacity(0.68))
-                            }
-                            .frame(maxWidth: .infinity)
-                        }
-                    }
-                    .padding(8)
-                    .background(.black.opacity(0.36), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                }
-                .frame(maxWidth: .infinity)
-            }
-            .frame(height: 138)
+            rayTracedAcousticsHeader(accent: accent, report: report)
+            rayTracedChamberSelector(accent: accent)
+            rayTracedSurfaceMaterialSelector
+            rayTracedVisualizerRow(accent: accent, report: report, rt60: rt60, sabine: sabine, eyring: eyring)
         }
         .padding(16)
         .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude, cornerRadius: 24)
+    }
+
+    private func rayTracedAcousticsHeader(accent: Color, report: AcousticRayTraceReport?) -> some View {
+        HStack {
+            Label("3D Ray-Traced Acoustics & RT60 Analyzer", systemImage: "cube.transparent.fill")
+                .font(.system(size: 14, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+
+            Spacer()
+
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(coordinator.synthParameters.rayTracedAcousticsEnabled ? Color.green : Color.white.opacity(0.35))
+                    .frame(width: 6, height: 6)
+                Text((report?.usedHardwareRayTracing == true) ? "MTLAccel HW" : "SIMD SAH-BVH")
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.85))
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .background(.white.opacity(0.10), in: Capsule())
+
+            Toggle(
+                "",
+                isOn: Binding(
+                    get: { coordinator.synthParameters.rayTracedAcousticsEnabled },
+                    set: { coordinator.toggleRayTracedAcoustics($0) }
+                )
+            )
+            .labelsHidden()
+            .tint(accent)
+        }
+    }
+
+    private func rayTracedChamberSelector(accent: Color) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(AcousticChamberPreset.allCases) { chamber in
+                    let selected = coordinator.selectedChamberPreset == chamber
+                    let bgCol: Color = selected ? accent.opacity(0.45) : Color.white.opacity(0.08)
+                    Button {
+                        coordinator.selectAcousticChamber(chamber)
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: chamber.symbolName)
+                                .font(.system(size: 11, weight: .semibold))
+                            Text(chamber.rawValue)
+                                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        }
+                        .foregroundStyle(selected ? Color.white : Color.white.opacity(0.68))
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 6)
+                        .background(bgCol, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private var rayTracedSurfaceMaterialSelector: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(AcousticSurfaceMaterialPreset.allCases) { mat in
+                    let selected = coordinator.selectedSurfaceMaterialPreset == mat
+                    let bgCol: Color = selected ? Color.cyan.opacity(0.38) : Color.white.opacity(0.06)
+                    Button {
+                        coordinator.selectAcousticSurfaceMaterial(mat)
+                    } label: {
+                        Text(mat.rawValue)
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundStyle(selected ? Color.white : Color.white.opacity(0.68))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(bgCol, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private func rayTracedVisualizerRow(
+        accent: Color,
+        report: AcousticRayTraceReport?,
+        rt60: SIMD4<Float>,
+        sabine: SIMD4<Float>,
+        eyring: SIMD4<Float>
+    ) -> some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text("3D Ray Paths (NEE + QMC)")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.88))
+                    Spacer()
+                    Text("\(report?.triangleCount ?? 64) tris · 0 leak")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(accent)
+                }
+
+                Canvas { context, size in
+                    let rect = CGRect(origin: .zero, size: size)
+                    context.fill(Path(roundedRect: rect, cornerRadius: 12), with: .color(.black.opacity(0.36)))
+
+                    let cx = size.width * 0.5
+                    let cy = size.height * 0.54
+                    let scale = min(size.width, size.height) * 0.085
+
+                    func projectIso(_ p: SIMD3<Float>) -> CGPoint {
+                        let ix = CGFloat(p.x - p.z * 0.55) * scale
+                        let iy = CGFloat(-p.y + (p.x + p.z) * 0.24) * scale
+                        return CGPoint(x: cx + ix, y: cy + iy)
+                    }
+
+                    if let segments = report?.raySegments, !segments.isEmpty {
+                        let bandColors: [Color] = [.orange, .yellow, .cyan, .purple]
+                        for seg in segments.prefix(160) {
+                            var path = Path()
+                            path.move(to: projectIso(seg.start))
+                            path.addLine(to: projectIso(seg.end))
+                            let bCol = bandColors[min(max(seg.dominantBand, 0), 3)]
+                            let alphaFade = max(0.18, 0.82 - Double(seg.bounceIndex) * 0.11)
+                            context.stroke(
+                                path,
+                                with: .color(bCol.opacity(alphaFade)),
+                                lineWidth: seg.bounceIndex == 0 ? 1.35 : 0.85
+                            )
+                        }
+                    } else {
+                        for idx in 0..<24 {
+                            let angle = Double(idx) * (Double.pi * 2.0 / 24.0)
+                            var path = Path()
+                            path.move(to: CGPoint(x: cx, y: cy))
+                            path.addLine(to: CGPoint(
+                                x: cx + CGFloat(cos(angle)) * size.width * 0.40,
+                                y: cy + CGFloat(sin(angle)) * size.height * 0.38
+                            ))
+                            context.stroke(path, with: .color(accent.opacity(0.35)), lineWidth: 0.9)
+                        }
+                    }
+
+                    let srcPt = projectIso(SIMD3<Float>(0.0, 0.35, 1.45))
+                    let lstPt = projectIso(SIMD3<Float>(0.0, 0.0, -1.10))
+                    context.fill(Path(ellipseIn: CGRect(x: srcPt.x - 3.5, y: srcPt.y - 3.5, width: 7, height: 7)), with: .color(.cyan))
+                    context.fill(Path(ellipseIn: CGRect(x: lstPt.x - 3.5, y: lstPt.y - 3.5, width: 7, height: 7)), with: .color(.green))
+                }
+            }
+            .frame(maxWidth: .infinity)
+
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text("Octave RT60 (s)")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.88))
+                    Spacer()
+                    Text(String(format: "Sab %.2fs / Eyr %.2fs", sabine.y, eyring.y))
+                        .font(.system(size: 8.5, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.cyan)
+                }
+
+                HStack(alignment: .bottom, spacing: 8) {
+                    ForEach(AcousticOctaveBand.allCases) { band in
+                        let val = rt60[band.rawValue]
+                        let norm = CGFloat(min(max(val / 3.5, 0.06), 1.0))
+                        VStack(spacing: 4) {
+                            Text(String(format: "%.2f", val))
+                                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                .foregroundStyle(.white)
+                            GeometryReader { geo in
+                                VStack {
+                                    Spacer(minLength: 0)
+                                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                        .fill(
+                                            LinearGradient(
+                                                colors: [.cyan, accent],
+                                                startPoint: .top,
+                                                endPoint: .bottom
+                                            )
+                                        )
+                                        .frame(height: max(6, geo.size.height * norm))
+                                }
+                            }
+                            Text(band.shortLabel)
+                                .font(.system(size: 8.5, weight: .semibold, design: .rounded))
+                                .foregroundStyle(.white.opacity(0.68))
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                }
+                .padding(8)
+                .background(.black.opacity(0.36), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .frame(height: 138)
     }
 
     // MARK: - Phase 7 Card B: Neural Latent Diffusion & RVQ Token Matrix Inspector

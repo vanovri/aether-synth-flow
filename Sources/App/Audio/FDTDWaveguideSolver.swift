@@ -491,9 +491,12 @@ public struct RealtimeFDTDResonatorKernel: @unchecked Sendable {
                 let ulVec = SIMD4<Float>(pCurr[rowP1 + x - 1], pCurr[rowP1 + x], pCurr[rowP1 + x + 1], pCurr[rowP1 + x + 2])
                 let urVec = SIMD4<Float>(pCurr[rowP1 + x + 1], pCurr[rowP1 + x + 2], pCurr[rowP1 + x + 3], pCurr[rowP1 + x + 4])
 
-                let lapVec = twoThirds * (lVec + rVec + dVec + uVec)
-                    + oneSixth * (dlVec + drVec + ulVec + urVec)
-                    - tenThirds * cVec
+                let axialVec: SIMD4<Float> = (lVec + rVec) + (dVec + uVec)
+                let diagVec: SIMD4<Float> = (dlVec + drVec) + (ulVec + urVec)
+                let scaledAxial: SIMD4<Float> = twoThirds * axialVec
+                let scaledDiag: SIMD4<Float> = oneSixth * diagVec
+                let scaledCenter: SIMD4<Float> = tenThirds * cVec
+                let lapVec: SIMD4<Float> = (scaledAxial + scaledDiag) - scaledCenter
 
                 lapScratch[base] = obs[base] == 0 ? lapVec[0] : 0.0
                 lapScratch[base + 1] = obs[base + 1] == 0 ? lapVec[1] : 0.0

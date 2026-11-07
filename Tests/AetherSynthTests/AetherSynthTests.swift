@@ -1546,7 +1546,7 @@ struct AetherSynthTests {
         }
 
         // 3. 50% Complementary Hann Overlap-Add unity-gain & WOLA reconstruction error < 1e-5
-        var ola = ComplementaryHannOverlapAdd()
+        let ola = ComplementaryHannOverlapAdd()
         #expect(ola.maxUnityGainRipple() < 1.0e-5)
 
         let signalLen = ComplementaryHannOverlapAdd.blockSize * 3

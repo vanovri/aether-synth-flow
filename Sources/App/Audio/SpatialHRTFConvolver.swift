@@ -175,6 +175,14 @@ public enum KEMARHRIRSynthesizer: Sendable {
         computeWoodworthITD(azimuthDeg: azimuthDeg, elevationDeg: elevationDeg)
     }
 
+    @inline(__always)
+    public static func woodworthSchlosbergITDSeconds(
+        azimuthRad: Float,
+        elevationRad: Float = 0.0
+    ) -> Float {
+        computeWoodworthITD(azimuthRadians: azimuthRad, elevationRadians: elevationRad)
+    }
+
     /// Analytical KEMAR primary pinna spectral notch center frequency `f_N1(phi) = 6200 + 3800 * sin(phi)` Hz.
     @inline(__always)
     public static func primaryPinnaNotchFrequencyHz(elevationDeg: Float) -> Double {
