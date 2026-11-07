@@ -19,6 +19,10 @@ public struct SharedWidgetSnapshot: Codable, Sendable, Equatable {
     public var binauralBeatHz: Double
     public var activePresetName: String
     public var recentSevenDayBuckets: [Int] // 7 elements: oldest -> today (0...4)
+    public var latestAutonomicCoherence: Double
+    public var latestHeartRateBPM: Double
+    public var latestRMSSDMs: Double
+    public var isBioEntrainmentActive: Bool
     public var updatedAt: Date
 
     public init(
@@ -33,6 +37,10 @@ public struct SharedWidgetSnapshot: Codable, Sendable, Equatable {
         binauralBeatHz: Double = 14.0,
         activePresetName: String = "Nebula Deep Work",
         recentSevenDayBuckets: [Int] = [2, 3, 1, 4, 2, 3, 2],
+        latestAutonomicCoherence: Double = 0.78,
+        latestHeartRateBPM: Double = 64.0,
+        latestRMSSDMs: Double = 52.0,
+        isBioEntrainmentActive: Bool = false,
         updatedAt: Date = .now
     ) {
         self.isFocusRunning = isFocusRunning
@@ -46,6 +54,10 @@ public struct SharedWidgetSnapshot: Codable, Sendable, Equatable {
         self.binauralBeatHz = binauralBeatHz
         self.activePresetName = activePresetName
         self.recentSevenDayBuckets = recentSevenDayBuckets
+        self.latestAutonomicCoherence = min(max(latestAutonomicCoherence, 0.0), 1.0)
+        self.latestHeartRateBPM = max(0.0, latestHeartRateBPM)
+        self.latestRMSSDMs = max(0.0, latestRMSSDMs)
+        self.isBioEntrainmentActive = isBioEntrainmentActive
         self.updatedAt = updatedAt
     }
 }

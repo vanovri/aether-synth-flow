@@ -3,9 +3,15 @@
 import Foundation
 import AVFoundation
 import MediaPlayer
-#if os(iOS)
+import simd
+#if os(iOS) || os(visionOS)
 import UIKit
+#endif
+#if os(iOS)
 import CoreMotion
+#endif
+#if os(macOS)
+import AppKit
 #endif
 
 @MainActor
@@ -16,6 +22,7 @@ public final class MediaSessionAndHeadTrackingController {
     public var onNextPresetRequested: (() -> Void)?
     public var onPreviousPresetRequested: (() -> Void)?
     public var onHeadOrientationChanged: ((Float, Float) -> Void)?
+    public var onHeadQuaternionChanged: ((SIMD4<Float>, Float, Float) -> Void)?
     public var onAudioInterruptedPause: (() -> Void)?
     public var onAudioInterruptionShouldResume: (() -> Void)?
 
@@ -23,11 +30,18 @@ public final class MediaSessionAndHeadTrackingController {
     public private(set) var isHeadTrackingActive: Bool = false
     public private(set) var currentYawDegrees: Double = 0.0
     public private(set) var currentPitchDegrees: Double = 0.0
+    public private(set) var currentHeadQuaternion: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 1)
 
     private var referenceYawRadians: Double?
     private var wasPlayingBeforeInterruption: Bool = false
     private var commandsRegistered: Bool = false
     private var cachedArtworkHue: Double = -1.0
+
+    private var cachedArtwork: MPMediaItemArtwork?
+
+    #if os(iOS) || os(visionOS)
+    private var notificationTokens: [NSObjectProtocol] = []
+    #endif
 
     #if os(iOS)
     private let headphoneMotionManager = CMHeadphoneMotionManager()
@@ -38,13 +52,13 @@ public final class MediaSessionAndHeadTrackingController {
         q.qualityOfService = .userInteractive
         return q
     }()
-    private var cachedArtwork: MPMediaItemArtwork?
-    private var notificationTokens: [NSObjectProtocol] = []
     #endif
 
     public init() {
         #if os(iOS)
         self.isHeadTrackingAvailable = headphoneMotionManager.isDeviceMotionAvailable
+        #elseif os(visionOS)
+        self.isHeadTrackingAvailable = true
         #endif
     }
 
@@ -96,12 +110,12 @@ public final class MediaSessionAndHeadTrackingController {
             return .success
         }
 
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         registerAudioSessionObservers()
         #endif
     }
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     private func registerAudioSessionObservers() {
         let center = NotificationCenter.default
 
@@ -143,7 +157,6 @@ public final class MediaSessionAndHeadTrackingController {
                 guard let self, let reasonRaw,
                       let reason = AVAudioSession.RouteChangeReason(rawValue: reasonRaw) else { return }
                 if reason == .oldDeviceUnavailable {
-                    // Headphones unplugged -> immediately pause binaural generator
                     self.onAudioInterruptedPause?()
                 }
             }
@@ -174,7 +187,7 @@ public final class MediaSessionAndHeadTrackingController {
             MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0
         ]
 
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         if abs(cachedArtworkHue - accentHue) > 0.02 || cachedArtwork == nil {
             cachedArtworkHue = accentHue
             let capturedHue = accentHue
@@ -185,12 +198,23 @@ public final class MediaSessionAndHeadTrackingController {
         if let artwork = cachedArtwork {
             info[MPMediaItemPropertyArtwork] = artwork
         }
+        #elseif os(macOS)
+        if abs(cachedArtworkHue - accentHue) > 0.02 || cachedArtwork == nil {
+            cachedArtworkHue = accentHue
+            let capturedHue = accentHue
+            cachedArtwork = MPMediaItemArtwork(boundsSize: CGSize(width: 512, height: 512)) { requestedSize in
+                Self.renderProceduralMacNowPlayingArtwork(hue: capturedHue, size: requestedSize)
+            }
+        }
+        if let artwork = cachedArtwork {
+            info[MPMediaItemPropertyArtwork] = artwork
+        }
         #endif
 
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     nonisolated private static func renderProceduralLockScreenArtwork(hue: Double, size: CGSize) -> UIImage {
         let safeSize = CGSize(width: max(64, size.width), height: max(64, size.height))
         let renderer = UIGraphicsImageRenderer(size: safeSize)
@@ -225,7 +249,6 @@ public final class MediaSessionAndHeadTrackingController {
                 )
             }
 
-            // Concentric orbital telemetry rings
             let center = CGPoint(x: safeSize.width * 0.5, y: safeSize.height * 0.5)
             for ring in 1...3 {
                 let radius = min(safeSize.width, safeSize.height) * (0.16 + CGFloat(ring) * 0.085)
@@ -241,9 +264,46 @@ public final class MediaSessionAndHeadTrackingController {
             }
         }
     }
+    #elseif os(macOS)
+    nonisolated private static func renderProceduralMacNowPlayingArtwork(hue: Double, size: CGSize) -> NSImage {
+        let safeSize = NSSize(width: max(64, size.width), height: max(64, size.height))
+        let image = NSImage(size: safeSize)
+        image.lockFocus()
+        defer { image.unlockFocus() }
+
+        if let cg = NSGraphicsContext.current?.cgContext {
+            let rect = CGRect(origin: .zero, size: safeSize)
+            cg.setFillColor(NSColor(calibratedRed: 0.03, green: 0.04, blue: 0.08, alpha: 1.0).cgColor)
+            cg.fill(rect)
+
+            let primary = NSColor(calibratedHue: CGFloat(hue), saturation: 0.78, brightness: 0.95, alpha: 0.85)
+            let secondary = NSColor(
+                calibratedHue: CGFloat((hue + 0.18).truncatingRemainder(dividingBy: 1.0)),
+                saturation: 0.72,
+                brightness: 0.85,
+                alpha: 0.35
+            )
+            if let gradient = CGGradient(
+                colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                colors: [primary.cgColor, secondary.cgColor, NSColor.clear.cgColor] as CFArray,
+                locations: [0.0, 0.48, 1.0]
+            ) {
+                let center = CGPoint(x: safeSize.width * 0.5, y: safeSize.height * 0.5)
+                cg.drawRadialGradient(
+                    gradient,
+                    startCenter: center,
+                    startRadius: 8,
+                    endCenter: center,
+                    endRadius: min(safeSize.width, safeSize.height) * 0.48,
+                    options: [.drawsAfterEndLocation]
+                )
+            }
+        }
+        return image
+    }
     #endif
 
-    // MARK: - AirPods Pro / Max Spatial Head-Tracking (CMHeadphoneMotionManager)
+    // MARK: - AirPods Pro / Max & visionOS 6-DoF Spatial Head-Tracking
 
     public func setHeadTrackingEnabled(_ enabled: Bool) {
         #if os(iOS)
@@ -261,21 +321,35 @@ public final class MediaSessionAndHeadTrackingController {
             guard let motion else { return }
             let rawYaw = motion.attitude.yaw
             let rawPitch = motion.attitude.pitch
+            let q = motion.attitude.quaternion
+            let quatVec = SIMD4<Float>(Float(q.x), Float(q.y), Float(q.z), Float(q.w))
 
             Task { @MainActor [weak self] in
-                self?.consumeHeadMotionSample(rawYaw: rawYaw, rawPitch: rawPitch)
+                self?.consumeHeadMotionSample(rawYaw: rawYaw, rawPitch: rawPitch, quaternion: quatVec)
             }
+        }
+        #elseif os(visionOS)
+        isHeadTrackingActive = enabled
+        if !enabled {
+            recenterHeadReference()
         }
         #else
         isHeadTrackingActive = false
         #endif
     }
 
+    public func consumeVision6DoFHeadPose(yawRadians: Double, pitchRadians: Double, quaternion: SIMD4<Float>) {
+        guard isHeadTrackingActive else { return }
+        consumeHeadMotionSample(rawYaw: yawRadians, rawPitch: pitchRadians, quaternion: quaternion)
+    }
+
     public func recenterHeadReference() {
         referenceYawRadians = nil
         currentYawDegrees = 0
         currentPitchDegrees = 0
+        currentHeadQuaternion = SIMD4<Float>(0, 0, 0, 1)
         onHeadOrientationChanged?(0, 0)
+        onHeadQuaternionChanged?(currentHeadQuaternion, 0, 0)
     }
 
     public func stopHeadTracking() {
@@ -288,10 +362,12 @@ public final class MediaSessionAndHeadTrackingController {
         referenceYawRadians = nil
         currentYawDegrees = 0
         currentPitchDegrees = 0
+        currentHeadQuaternion = SIMD4<Float>(0, 0, 0, 1)
         onHeadOrientationChanged?(0, 0)
+        onHeadQuaternionChanged?(currentHeadQuaternion, 0, 0)
     }
 
-    private func consumeHeadMotionSample(rawYaw: Double, rawPitch: Double) {
+    private func consumeHeadMotionSample(rawYaw: Double, rawPitch: Double, quaternion: SIMD4<Float>) {
         if referenceYawRadians == nil {
             referenceYawRadians = rawYaw
         }
@@ -302,9 +378,11 @@ public final class MediaSessionAndHeadTrackingController {
 
         currentYawDegrees = deltaYaw * (180.0 / .pi)
         currentPitchDegrees = rawPitch * (180.0 / .pi)
+        currentHeadQuaternion = quaternion
 
         let mappedPan = Self.mapHeadAttitudeToSpatialControls(deltaYawRadians: deltaYaw, pitchRadians: rawPitch)
         onHeadOrientationChanged?(mappedPan.pan, mappedPan.elevation)
+        onHeadQuaternionChanged?(quaternion, mappedPan.pan, mappedPan.elevation)
     }
 
     /// Pure mathematical projection from head attitude radians into normalized synth pan & elevation [-1, 1]
@@ -312,7 +390,6 @@ public final class MediaSessionAndHeadTrackingController {
         deltaYawRadians: Double,
         pitchRadians: Double
     ) -> (pan: Float, elevation: Float) {
-        // Turning head left (positive yaw in CoreMotion right-hand Z-up frame) shifts acoustic stage toward right ear
         let pan = Float(min(max(-sin(deltaYawRadians) * 0.85, -1.0), 1.0))
         let elevation = Float(min(max(sin(pitchRadians) * 1.15, -1.0), 1.0))
         return (pan, elevation)

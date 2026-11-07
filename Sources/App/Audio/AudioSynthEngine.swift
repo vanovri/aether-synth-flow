@@ -2,7 +2,12 @@
 
 import Foundation
 import AVFoundation
+import simd
 import os
+#if os(macOS)
+import CoreAudio
+import AudioToolbox
+#endif
 
 // MARK: - Lock-Free Real-Time Synth Parameters & Telemetry
 
@@ -17,8 +22,19 @@ public struct SynthParameters: Sendable, Equatable {
     public var padDetuneCents: Float
     public var masterGain: Float
     public var bloomBoost: Float
-    public var spatialPanOffset: Float     // -1.0 (left) ... +1.0 (right) from AirPods head yaw
-    public var headElevationTilt: Float    // -1.0 (down) ... +1.0 (up) from AirPods head pitch
+    public var spatialPanOffset: Float         // -1.0 (left) ... +1.0 (right) from AirPods head yaw
+    public var headElevationTilt: Float        // -1.0 (down) ... +1.0 (up) from AirPods head pitch
+    public var hrtfAzimuthDeg: Float           // [-180.0 ... +180.0] 3D virtual source azimuth
+    public var hrtfElevationDeg: Float         // [-45.0 ... +90.0] 3D virtual source elevation
+    public var hrtfDistanceMeters: Float       // [0.15 ... 10.0] 3D virtual source radial distance
+    public var roomPresetIndex: Int            // 0 = Anechoic, 1 = Obsidian Studio, 2 = Conservatory, 3 = Cathedral
+    public var isHRTFSpatializerEnabled: Bool  // Enables KEMAR 128-tap UPOLS + 3D Shoebox ISM + Orbital spatializer
+    public var headQuaternion: SIMD4<Float>    // Listener head orientation quaternion (ix, iy, iz, r)
+    public var orbitalSatellites: OrbitalSatelliteBank
+    public var neuralSoundscapeMix: Float      // [0.0 ... 1.0] RVQ + Snake Neural Latent Diffusion mix
+    public var latentGuidanceScale: Float      // [1.0 ... 4.0] Rectified-Flow Classifier-Free Guidance scale
+    public var latentTemperature: Float        // [0.1 ... 2.0] Gaussian prior latent entropy temperature
+    public var rayTracedAcousticsEnabled: Bool // Enables Metal/SAH-BVH ray-traced 512-tap DRIR convolution
     public var isMuted: Bool
 
     public init(
@@ -34,6 +50,17 @@ public struct SynthParameters: Sendable, Equatable {
         bloomBoost: Float = 0.0,
         spatialPanOffset: Float = 0.0,
         headElevationTilt: Float = 0.0,
+        hrtfAzimuthDeg: Float = 0.0,
+        hrtfElevationDeg: Float = 12.0,
+        hrtfDistanceMeters: Float = 1.4,
+        roomPresetIndex: Int = ShoeboxRoomPreset.obsidianStudio.rawValue,
+        isHRTFSpatializerEnabled: Bool = false,
+        headQuaternion: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 1),
+        orbitalSatellites: OrbitalSatelliteBank = OrbitalSatelliteBank(),
+        neuralSoundscapeMix: Float = 0.0,
+        latentGuidanceScale: Float = 2.2,
+        latentTemperature: Float = 0.85,
+        rayTracedAcousticsEnabled: Bool = false,
         isMuted: Bool = false
     ) {
         self.carrierFrequencyHz = min(max(carrierFrequencyHz, 60.0), 880.0)
@@ -48,6 +75,17 @@ public struct SynthParameters: Sendable, Equatable {
         self.bloomBoost = min(max(bloomBoost, 0.0), 1.0)
         self.spatialPanOffset = min(max(spatialPanOffset, -1.0), 1.0)
         self.headElevationTilt = min(max(headElevationTilt, -1.0), 1.0)
+        self.hrtfAzimuthDeg = BinauralSourcePose.wrapAzimuthDegrees(hrtfAzimuthDeg)
+        self.hrtfElevationDeg = min(max(hrtfElevationDeg, -45.0), 90.0)
+        self.hrtfDistanceMeters = min(max(hrtfDistanceMeters, 0.15), 10.0)
+        self.roomPresetIndex = min(max(roomPresetIndex, 0), ShoeboxRoomPreset.allCases.count - 1)
+        self.isHRTFSpatializerEnabled = isHRTFSpatializerEnabled
+        self.headQuaternion = headQuaternion
+        self.orbitalSatellites = orbitalSatellites
+        self.neuralSoundscapeMix = min(max(neuralSoundscapeMix, 0.0), 1.0)
+        self.latentGuidanceScale = min(max(latentGuidanceScale, 1.0), 4.0)
+        self.latentTemperature = min(max(latentTemperature, 0.1), 2.0)
+        self.rayTracedAcousticsEnabled = rayTracedAcousticsEnabled
         self.isMuted = isMuted
     }
 
@@ -65,6 +103,10 @@ public struct SynthParameters: Sendable, Equatable {
             bloomBoost: 0.0,
             spatialPanOffset: 0.0,
             headElevationTilt: 0.0,
+            neuralSoundscapeMix: 0.24,
+            latentGuidanceScale: 2.2,
+            latentTemperature: 0.85,
+            rayTracedAcousticsEnabled: true,
             isMuted: false
         )
     }
@@ -95,6 +137,8 @@ public struct AudioTelemetrySnapshot: Sendable, Equatable {
 // MARK: - Pure Swift Real-Time DSP Synthesizer Kernel (Testable & Allocation-Free)
 
 public struct ProceduralSynthKernel: Sendable {
+    private static let spatialChunkCapacity: Int = 512
+
     public let sampleRate: Double
     private let invSampleRate: Double
     private let twoPi: Double = .pi * 2.0
@@ -142,11 +186,55 @@ public struct ProceduralSynthKernel: Sendable {
     private var smoothBloom: Float = 0.0
     private var smoothSpatialPan: Float = 0.0
     private var smoothElevationTilt: Float = 0.0
+    private var smoothNeuralMix: Float = 0.0
+    private var smoothRayTracedMix: Float = 0.0
+
+    // Phase 6 Pre-Allocated KEMAR HRTF UPOLS Convolver, 3D Shoebox ISM + FDN & Multi-Satellite Spatializer
+    private var hrtfConvolver: SpatialHRTFConvolver
+    private var roomSimulator: ShoeboxRoomSimulator
+    private var orbitalSpatializer: OrbitalHabitSpatializer
+    private var monoSpatialExcitation: [Float]
+    private var roomSendScratch: [Float]
+    private var hrtfLeftScratch: [Float]
+    private var hrtfRightScratch: [Float]
+    private var earLockedBinauralLeft: [Float]
+    private var earLockedBinauralRight: [Float]
+
+    // Phase 7 Pre-Allocated Neural Vocoder Ring Read & Ray-Traced DRIR Convolution Scratch Buffers
+    private var neuralLeftScratch: [Float]
+    private var neuralRightScratch: [Float]
+    private var drirMonoInputScratch: [Float]
+    private var drirWetLeftScratch: [Float]
+    private var drirWetRightScratch: [Float]
 
     public init(sampleRate: Double, snapInitialParameters: SynthParameters? = nil) {
         let safeRate = max(8_000.0, sampleRate)
         self.sampleRate = safeRate
         self.invSampleRate = 1.0 / safeRate
+
+        let initialPose = BinauralSourcePose(
+            azimuthDeg: snapInitialParameters?.hrtfAzimuthDeg ?? 0.0,
+            elevationDeg: snapInitialParameters?.hrtfElevationDeg ?? 12.0,
+            distanceMeters: snapInitialParameters?.hrtfDistanceMeters ?? 1.4
+        )
+        let initialRoom = ShoeboxRoomPreset(rawValue: snapInitialParameters?.roomPresetIndex ?? 1) ?? .obsidianStudio
+
+        self.hrtfConvolver = SpatialHRTFConvolver(sampleRate: safeRate, initialPose: initialPose)
+        self.roomSimulator = ShoeboxRoomSimulator(sampleRate: safeRate, initialPreset: initialRoom, initialPose: initialPose)
+        self.orbitalSpatializer = OrbitalHabitSpatializer(sampleRate: safeRate)
+
+        self.monoSpatialExcitation = [Float](repeating: 0, count: Self.spatialChunkCapacity)
+        self.roomSendScratch = [Float](repeating: 0, count: Self.spatialChunkCapacity)
+        self.hrtfLeftScratch = [Float](repeating: 0, count: Self.spatialChunkCapacity)
+        self.hrtfRightScratch = [Float](repeating: 0, count: Self.spatialChunkCapacity)
+        self.earLockedBinauralLeft = [Float](repeating: 0, count: Self.spatialChunkCapacity)
+        self.earLockedBinauralRight = [Float](repeating: 0, count: Self.spatialChunkCapacity)
+
+        self.neuralLeftScratch = [Float](repeating: 0, count: Self.spatialChunkCapacity)
+        self.neuralRightScratch = [Float](repeating: 0, count: Self.spatialChunkCapacity)
+        self.drirMonoInputScratch = [Float](repeating: 0, count: Self.spatialChunkCapacity)
+        self.drirWetLeftScratch = [Float](repeating: 0, count: Self.spatialChunkCapacity)
+        self.drirWetRightScratch = [Float](repeating: 0, count: Self.spatialChunkCapacity)
 
         if let initial = snapInitialParameters {
             self.smoothCarrierHz = initial.carrierFrequencyHz
@@ -161,6 +249,8 @@ public struct ProceduralSynthKernel: Sendable {
             self.smoothBloom = initial.bloomBoost
             self.smoothSpatialPan = initial.spatialPanOffset
             self.smoothElevationTilt = initial.headElevationTilt
+            self.smoothNeuralMix = initial.isMuted ? 0.0 : (initial.neuralSoundscapeMix * initial.masterGain)
+            self.smoothRayTracedMix = (initial.rayTracedAcousticsEnabled && !initial.isMuted) ? 0.36 : 0.0
         }
     }
 
@@ -232,12 +322,162 @@ public struct ProceduralSynthKernel: Sendable {
         leftOutput: UnsafeMutablePointer<Float>,
         rightOutput: UnsafeMutablePointer<Float>,
         frameCount: Int,
-        target: SynthParameters
+        target: SynthParameters,
+        neuralRingBuffer: NeuralAudioRingBuffer? = nil,
+        drirConvolverBridge: RayTracedDRIRConvolverBridge? = nil
     ) -> AudioTelemetrySnapshot {
         guard frameCount > 0 else {
             return AudioTelemetrySnapshot(isRendering: !target.isMuted)
         }
 
+        let baseSnapshot: AudioTelemetrySnapshot
+        if target.isHRTFSpatializerEnabled {
+            baseSnapshot = renderHRTFSpatialStereoBlock(
+                leftOutput: leftOutput,
+                rightOutput: rightOutput,
+                frameCount: frameCount,
+                target: target
+            )
+        } else {
+            baseSnapshot = renderConstantPowerStereoBlock(
+                leftOutput: leftOutput,
+                rightOutput: rightOutput,
+                frameCount: frameCount,
+                target: target
+            )
+        }
+
+        let wantsNeural = neuralRingBuffer != nil && (target.neuralSoundscapeMix > 0.0001 || smoothNeuralMix > 0.0001)
+        let wantsRayTraced = drirConvolverBridge != nil && (target.rayTracedAcousticsEnabled || smoothRayTracedMix > 0.0001)
+        guard wantsNeural || wantsRayTraced else {
+            return baseSnapshot
+        }
+
+        // Zero-allocation scratch ownership swap (prevents CoW heap allocation on AVAudioSourceNode thread)
+        var localNeuralL = neuralLeftScratch
+        var localNeuralR = neuralRightScratch
+        var localDRIRMono = drirMonoInputScratch
+        var localWetL = drirWetLeftScratch
+        var localWetR = drirWetRightScratch
+        neuralLeftScratch = []
+        neuralRightScratch = []
+        drirMonoInputScratch = []
+        drirWetLeftScratch = []
+        drirWetRightScratch = []
+
+        let slewCoeff = Float(min(1.0, 35.0 * invSampleRate))
+        let targetNeuralGain: Float = target.isMuted ? 0.0 : (target.neuralSoundscapeMix * target.masterGain)
+        let targetRayMix: Float = (target.rayTracedAcousticsEnabled && !target.isMuted) ? 0.36 : 0.0
+
+        var sumSquares: Float = 0.0
+        var peak: Float = 0.0
+        var lowAccum: Float = 0.0
+        var highAccum: Float = 0.0
+        var prevL: Float = 0.0
+
+        var remaining = frameCount
+        var offset = 0
+
+        while remaining > 0 {
+            let chunk = min(remaining, Self.spatialChunkCapacity)
+
+            if let ring = neuralRingBuffer, wantsNeural {
+                localNeuralL.withUnsafeMutableBufferPointer { lBuf in
+                    localNeuralR.withUnsafeMutableBufferPointer { rBuf in
+                        guard let lBase = lBuf.baseAddress, let rBase = rBuf.baseAddress else { return }
+                        _ = ring.popStereoFrames(leftDestination: lBase, rightDestination: rBase, frameCount: chunk)
+                    }
+                }
+            }
+
+            for f in 0..<chunk {
+                let idx = offset + f
+                var mixedL = leftOutput[idx]
+                var mixedR = rightOutput[idx]
+
+                if wantsNeural {
+                    smoothNeuralMix += slewCoeff * (targetNeuralGain - smoothNeuralMix)
+                    mixedL += localNeuralL[f] * smoothNeuralMix
+                    mixedR += localNeuralR[f] * smoothNeuralMix
+                }
+
+                leftOutput[idx] = mixedL
+                rightOutput[idx] = mixedR
+                localDRIRMono[f] = 0.5 * (mixedL + mixedR)
+            }
+
+            if let drir = drirConvolverBridge, wantsRayTraced {
+                localDRIRMono.withUnsafeBufferPointer { mBuf in
+                    localWetL.withUnsafeMutableBufferPointer { wLBuf in
+                        localWetR.withUnsafeMutableBufferPointer { wRBuf in
+                            guard let mBase = mBuf.baseAddress,
+                                  let wLBase = wLBuf.baseAddress,
+                                  let wRBase = wRBuf.baseAddress else { return }
+                            drir.processRealtimeBlock(
+                                monoInput: mBase,
+                                wetLeftOutput: wLBase,
+                                wetRightOutput: wRBase,
+                                frameCount: chunk
+                            )
+                        }
+                    }
+                }
+            }
+
+            for f in 0..<chunk {
+                let idx = offset + f
+                var outL = leftOutput[idx]
+                var outR = rightOutput[idx]
+
+                if wantsRayTraced {
+                    smoothRayTracedMix += slewCoeff * (targetRayMix - smoothRayTracedMix)
+                    let dryWeight = 1.0 - 0.18 * smoothRayTracedMix
+                    outL = outL * dryWeight + localWetL[f] * smoothRayTracedMix
+                    outR = outR * dryWeight + localWetR[f] * smoothRayTracedMix
+                }
+
+                outL = fastSoftClip(outL)
+                outR = fastSoftClip(outR)
+                leftOutput[idx] = outL
+                rightOutput[idx] = outR
+
+                let monoAbs = 0.5 * (abs(outL) + abs(outR))
+                sumSquares += 0.5 * (outL * outL + outR * outR)
+                if monoAbs > peak { peak = monoAbs }
+                lowAccum += monoAbs
+                highAccum += abs(outL - prevL)
+                prevL = outL
+            }
+
+            remaining -= chunk
+            offset += chunk
+        }
+
+        neuralLeftScratch = localNeuralL
+        neuralRightScratch = localNeuralR
+        drirMonoInputScratch = localDRIRMono
+        drirWetLeftScratch = localWetL
+        drirWetRightScratch = localWetR
+
+        let invCount = 1.0 / Float(frameCount)
+        let rms = sqrt(sumSquares * invCount)
+        return AudioTelemetrySnapshot(
+            rmsAmplitude: min(max(rms, 0.0), 1.0),
+            peakAmplitude: min(max(peak, 0.0), 1.0),
+            lowBandEnergy: min(max(lowAccum * invCount, 0.0), 1.0),
+            highBandEnergy: min(max(highAccum * invCount * 3.0, 0.0), 1.0),
+            isRendering: baseSnapshot.isRendering || smoothNeuralMix > 0.001
+        )
+    }
+
+    // MARK: - Legacy Constant-Power Stereo Path (Bit-Exact Backward Compatibility)
+
+    private mutating func renderConstantPowerStereoBlock(
+        leftOutput: UnsafeMutablePointer<Float>,
+        rightOutput: UnsafeMutablePointer<Float>,
+        frameCount: Int,
+        target: SynthParameters
+    ) -> AudioTelemetrySnapshot {
         let slewCoeff = Float(min(1.0, 35.0 * invSampleRate))
         let targetGain: Float = target.isMuted ? 0.0 : target.masterGain
 
@@ -247,14 +487,9 @@ public struct ProceduralSynthKernel: Sendable {
         var highAccum: Float = 0.0
         var previousOutL: Float = 0.0
 
-        let r0 = 0.5
-        let r1 = 0.75
-        let r2 = 1.0
-        let r3 = 1.125
-        let r4 = 1.5
+        let r0 = 0.5, r1 = 0.75, r2 = 1.0, r3 = 1.125, r4 = 1.5
 
         for i in 0..<frameCount {
-            // 1. Exponential parameter slewing
             smoothCarrierHz += slewCoeff * (target.carrierFrequencyHz - smoothCarrierHz)
             smoothBeatHz += slewCoeff * (target.binauralBeatHz - smoothBeatHz)
             smoothBinauralMix += slewCoeff * (target.binauralMix - smoothBinauralMix)
@@ -268,7 +503,6 @@ public struct ProceduralSynthKernel: Sendable {
             smoothSpatialPan += slewCoeff * (target.spatialPanOffset - smoothSpatialPan)
             smoothElevationTilt += slewCoeff * (target.headElevationTilt - smoothElevationTilt)
 
-            // 2. Binaural Beat Synthesis (Left = fc - fb/2, Right = fc + fb/2)
             let carrier = Double(smoothCarrierHz)
             let halfBeat = Double(smoothBeatHz) * 0.5
             let freqLeft = max(20.0, carrier - halfBeat)
@@ -281,13 +515,11 @@ public struct ProceduralSynthKernel: Sendable {
             advancePhase(&phaseBinauralRight, delta: freqRight * invSampleRate)
             advancePhase(&phaseSubFundamental, delta: (carrier * 0.5) * invSampleRate)
 
-            // 3. Slow Quadrature LFOs
             let lfoA = Float(sin(twoPi * lfoPhasePrimary))
             let lfoB = Float(cos(twoPi * lfoPhaseSecondary))
             advancePhase(&lfoPhasePrimary, delta: 0.083 * invSampleRate)
             advancePhase(&lfoPhaseSecondary, delta: 0.137 * invSampleRate)
 
-            // 4. 5-Voice Detuned Harmonic Ambient Pad
             var padL: Float = 0.0
             var padR: Float = 0.0
             if smoothPadMix > 0.0005 {
@@ -327,7 +559,6 @@ public struct ProceduralSynthKernel: Sendable {
                 advancePhase(&padPhasesRight.4, delta: carrier * r4 * detuneRatioUp * invSampleRate)
             }
 
-            // 5. Procedural 1/f Pink Noise
             var noiseL: Float = 0.0
             var noiseR: Float = 0.0
             if smoothPinkMix > 0.0005 {
@@ -336,14 +567,11 @@ public struct ProceduralSynthKernel: Sendable {
                 noiseR = pair.1
             }
 
-            // 6. AirPods Constant-Power Spatial Panning + Head-Pitch Spectral Tilt
-            // Normalized pan angle theta in [0, pi/2]; at pan=0, cos(pi/4)=sin(pi/4)=0.7071 -> normalized by sqrt(2)=1.4142135
             let panAngle = (Float.pi * 0.25) * (1.0 + min(max(smoothSpatialPan, -1.0), 1.0))
             let panGainL = cos(panAngle) * 1.41421356
             let panGainR = sin(panAngle) * 1.41421356
             let elevationFactor = 1.0 + 0.24 * min(max(smoothElevationTilt, -1.0), 1.0)
 
-            // 7. 4-Pole Cascaded Cytomic TPT SVF Low-Pass Filter
             let maxSafeCutoff = Float(sampleRate * 0.44)
             let modulatedCutoff = min(
                 max(smoothCutoffHz * elevationFactor * (1.0 + 0.08 * lfoA + 0.65 * smoothBloom), 60.0),
@@ -355,11 +583,9 @@ public struct ProceduralSynthKernel: Sendable {
             let a2 = g * a1
             let a3 = g * a2
 
-            // Binaural tones remain ear-locked for phase coherence while ambient field pans spatially
             let preFilterL = binauralL * smoothBinauralMix + (padL * smoothPadMix + noiseL * smoothPinkMix) * panGainL
             let preFilterR = binauralR * smoothBinauralMix + (padR * smoothPadMix + noiseR * smoothPinkMix) * panGainR
 
-            // Stage 1 Stereo SVF
             let v3_1L = preFilterL - svf1ic2L
             let v1_1L = a1 * svf1ic1L + a2 * v3_1L
             let v2_1L = svf1ic2L + a2 * svf1ic1L + a3 * v3_1L
@@ -372,7 +598,6 @@ public struct ProceduralSynthKernel: Sendable {
             svf1ic1R = 2.0 * v1_1R - svf1ic1R
             svf1ic2R = 2.0 * v2_1R - svf1ic2R
 
-            // Stage 2 Stereo SVF
             let v3_2L = v2_1L - svf2ic2L
             let v1_2L = a1 * svf2ic1L + a2 * v3_2L
             let v2_2L = svf2ic2L + a2 * svf2ic1L + a3 * v3_2L
@@ -414,6 +639,254 @@ public struct ProceduralSynthKernel: Sendable {
             isRendering: smoothMasterGain > 0.001
         )
     }
+
+    // MARK: - Phase 6 KEMAR Binaural HRTF UPOLS + 3D Shoebox Room + Multi-Satellite Orbital Render Path
+
+    private mutating func renderHRTFSpatialStereoBlock(
+        leftOutput: UnsafeMutablePointer<Float>,
+        rightOutput: UnsafeMutablePointer<Float>,
+        frameCount: Int,
+        target: SynthParameters
+    ) -> AudioTelemetrySnapshot {
+        let slewCoeff = Float(min(1.0, 35.0 * invSampleRate))
+        let targetGain: Float = target.isMuted ? 0.0 : target.masterGain
+
+        var sumSquares: Float = 0.0
+        var peak: Float = 0.0
+        var lowAccum: Float = 0.0
+        var highAccum: Float = 0.0
+        var previousOutL: Float = 0.0
+
+        let r0 = 0.5, r1 = 0.75, r2 = 1.0, r3 = 1.125, r4 = 1.5
+
+        // Head yaw/pitch offsets anchor the 3D virtual acoustic stage relative to listener head orientation
+        let headYawDeg = asin(min(max(-target.spatialPanOffset, -1.0), 1.0)) * (180.0 / .pi)
+        let headPitchDeg = asin(min(max(target.headElevationTilt, -1.0), 1.0)) * (180.0 / .pi) * 0.65
+        let effectivePose = BinauralSourcePose(
+            azimuthDeg: target.hrtfAzimuthDeg - headYawDeg,
+            elevationDeg: target.hrtfElevationDeg - headPitchDeg,
+            distanceMeters: target.hrtfDistanceMeters
+        )
+        let roomPreset = ShoeboxRoomPreset(rawValue: target.roomPresetIndex) ?? .obsidianStudio
+        roomSimulator.updateParametersIfNeeded(
+            preset: roomPreset,
+            sourcePose: BinauralSourcePose(
+                azimuthDeg: target.hrtfAzimuthDeg,
+                elevationDeg: target.hrtfElevationDeg,
+                distanceMeters: target.hrtfDistanceMeters
+            ),
+            headQuaternion: target.headQuaternion
+        )
+
+        // Exchange pre-allocated buffers out of self to mutate via UnsafePointers with zero CoW allocations
+        var localMonoExcite = monoSpatialExcitation
+        var localRoomSend = roomSendScratch
+        var localHRTFL = hrtfLeftScratch
+        var localHRTFR = hrtfRightScratch
+        var localBinL = earLockedBinauralLeft
+        var localBinR = earLockedBinauralRight
+        monoSpatialExcitation = []
+        roomSendScratch = []
+        hrtfLeftScratch = []
+        hrtfRightScratch = []
+        earLockedBinauralLeft = []
+        earLockedBinauralRight = []
+
+        var offset = 0
+        while offset < frameCount {
+            let chunk = min(frameCount - offset, Self.spatialChunkCapacity)
+
+            for i in 0..<chunk {
+                smoothCarrierHz += slewCoeff * (target.carrierFrequencyHz - smoothCarrierHz)
+                smoothBeatHz += slewCoeff * (target.binauralBeatHz - smoothBeatHz)
+                smoothBinauralMix += slewCoeff * (target.binauralMix - smoothBinauralMix)
+                smoothPinkMix += slewCoeff * (target.pinkNoiseMix - smoothPinkMix)
+                smoothPadMix += slewCoeff * (target.padMix - smoothPadMix)
+                smoothCutoffHz += slewCoeff * (target.filterCutoffHz - smoothCutoffHz)
+                smoothResonance += slewCoeff * (target.filterResonance - smoothResonance)
+                smoothDetuneCents += slewCoeff * (target.padDetuneCents - smoothDetuneCents)
+                smoothMasterGain += slewCoeff * (targetGain - smoothMasterGain)
+                smoothBloom += slewCoeff * (target.bloomBoost - smoothBloom)
+                smoothSpatialPan += slewCoeff * (target.spatialPanOffset - smoothSpatialPan)
+                smoothElevationTilt += slewCoeff * (target.headElevationTilt - smoothElevationTilt)
+
+                let carrier = Double(smoothCarrierHz)
+                let halfBeat = Double(smoothBeatHz) * 0.5
+                let freqLeft = max(20.0, carrier - halfBeat)
+                let freqRight = max(20.0, carrier + halfBeat)
+
+                let binauralL = Float(sin(twoPi * phaseBinauralLeft))
+                let binauralR = Float(sin(twoPi * phaseBinauralRight))
+                advancePhase(&phaseBinauralLeft, delta: freqLeft * invSampleRate)
+                advancePhase(&phaseBinauralRight, delta: freqRight * invSampleRate)
+                advancePhase(&phaseSubFundamental, delta: (carrier * 0.5) * invSampleRate)
+
+                let lfoA = Float(sin(twoPi * lfoPhasePrimary))
+                let lfoB = Float(cos(twoPi * lfoPhaseSecondary))
+                advancePhase(&lfoPhasePrimary, delta: 0.083 * invSampleRate)
+                advancePhase(&lfoPhaseSecondary, delta: 0.137 * invSampleRate)
+
+                var padMono: Float = 0.0
+                if smoothPadMix > 0.0005 {
+                    let detuneRatioUp = pow(2.0, Double(smoothDetuneCents) / 1200.0)
+                    let detuneRatioDown = 1.0 / detuneRatioUp
+                    let subWarmth = Float(sin(twoPi * phaseSubFundamental)) * 0.22
+
+                    let v0L = Float(sin(twoPi * padPhasesLeft.0))
+                    let v1L = Float(sin(twoPi * padPhasesLeft.1 + Double(lfoA) * 0.18))
+                    let v2L = Float(sin(twoPi * padPhasesLeft.2))
+                    let v3L = Float(sin(twoPi * padPhasesLeft.3 + Double(lfoB) * 0.22))
+                    let v4L = Float(sin(twoPi * padPhasesLeft.4))
+
+                    let v0R = Float(sin(twoPi * padPhasesRight.0))
+                    let v1R = Float(sin(twoPi * padPhasesRight.1 - Double(lfoB) * 0.18))
+                    let v2R = Float(sin(twoPi * padPhasesRight.2))
+                    let v3R = Float(sin(twoPi * padPhasesRight.3 - Double(lfoA) * 0.22))
+                    let v4R = Float(sin(twoPi * padPhasesRight.4))
+
+                    let bloomGain = 1.0 + smoothBloom * 0.55
+                    let rawPadL = (v0L * 0.34 + v1L * 0.26 + v2L * 0.22 + v3L * (0.16 + 0.06 * lfoA) + v4L * (0.12 + 0.05 * lfoB) + subWarmth) * bloomGain
+                    let rawPadR = (v0R * 0.34 + v1R * 0.26 + v2R * 0.22 + v3R * (0.16 + 0.06 * lfoB) + v4R * (0.12 + 0.05 * lfoA) + subWarmth) * bloomGain
+                    padMono = fastSoftClip((rawPadL + rawPadR) * 0.675) * 0.68
+
+                    advancePhase(&padPhasesLeft.0, delta: carrier * r0 * detuneRatioDown * invSampleRate)
+                    advancePhase(&padPhasesLeft.1, delta: carrier * r1 * detuneRatioUp * invSampleRate)
+                    advancePhase(&padPhasesLeft.2, delta: carrier * r2 * detuneRatioDown * invSampleRate)
+                    advancePhase(&padPhasesLeft.3, delta: carrier * r3 * detuneRatioUp * invSampleRate)
+                    advancePhase(&padPhasesLeft.4, delta: carrier * r4 * detuneRatioDown * invSampleRate)
+
+                    advancePhase(&padPhasesRight.0, delta: carrier * r0 * detuneRatioUp * invSampleRate)
+                    advancePhase(&padPhasesRight.1, delta: carrier * r1 * detuneRatioDown * invSampleRate)
+                    advancePhase(&padPhasesRight.2, delta: carrier * r2 * detuneRatioUp * invSampleRate)
+                    advancePhase(&padPhasesRight.3, delta: carrier * r3 * detuneRatioDown * invSampleRate)
+                    advancePhase(&padPhasesRight.4, delta: carrier * r4 * detuneRatioUp * invSampleRate)
+                }
+
+                var noiseMono: Float = 0.0
+                if smoothPinkMix > 0.0005 {
+                    let pair = nextPinkNoiseStereo()
+                    noiseMono = 0.5 * (pair.0 + pair.1)
+                }
+
+                let maxSafeCutoff = Float(sampleRate * 0.44)
+                let modulatedCutoff = min(
+                    max(smoothCutoffHz * (1.0 + 0.08 * lfoA + 0.65 * smoothBloom), 60.0),
+                    maxSafeCutoff
+                )
+                let g = tan(Float.pi * modulatedCutoff * Float(invSampleRate))
+                let k = 2.0 - 2.0 * min(max(smoothResonance, 0.05), 0.94)
+                let a1 = 1.0 / (1.0 + g * (g + k))
+                let a2 = g * a1
+                let a3 = g * a2
+
+                // Filter ear-locked binaural tones in SVF R-channel & spatial pad/noise excitation in SVF L-channel
+                let rawSpatialMono = padMono * smoothPadMix + noiseMono * smoothPinkMix
+                let v3_1L = rawSpatialMono - svf1ic2L
+                let v1_1L = a1 * svf1ic1L + a2 * v3_1L
+                let v2_1L = svf1ic2L + a2 * svf1ic1L + a3 * v3_1L
+                svf1ic1L = 2.0 * v1_1L - svf1ic1L
+                svf1ic2L = 2.0 * v2_1L - svf1ic2L
+
+                let v3_2L = v2_1L - svf2ic2L
+                let v1_2L = a1 * svf2ic1L + a2 * v3_2L
+                let v2_2L = svf2ic2L + a2 * svf2ic1L + a3 * v3_2L
+                svf2ic1L = 2.0 * v1_2L - svf2ic1L
+                svf2ic2L = 2.0 * v2_2L - svf2ic2L
+
+                let cleanSpatial = v2_2L.isFinite ? v2_2L : 0.0
+                localMonoExcite[i] = cleanSpatial
+                localRoomSend[i] = cleanSpatial
+                localBinL[i] = binauralL * smoothBinauralMix * smoothMasterGain
+                localBinR[i] = binauralR * smoothBinauralMix * smoothMasterGain
+                lowAccum += abs(cleanSpatial)
+            }
+
+            // 1. KEMAR 128-tap UPOLS Binaural Convolution
+            localMonoExcite.withUnsafeBufferPointer { monoPtr in
+                localHRTFL.withUnsafeMutableBufferPointer { lPtr in
+                    localHRTFR.withUnsafeMutableBufferPointer { rPtr in
+                        hrtfConvolver.processMonoToBinaural(
+                            monoInput: monoPtr.baseAddress!,
+                            leftOutput: lPtr.baseAddress!,
+                            rightOutput: rPtr.baseAddress!,
+                            frameCount: chunk,
+                            pose: effectivePose
+                        )
+                    }
+                }
+            }
+
+            // 2. Multi-Satellite Orbital Habit 3D Binaural Overtones
+            localHRTFL.withUnsafeMutableBufferPointer { lPtr in
+                localHRTFR.withUnsafeMutableBufferPointer { rPtr in
+                    localRoomSend.withUnsafeMutableBufferPointer { sendPtr in
+                        orbitalSpatializer.renderSatellites(
+                            bank: target.orbitalSatellites,
+                            carrierFrequencyHz: smoothCarrierHz,
+                            padMix: smoothPadMix,
+                            headYawRadians: headYawDeg * (.pi / 180.0),
+                            headPitchRadians: headPitchDeg * (.pi / 180.0),
+                            leftInOut: lPtr.baseAddress!,
+                            rightInOut: rPtr.baseAddress!,
+                            monoRoomSendInOut: sendPtr.baseAddress!,
+                            frameCount: chunk
+                        )
+                    }
+                }
+            }
+
+            // 3. 3D Shoebox Image-Source Early Reflections (18 Virtual Sources) + 8-Channel Hadamard FDN Reverb
+            localRoomSend.withUnsafeBufferPointer { sendPtr in
+                localHRTFL.withUnsafeMutableBufferPointer { lPtr in
+                    localHRTFR.withUnsafeMutableBufferPointer { rPtr in
+                        roomSimulator.processAndAccumulate(
+                            monoSource: sendPtr.baseAddress!,
+                            leftInOut: lPtr.baseAddress!,
+                            rightInOut: rPtr.baseAddress!,
+                            frameCount: chunk
+                        )
+                    }
+                }
+            }
+
+            // 4. Master Sum (Ear-Locked Binaural Beat Entrainment + Spatialized Binaural Soundstage)
+            for i in 0..<chunk {
+                let rawL = localBinL[i] + localHRTFL[i] * smoothMasterGain
+                let rawR = localBinR[i] + localHRTFR[i] * smoothMasterGain
+                let finalL = fastSoftClip(rawL.isFinite ? rawL : 0.0)
+                let finalR = fastSoftClip(rawR.isFinite ? rawR : 0.0)
+
+                leftOutput[offset + i] = finalL
+                rightOutput[offset + i] = finalR
+
+                let mono = 0.5 * (finalL + finalR)
+                sumSquares += mono * mono
+                let absMax = max(abs(finalL), abs(finalR))
+                if absMax > peak { peak = absMax }
+                highAccum += abs(finalL - previousOutL)
+                previousOutL = finalL
+            }
+
+            offset += chunk
+        }
+
+        monoSpatialExcitation = localMonoExcite
+        roomSendScratch = localRoomSend
+        hrtfLeftScratch = localHRTFL
+        hrtfRightScratch = localHRTFR
+        earLockedBinauralLeft = localBinL
+        earLockedBinauralRight = localBinR
+
+        let invCount = 1.0 / Float(frameCount)
+        let rms = sqrt(sumSquares * invCount)
+        return AudioTelemetrySnapshot(
+            rmsAmplitude: min(max(rms, 0.0), 1.0),
+            peakAmplitude: min(max(peak, 0.0), 1.0),
+            lowBandEnergy: min(max(lowAccum * invCount, 0.0), 1.0),
+            highBandEnergy: min(max(highAccum * invCount * 3.0, 0.0), 1.0),
+            isRendering: smoothMasterGain > 0.001
+        )
+    }
 }
 
 // MARK: - Wait-Free Real-Time Audio Bridge with 256-Sample FFT Scope Tap
@@ -436,9 +909,18 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
     private let maxScratchFrames: Int = 4096
 
     public let sampleRate: Double
+    public let neuralRingBuffer: NeuralAudioRingBuffer
+    public let drirConvolverBridge: RayTracedDRIRConvolverBridge
 
-    public init(sampleRate: Double, initialParameters: SynthParameters = SynthParameters()) {
+    public init(
+        sampleRate: Double,
+        initialParameters: SynthParameters = SynthParameters(),
+        neuralRingBuffer: NeuralAudioRingBuffer = NeuralAudioRingBuffer(),
+        drirConvolverBridge: RayTracedDRIRConvolverBridge = RayTracedDRIRConvolverBridge()
+    ) {
         self.sampleRate = sampleRate
+        self.neuralRingBuffer = neuralRingBuffer
+        self.drirConvolverBridge = drirConvolverBridge
 
         self.paramLock = UnsafeMutablePointer<os_unfair_lock_s>.allocate(capacity: 1)
         self.paramLock.initialize(to: os_unfair_lock_s())
@@ -532,7 +1014,9 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
                 leftOutput: outL,
                 rightOutput: outR,
                 frameCount: frameCount,
-                target: audioThreadCachedParameters
+                target: audioThreadCachedParameters,
+                neuralRingBuffer: neuralRingBuffer,
+                drirConvolverBridge: drirConvolverBridge
             )
             tapL = UnsafePointer(outL)
             tapR = UnsafePointer(outR)
@@ -549,7 +1033,9 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
                     leftOutput: scratchLeft,
                     rightOutput: scratchRight,
                     frameCount: chunk,
-                    target: audioThreadCachedParameters
+                    target: audioThreadCachedParameters,
+                    neuralRingBuffer: neuralRingBuffer,
+                    drirConvolverBridge: drirConvolverBridge
                 )
 
                 if channels >= 2 {
@@ -600,6 +1086,9 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
 // MARK: - Thread-Safe Actor Managing AVAudioEngine & Procedural Source Node
 
 public actor AudioSynthEngine {
+    public nonisolated let neuralRingBuffer = NeuralAudioRingBuffer()
+    public nonisolated let drirConvolverBridge = RayTracedDRIRConvolverBridge()
+
     private let engine = AVAudioEngine()
     private var sourceNode: AVAudioSourceNode?
     private var bridge: RealtimeAudioBridge?
@@ -609,15 +1098,24 @@ public actor AudioSynthEngine {
 
     public init() {}
 
+    public nonisolated func pushRayTracedDRIR(leftTaps: [Float], rightTaps: [Float]) {
+        drirConvolverBridge.pushStereoDRIR(leftTaps: leftTaps, rightTaps: rightTaps)
+    }
+
     public func configureIfNeeded() throws {
         guard sourceNode == nil else { return }
 
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.playback, mode: .default, options: [])
+        #if os(iOS)
         try session.setPreferredIOBufferDuration(0.0058)
+        #endif
         try session.setActive(true)
         let hardwareRate = session.sampleRate > 0 ? session.sampleRate : 48_000.0
+        #elseif os(macOS)
+        let outputRate = engine.outputNode.outputFormat(forBus: 0).sampleRate
+        let hardwareRate = outputRate > 0 ? outputRate : 48_000.0
         #else
         let hardwareRate = 48_000.0
         #endif
@@ -633,7 +1131,12 @@ public actor AudioSynthEngine {
             )
         }
 
-        let audioBridge = RealtimeAudioBridge(sampleRate: hardwareRate, initialParameters: currentParameters)
+        let audioBridge = RealtimeAudioBridge(
+            sampleRate: hardwareRate,
+            initialParameters: currentParameters,
+            neuralRingBuffer: neuralRingBuffer,
+            drirConvolverBridge: drirConvolverBridge
+        )
         let renderBlock = RealtimeAudioBridge.makeRenderBlock(bridge: audioBridge)
         let node = AVAudioSourceNode(format: stereoFormat, renderBlock: renderBlock)
 
@@ -652,7 +1155,7 @@ public actor AudioSynthEngine {
         bridge?.writeParameters(currentParameters)
 
         if !engine.isRunning {
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             try AVAudioSession.sharedInstance().setActive(true)
             #endif
             try engine.start()
@@ -686,9 +1189,40 @@ public actor AudioSynthEngine {
         bridge?.writeParameters(next)
     }
 
-    public func updateHeadTrackingOffsets(spatialPan: Float, elevationTilt: Float) {
+    public func updateHeadTrackingOffsets(
+        spatialPan: Float,
+        elevationTilt: Float,
+        headQuaternion: SIMD4<Float>? = nil
+    ) {
         currentParameters.spatialPanOffset = min(max(spatialPan, -1.0), 1.0)
         currentParameters.headElevationTilt = min(max(elevationTilt, -1.0), 1.0)
+        if let headQuaternion {
+            currentParameters.headQuaternion = headQuaternion
+        }
+        bridge?.writeParameters(currentParameters)
+    }
+
+    public func updateHRTFPose(
+        azimuthDeg: Float,
+        elevationDeg: Float,
+        distanceMeters: Float,
+        roomPresetIndex: Int? = nil,
+        isSpatializerEnabled: Bool? = nil
+    ) {
+        currentParameters.hrtfAzimuthDeg = BinauralSourcePose.wrapAzimuthDegrees(azimuthDeg)
+        currentParameters.hrtfElevationDeg = min(max(elevationDeg, -45.0), 90.0)
+        currentParameters.hrtfDistanceMeters = min(max(distanceMeters, 0.15), 10.0)
+        if let roomPresetIndex {
+            currentParameters.roomPresetIndex = min(max(roomPresetIndex, 0), ShoeboxRoomPreset.allCases.count - 1)
+        }
+        if let isSpatializerEnabled {
+            currentParameters.isHRTFSpatializerEnabled = isSpatializerEnabled
+        }
+        bridge?.writeParameters(currentParameters)
+    }
+
+    public func updateOrbitalSatellites(_ bank: OrbitalSatelliteBank) {
+        currentParameters.orbitalSatellites = bank
         bridge?.writeParameters(currentParameters)
     }
 
@@ -696,6 +1230,17 @@ public actor AudioSynthEngine {
         var next = SynthParameters(preset: preset)
         next.spatialPanOffset = currentParameters.spatialPanOffset
         next.headElevationTilt = currentParameters.headElevationTilt
+        next.hrtfAzimuthDeg = currentParameters.hrtfAzimuthDeg
+        next.hrtfElevationDeg = currentParameters.hrtfElevationDeg
+        next.hrtfDistanceMeters = currentParameters.hrtfDistanceMeters
+        next.roomPresetIndex = currentParameters.roomPresetIndex
+        next.isHRTFSpatializerEnabled = currentParameters.isHRTFSpatializerEnabled
+        next.headQuaternion = currentParameters.headQuaternion
+        next.orbitalSatellites = currentParameters.orbitalSatellites
+        next.neuralSoundscapeMix = currentParameters.neuralSoundscapeMix
+        next.latentGuidanceScale = currentParameters.latentGuidanceScale
+        next.latentTemperature = currentParameters.latentTemperature
+        next.rayTracedAcousticsEnabled = currentParameters.rayTracedAcousticsEnabled
         next.isMuted = !isRunningEngine
         currentParameters = next
         bridge?.writeParameters(next)
@@ -735,6 +1280,54 @@ public actor AudioSynthEngine {
         }
         return (bridge.copyRecentMonoWindow(), bridge.sampleRate)
     }
+
+    #if os(macOS)
+    public func routeOutputDevice(deviceID: AudioObjectID) throws {
+        let wasRunning = engine.isRunning
+        if wasRunning {
+            engine.stop()
+        }
+
+        guard let audioUnit = engine.outputNode.audioUnit else {
+            throw NSError(
+                domain: "AetherAudioSynthEngine",
+                code: -1002,
+                userInfo: [NSLocalizedDescriptionKey: "AVAudioEngine outputNode AudioUnit is unavailable."]
+            )
+        }
+
+        var mutableID = deviceID
+        let status = AudioUnitSetProperty(
+            audioUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &mutableID,
+            UInt32(MemoryLayout<AudioObjectID>.size)
+        )
+        guard status == noErr else {
+            throw NSError(
+                domain: "AetherAudioSynthEngine",
+                code: Int(status),
+                userInfo: [NSLocalizedDescriptionKey: "AudioUnitSetProperty(CurrentDevice) failed with OSStatus \(status)."]
+            )
+        }
+
+        if let existingNode = sourceNode {
+            engine.detach(existingNode)
+            sourceNode = nil
+            bridge = nil
+        }
+
+        try configureIfNeeded()
+        bridge?.writeParameters(currentParameters)
+
+        if wasRunning || isRunningEngine {
+            try engine.start()
+            isRunningEngine = true
+        }
+    }
+    #endif
 
     public var isPlaying: Bool {
         isRunningEngine && engine.isRunning

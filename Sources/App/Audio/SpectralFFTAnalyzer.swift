@@ -12,6 +12,34 @@ public struct SpectrumAnalysisFrame: Sendable, Equatable {
         self.bars = bars
         self.dominantFrequencyHz = dominantFrequencyHz
     }
+
+    public var subBandEnergy: Float {
+        bandAverage(range: 0..<8)
+    }
+
+    public var lowBandEnergy: Float {
+        bandAverage(range: 8..<24)
+    }
+
+    public var midBandEnergy: Float {
+        bandAverage(range: 24..<44)
+    }
+
+    public var highBandEnergy: Float {
+        bandAverage(range: 44..<64)
+    }
+
+    private func bandAverage(range: Range<Int>) -> Float {
+        guard !bars.isEmpty else { return 0 }
+        let start = max(0, min(range.lowerBound, bars.count))
+        let end = max(start, min(range.upperBound, bars.count))
+        guard end > start else { return 0 }
+        var sum: Float = 0
+        for idx in start..<end {
+            sum += bars[idx]
+        }
+        return min(max(sum / Float(end - start), 0.0), 1.0)
+    }
 }
 
 /// Hardware-accelerated vDSP 256-point Hann-windowed DFT mapped into 64 perceptual display bars.

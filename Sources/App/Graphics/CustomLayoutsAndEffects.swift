@@ -1,6 +1,7 @@
 // MARK: - FILE: CustomLayoutsAndEffects.swift
 
 import SwiftUI
+import QuartzCore
 
 private struct OrbitalMassLayoutKey: LayoutValueKey {
     static let defaultValue: Double = 1.0

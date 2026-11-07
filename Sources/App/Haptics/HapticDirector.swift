@@ -1,21 +1,33 @@
 // MARK: - FILE: HapticDirector.swift
 
 import Foundation
+#if canImport(CoreHaptics)
 import CoreHaptics
+#endif
+#if os(macOS)
+import AppKit
+#endif
 
 @MainActor
 public final class HapticDirector {
+    #if canImport(CoreHaptics)
     private var engine: CHHapticEngine?
+    #endif
     private let supportsHaptics: Bool
     private var isEngineRunning: Bool = false
     private var lastScrubTimestamp: TimeInterval = 0
 
     public init() {
+        #if canImport(CoreHaptics)
         self.supportsHaptics = CHHapticEngine.capabilitiesForHardware().supportsHaptics
+        #else
+        self.supportsHaptics = false
+        #endif
         prepareEngineIfSupported()
     }
 
     public func prepareEngineIfSupported() {
+        #if canImport(CoreHaptics)
         guard supportsHaptics, engine == nil else { return }
         do {
             let created = try CHHapticEngine()
@@ -41,8 +53,10 @@ public final class HapticDirector {
             self.engine = nil
             self.isEngineRunning = false
         }
+        #endif
     }
 
+    #if canImport(CoreHaptics)
     private func restartEngine() {
         guard supportsHaptics, let engine else { return }
         do {
@@ -65,18 +79,34 @@ public final class HapticDirector {
         }
         return engine
     }
+    #endif
 
     // MARK: - Tactile Vocabulary
 
     public func playSegmentSnap() {
+        #if os(macOS)
+        if !supportsHaptics {
+            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .default)
+            return
+        }
+        #endif
+        #if canImport(CoreHaptics)
         guard let engine = ensureRunning() else { return }
         let intensity = CHHapticEventParameter(parameterID: .hapticIntensity, value: 0.58)
         let sharpness = CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.82)
         let event = CHHapticEvent(eventType: .hapticTransient, parameters: [intensity, sharpness], relativeTime: 0)
         playEvents([event], curves: [], on: engine)
+        #endif
     }
 
     public func playOrbitalSnap(mass: Double) {
+        #if os(macOS)
+        if !supportsHaptics {
+            NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .default)
+            return
+        }
+        #endif
+        #if canImport(CoreHaptics)
         guard let engine = ensureRunning() else { return }
         let normalizedMass = Float(min(max((mass - 0.5) / 2.0, 0.0), 1.0))
         let intensityValue = 0.45 + normalizedMass * 0.45
@@ -108,6 +138,7 @@ public final class HapticDirector {
             relativeTime: 0
         )
         playEvents([transient, tail], curves: [fadeCurve], on: engine)
+        #endif
     }
 
     public func playRippleTouch(normalizedVelocity: Float, normalizedY: Float) {
@@ -115,6 +146,15 @@ public final class HapticDirector {
         guard now - lastScrubTimestamp >= 0.045 else { return }
         lastScrubTimestamp = now
 
+        #if os(macOS)
+        if !supportsHaptics {
+            if normalizedVelocity > 0.28 {
+                NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
+            }
+            return
+        }
+        #endif
+        #if canImport(CoreHaptics)
         guard let engine = ensureRunning() else { return }
         let v = min(max(normalizedVelocity, 0.08), 1.0)
         let sharpness = min(max(1.0 - normalizedY, 0.15), 0.90)
@@ -139,6 +179,7 @@ public final class HapticDirector {
             relativeTime: 0
         )
         playEvents([swell], curves: [envelope], on: engine)
+        #endif
     }
 
     public func scrubDayCell(intensityLevel: Int) {
@@ -146,6 +187,13 @@ public final class HapticDirector {
         guard now - lastScrubTimestamp >= 0.032 else { return }
         lastScrubTimestamp = now
 
+        #if os(macOS)
+        if !supportsHaptics {
+            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .default)
+            return
+        }
+        #endif
+        #if canImport(CoreHaptics)
         guard let engine = ensureRunning() else { return }
         let clamped = Float(min(max(intensityLevel, 0), 4)) / 4.0
         let event = CHHapticEvent(
@@ -157,9 +205,17 @@ public final class HapticDirector {
             relativeTime: 0
         )
         playEvents([event], curves: [], on: engine)
+        #endif
     }
 
     public func playTimerIgnition(starting: Bool) {
+        #if os(macOS)
+        if !supportsHaptics {
+            NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .default)
+            return
+        }
+        #endif
+        #if canImport(CoreHaptics)
         guard let engine = ensureRunning() else { return }
         let duration: TimeInterval = 0.28
         let continuous = CHHapticEvent(
@@ -196,9 +252,17 @@ public final class HapticDirector {
         )
 
         playEvents([continuous, anchorTap], curves: [intensityCurve], on: engine)
+        #endif
     }
 
     public func playSessionCompletionSymphony() {
+        #if os(macOS)
+        if !supportsHaptics {
+            NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .default)
+            return
+        }
+        #endif
+        #if canImport(CoreHaptics)
         guard let engine = ensureRunning() else { return }
 
         let pulseOffsets: [(TimeInterval, Float, Float)] = [
@@ -252,8 +316,10 @@ public final class HapticDirector {
         )
 
         playEvents(events, curves: [bloomIntensityCurve, bloomSharpnessCurve], on: engine)
+        #endif
     }
 
+    #if canImport(CoreHaptics)
     private func playEvents(
         _ events: [CHHapticEvent],
         curves: [CHHapticParameterCurve],
@@ -267,4 +333,5 @@ public final class HapticDirector {
             isEngineRunning = false
         }
     }
+    #endif
 }

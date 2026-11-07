@@ -52,6 +52,8 @@ public struct OrbitalFocusArenaView: View {
 
                 timerCommandDeck
 
+                orbitalAutonomicStatusStrip
+
                 if let activeHabit = selectedHabit {
                     selectedHabitDetailStrip(activeHabit)
                 }
@@ -319,6 +321,49 @@ public struct OrbitalFocusArenaView: View {
         .padding(14)
         .aetherGlass(accentHue: habit.accentHue, audioEnergy: coordinator.liveAudioAmplitude * 0.5, cornerRadius: 20)
     }
+
+    private var orbitalAutonomicStatusStrip: some View {
+        let accent = Color(hue: coordinator.activeAccentHue, saturation: 0.72, brightness: 0.98)
+        let bpmText = coordinator.latestBiometricSnapshot.map { String(format: "%.0f BPM", $0.heartRateBPM) } ?? "Wrist Standby"
+        let rmssdText = coordinator.latestHRVMetrics.map { String(format: "%.0fms RMSSD", $0.rmssdMs) } ?? "HRV Idle"
+        let cohText = coordinator.latestHRVMetrics.map { "\(Int(($0.rsaCoherenceScore * 100.0).rounded()))% Coh" } ?? "--"
+
+        return HStack(spacing: 10) {
+            Image(systemName: coordinator.isWatchCounterpartReachable ? "applewatch.radiowaves.left.and.right" : "waveform.path.ecg")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(coordinator.isBioEntrainmentEnabled ? Color.green : accent)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(coordinator.isBioEntrainmentEnabled ? "Closed-Loop Bio-Entrainment Active" : "Autonomic Watch Telemetry")
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                Text("\(bpmText) · \(rmssdText) · \(cohText)")
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.68))
+            }
+
+            Spacer()
+
+            Button {
+                coordinator.toggleBioEntrainmentClosedLoop(!coordinator.isBioEntrainmentEnabled)
+            } label: {
+                Text(coordinator.isBioEntrainmentEnabled ? "Bio-Locked" : "Engage Loop")
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 7)
+                    .background(
+                        coordinator.isBioEntrainmentEnabled
+                            ? accent.opacity(0.55)
+                            : Color.white.opacity(0.12),
+                        in: Capsule()
+                    )
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(13)
+        .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude * 0.4, cornerRadius: 20)
+    }
 }
 
 // MARK: - 2. Real-Time Synth Lab View (vDSP 64-Bar FFT + AirPods Head-Tracking + XY Pad + Mixer)
@@ -347,6 +392,7 @@ public struct SynthLabPanelView: View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 18) {
                 presetHeaderCard
+                bioEntrainmentInspectorCard
                 realtimeSpectrumAndSpatialCard
                 filterXYPadCard
                 oscillatorAndMixerCard
@@ -439,6 +485,296 @@ public struct SynthLabPanelView: View {
         }
         .padding(16)
         .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude, cornerRadius: 24)
+    }
+
+    // MARK: - Closed-Loop Bio-Entrainment Inspector (Poincaré SD1/SD2 + Lomb-Scargle LF/HF + CoreML Readout)
+
+    private var bioEntrainmentInspectorCard: some View {
+        let accent = Color(hue: coordinator.activeAccentHue, saturation: 0.74, brightness: 0.98)
+        let metrics = coordinator.latestHRVMetrics ?? .baselinePlaceholder
+        let snapshot = coordinator.latestBiometricSnapshot
+
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("watchOS 11 HRV & CoreML Entrainment", systemImage: "heart.text.square.fill")
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+
+                Spacer()
+
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(coordinator.isWatchCounterpartReachable
+                              ? Color.green
+                              : (coordinator.isSimulateWristBiometricsEnabled ? Color.cyan : Color.white.opacity(0.35)))
+                        .frame(width: 6, height: 6)
+                    Text(coordinator.isWatchCounterpartReachable
+                         ? "Watch Live"
+                         : (coordinator.isSimulateWristBiometricsEnabled ? "Sim PPG" : "Standby"))
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.82))
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(.white.opacity(0.10), in: Capsule())
+            }
+
+            VStack(spacing: 10) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Bio-Entrainment Closed Loop")
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white)
+                        Text("2s CoreML + PID slew adapting carrier, beat Hz & pink noise")
+                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.58))
+                    }
+                    Spacer()
+                    Toggle(
+                        "",
+                        isOn: Binding(
+                            get: { coordinator.isBioEntrainmentEnabled },
+                            set: { coordinator.toggleBioEntrainmentClosedLoop($0) }
+                        )
+                    )
+                    .labelsHidden()
+                    .tint(accent)
+                }
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Simulate Wrist Biometrics")
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white)
+                        Text("Coupled PQRST + 0.10 Hz Mayer baroreflex synthetic oscillator")
+                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.58))
+                    }
+                    Spacer()
+                    Toggle(
+                        "",
+                        isOn: Binding(
+                            get: { coordinator.isSimulateWristBiometricsEnabled },
+                            set: { coordinator.toggleSimulateWristBiometrics($0) }
+                        )
+                    )
+                    .labelsHidden()
+                    .tint(.cyan)
+                }
+            }
+
+            HStack(spacing: 8) {
+                bioMetricPill(
+                    title: "HR",
+                    value: String(format: "%.0f BPM", snapshot?.heartRateBPM ?? metrics.meanHeartRateBPM)
+                )
+                bioMetricPill(
+                    title: "RMSSD",
+                    value: String(format: "%.1f ms", metrics.rmssdMs)
+                )
+                bioMetricPill(
+                    title: "Stress SI",
+                    value: String(format: "%.0f", metrics.baevskyStressIndex)
+                )
+                bioMetricPill(
+                    title: "RSA Coh",
+                    value: "\(Int((metrics.rsaCoherenceScore * 100.0).rounded()))%"
+                )
+            }
+
+            HStack(spacing: 10) {
+                poincarePhaseSpacePanel(snapshot: snapshot, metrics: metrics, accent: accent)
+                lombScargleSpectrumPanel(metrics: metrics, accent: accent)
+            }
+            .frame(height: 136)
+
+            Divider().overlay(.white.opacity(0.12))
+
+            neuralPredictorReadoutSection(accent: accent)
+        }
+        .padding(16)
+        .aetherGlass(accentHue: coordinator.activeAccentHue, audioEnergy: coordinator.liveAudioAmplitude, cornerRadius: 24)
+    }
+
+    private func bioMetricPill(title: String, value: String) -> some View {
+        VStack(spacing: 2) {
+            Text(value)
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+            Text(title)
+                .font(.system(size: 9, weight: .semibold, design: .rounded))
+                .foregroundStyle(.white.opacity(0.60))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 6)
+        .background(.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func poincarePhaseSpacePanel(
+        snapshot: BiometricSnapshotDTO?,
+        metrics: HRVAnalysisMetricsDTO,
+        accent: Color
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("Poincaré RRₙ/RRₙ₊₁")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.88))
+                Spacer()
+                Text(String(format: "SD1 %.0f / SD2 %.0f", metrics.sd1Ms, metrics.sd2Ms))
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(accent)
+            }
+
+            Canvas { context, size in
+                let rect = CGRect(origin: .zero, size: size)
+                context.fill(Path(roundedRect: rect, cornerRadius: 12), with: .color(.black.opacity(0.34)))
+
+                var diag = Path()
+                diag.move(to: CGPoint(x: 8, y: size.height - 8))
+                diag.addLine(to: CGPoint(x: size.width - 8, y: 8))
+                context.stroke(diag, with: .color(.white.opacity(0.14)), style: StrokeStyle(lineWidth: 0.8, dash: [3, 3]))
+
+                let minRR = max(400.0, metrics.meanRRMs - 220.0)
+                let maxRR = min(1_500.0, metrics.meanRRMs + 220.0)
+                let span = max(80.0, maxRR - minRR)
+
+                func mapPoint(_ rrX: Double, _ rrY: Double) -> CGPoint {
+                    let nx = min(max((rrX - minRR) / span, 0.04), 0.96)
+                    let ny = min(max((rrY - minRR) / span, 0.04), 0.96)
+                    return CGPoint(x: nx * size.width, y: (1.0 - ny) * size.height)
+                }
+
+                if metrics.sd2Ms > 1.0 && metrics.sd1Ms > 1.0 {
+                    var ellipsePath = Path()
+                    let steps = 48
+                    let cos45 = 0.70710678
+                    for step in 0...steps {
+                        let theta = (Double(step) / Double(steps)) * 2.0 * Double.pi
+                        let uMajor = metrics.sd2Ms * cos(theta)
+                        let vMinor = metrics.sd1Ms * sin(theta)
+                        let rrX = metrics.meanRRMs + (uMajor * cos45 - vMinor * cos45)
+                        let rrY = metrics.meanRRMs + (uMajor * cos45 + vMinor * cos45)
+                        let pt = mapPoint(rrX, rrY)
+                        if step == 0 {
+                            ellipsePath.move(to: pt)
+                        } else {
+                            ellipsePath.addLine(to: pt)
+                        }
+                    }
+                    ellipsePath.closeSubpath()
+                    context.fill(ellipsePath, with: .color(accent.opacity(0.16)))
+                    context.stroke(ellipsePath, with: .color(accent.opacity(0.85)), lineWidth: 1.3)
+                }
+
+                if let rr = snapshot?.rrIntervals, rr.count >= 2 {
+                    let tail = max(0, rr.count - 48)
+                    for idx in tail..<(rr.count - 1) {
+                        let pt = mapPoint(rr[idx].durationMs, rr[idx + 1].durationMs)
+                        let dot = CGRect(x: pt.x - 2.0, y: pt.y - 2.0, width: 4.0, height: 4.0)
+                        let fade = 0.30 + 0.70 * (Double(idx - tail) / Double(max(1, rr.count - 1 - tail)))
+                        context.fill(Path(ellipseIn: dot), with: .color(.cyan.opacity(fade)))
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func lombScargleSpectrumPanel(
+        metrics: HRVAnalysisMetricsDTO,
+        accent: Color
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("Lomb-Scargle PSD")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.88))
+                Spacer()
+                Text(String(format: "LF/HF %.2f", metrics.lfHfRatio))
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.cyan)
+            }
+
+            Canvas { context, size in
+                let rect = CGRect(origin: .zero, size: size)
+                context.fill(Path(roundedRect: rect, cornerRadius: 12), with: .color(.black.opacity(0.34)))
+
+                let fMin = 0.04
+                let fMax = 0.40
+                let fSpan = fMax - fMin
+
+                func xForFreq(_ hz: Double) -> CGFloat {
+                    CGFloat(min(max((hz - fMin) / fSpan, 0.0), 1.0)) * size.width
+                }
+
+                let lfEnd = xForFreq(0.15)
+                context.fill(
+                    Path(CGRect(x: 0, y: 0, width: lfEnd, height: size.height)),
+                    with: .color(accent.opacity(0.08))
+                )
+
+                let mayerX = xForFreq(0.10)
+                var mayerLine = Path()
+                mayerLine.move(to: CGPoint(x: mayerX, y: 4))
+                mayerLine.addLine(to: CGPoint(x: mayerX, y: size.height - 4))
+                context.stroke(mayerLine, with: .color(.green.opacity(0.55)), style: StrokeStyle(lineWidth: 1.0, dash: [3, 2]))
+
+                let bins = metrics.spectrumBins
+                if bins.count >= 2 {
+                    var curve = Path()
+                    var area = Path()
+                    for (idx, bin) in bins.enumerated() {
+                        let px = xForFreq(bin.frequencyHz)
+                        let py = size.height - 6 - CGFloat(bin.normalizedPower) * (size.height - 14)
+                        if idx == 0 {
+                            curve.move(to: CGPoint(x: px, y: py))
+                            area.move(to: CGPoint(x: px, y: size.height))
+                            area.addLine(to: CGPoint(x: px, y: py))
+                        } else {
+                            curve.addLine(to: CGPoint(x: px, y: py))
+                            area.addLine(to: CGPoint(x: px, y: py))
+                        }
+                    }
+                    if let last = bins.last {
+                        area.addLine(to: CGPoint(x: xForFreq(last.frequencyHz), y: size.height))
+                        area.closeSubpath()
+                    }
+                    context.fill(area, with: .color(.cyan.opacity(0.22)))
+                    context.stroke(curve, with: .color(.cyan), lineWidth: 1.6)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func neuralPredictorReadoutSection(accent: Color) -> some View {
+        let pred = coordinator.latestBioEntrainmentPrediction
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Label("3-Layer SIMD MLP + Online Huber SGD", systemImage: "brain.head.profile")
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.88))
+                Spacer()
+                Text("Epochs \(coordinator.onlineAdaptationEpochs) · Loss \(String(format: "%.4f", coordinator.lastOnlineHuberLoss))")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(accent)
+            }
+
+            if let pred {
+                HStack(spacing: 8) {
+                    bioMetricPill(title: "Target Beat", value: String(format: "%.1f Hz", pred.targetBinauralBeatHz))
+                    bioMetricPill(title: "Carrier", value: String(format: "%.0f Hz", pred.targetCarrierFrequencyHz))
+                    bioMetricPill(title: "SVF Cutoff", value: String(format: "%.0f Hz", pred.targetFilterCutoffHz))
+                    bioMetricPill(title: "Pred Vagal", value: "\(Int((pred.predictedVagalCoherence * 100.0).rounded()))%")
+                }
+            } else {
+                Text("Enable Bio-Entrainment Closed Loop to stream 12D CoreML tensor predictions into PID audio slew.")
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.58))
+            }
+        }
     }
 
     private var realtimeSpectrumAndSpatialCard: some View {
@@ -842,7 +1178,7 @@ public struct CreateOrEditHabitSheet: View {
                 }
             }
             .navigationTitle(existingDraft == nil ? "New Habit Satellite" : "Edit Habit Satellite")
-            .navigationBarTitleDisplayMode(.inline)
+            .aetherInlineNavigationTitle()
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
@@ -913,7 +1249,7 @@ public struct SaveAudioPresetSheet: View {
                 }
             }
             .navigationTitle("Save Synth Preset")
-            .navigationBarTitleDisplayMode(.inline)
+            .aetherInlineNavigationTitle()
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
@@ -1006,7 +1342,7 @@ public struct SessionSummarySheet: View {
             }
             .padding(20)
             .navigationTitle("Focus Telemetry")
-            .navigationBarTitleDisplayMode(.inline)
+            .aetherInlineNavigationTitle()
         }
         .presentationDetents([.medium])
         .interactiveDismissDisabled()
@@ -1023,5 +1359,17 @@ public struct SessionSummarySheet: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 12)
         .background(.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+}
+
+
+private extension View {
+    @ViewBuilder
+    func aetherInlineNavigationTitle() -> some View {
+        #if os(iOS) || os(visionOS)
+        self.navigationBarTitleDisplayMode(.inline)
+        #else
+        self
+        #endif
     }
 }

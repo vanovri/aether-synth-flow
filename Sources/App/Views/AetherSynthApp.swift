@@ -4,6 +4,7 @@ import SwiftUI
 import SwiftData
 import UniformTypeIdentifiers
 
+#if os(iOS)
 @main
 public struct AetherSynthApp: App {
     private let container: ModelContainer
@@ -27,6 +28,7 @@ public struct AetherSynthApp: App {
         }
     }
 }
+#endif
 
 public struct RootSpatialShellView: View {
     @Bindable public var coordinator: AetherAppCoordinator
@@ -78,6 +80,9 @@ public struct RootSpatialShellView: View {
                     coordinator.hapticDirector.playRippleTouch(normalizedVelocity: normVel, normalizedY: normY)
                 }
             )
+            #if os(visionOS)
+            .opacity(0.62)
+            #endif
 
             VStack(spacing: 14) {
                 topSpatialHeaderBar

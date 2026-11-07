@@ -167,6 +167,7 @@ public enum TelemetryCSVSerializer: Sendable {
 
 // MARK: - SwiftUI FileDocument & Transferable Wrappers
 
+#if !os(watchOS) && !os(tvOS)
 public struct AetherArchiveDocument: FileDocument, Sendable {
     public static let readableContentTypes: [UTType] = [.json]
 
@@ -213,3 +214,4 @@ public struct AetherCSVDocument: FileDocument, Sendable {
         return FileWrapper(regularFileWithContents: encoded)
     }
 }
+#endif

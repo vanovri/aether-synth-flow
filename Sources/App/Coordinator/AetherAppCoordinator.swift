@@ -4,7 +4,13 @@ import Foundation
 import SwiftUI
 import SwiftData
 import Observation
+#if canImport(WidgetKit) && !os(visionOS)
 import WidgetKit
+#endif
+#if canImport(CoreML)
+import CoreML
+#endif
+import simd
 
 public enum SpatialTabSection: String, CaseIterable, Hashable, Sendable {
     case orbit
@@ -47,28 +53,70 @@ public final class AetherAppCoordinator {
     public var remainingSeconds: Double = 25.0 * 60.0
     public var orbitalRotationAngle: Double = 0.0
 
-    // Real-Time Synth, vDSP FFT & Head-Tracking State
-    public var synthParameters: SynthParameters = SynthParameters(preset: AudioPresetDTO.defaultPresets[0])
+    // Real-Time Synth, KEMAR HRTF, Shoebox Room Acoustics & Head-Tracking State
+    public var synthParameters: SynthParameters = {
+        var initial = SynthParameters(preset: AudioPresetDTO.defaultPresets[0])
+        initial.isHRTFSpatializerEnabled = true
+        initial.roomPresetIndex = ShoeboxRoomPreset.obsidianStudio.rawValue
+        initial.hrtfAzimuthDeg = 18.0
+        initial.hrtfElevationDeg = 14.0
+        initial.hrtfDistanceMeters = 1.45
+        return initial
+    }()
     public var selectedPresetID: UUID? = AudioPresetDTO.defaultPresets[0].presetID
     public var activePresetName: String = AudioPresetDTO.defaultPresets[0].name
     public var isSynthPlaying: Bool = false
     public var liveAudioAmplitude: Float = 0.0
+    public var liveSubBandEnergy: Float = 0.0
+    public var liveLowBandEnergy: Float = 0.0
+    public var liveMidBandEnergy: Float = 0.0
     public var liveHighBandEnergy: Float = 0.0
+    public var orbitalRadiusScale: Double = 1.0
+    public var latestSpatialModulation: SpatialPoseModulationOutput?
     public var sessionPeakAmplitude: Float = 0.0
     public var spectrumBars: [Float] = [Float](repeating: 0, count: SpectralFFTAnalyzer.outputBarCount)
     public var dominantSpectrumHz: Float = 0.0
     public var isHeadTrackingEnabled: Bool = false
+    public var isOrbitalSourceAutoLockEnabled: Bool = false
+    public var hrtfOrbitalSpeedRadPerSec: Float = 0.32
+    public var currentRoomReflectionTaps: [ImageSourceReflectionTap] = []
+
+    // GPU MPSGraph Neural Trainer Telemetry State
+    public var neuralTelemetry: TrainingTelemetrySnapshot = TrainingTelemetrySnapshot()
+    public var lossConvergenceHistory: [Float] = []
+    public var latestNeuralPrediction: BrainwavePrediction?
+    public var isNeuralTrainingRunning: Bool = false
+
+    // watchOS 11 Biometric Streaming & Closed-Loop CoreML Entrainment State
+    public var isBioEntrainmentEnabled: Bool = false
+    public var isSimulateWristBiometricsEnabled: Bool = false
+    public var isWatchCounterpartReachable: Bool = false
+    public var latestBiometricSnapshot: BiometricSnapshotDTO?
+    public var latestHRVMetrics: HRVAnalysisMetricsDTO?
+    public var latestBioEntrainmentPrediction: BrainwavePredictionOutput?
+    public var onlineAdaptationEpochs: Int = 0
+    public var lastOnlineHuberLoss: Double = 0.0
 
     // Underlying Actors, DSP, Haptics & System Bridges
     public let hapticDirector = HapticDirector()
     public let audioEngine = AudioSynthEngine()
     public let fftAnalyzer = SpectralFFTAnalyzer()
     public let mediaAndMotion = MediaSessionAndHeadTrackingController()
+    public let neuralTrainer = MPSGraphBrainwaveTrainer()
+    public let mlPredictor = AdaptiveBrainwaveMLPredictor()
+    public let watchBridge = WatchBiometricBridgeActor()
     public let databaseActor: TelemetryDatabaseActor
 
     #if canImport(ActivityKit) && os(iOS)
     private let liveActivityController = FocusLiveActivityController()
     #endif
+
+    private var pidController = EntrainmentPIDController()
+    private var physiologySimulator = SyntheticPhysiologySimulator(initialStressLevel: 0.58)
+    private var lastBioEntrainmentTickDate: Date = .distantPast
+    private var previousEvaluatedMetrics: HRVAnalysisMetricsDTO?
+    private var previousEvaluatedFeatures: BiometricFeatureVector?
+    private var previousPredictionOutput: BrainwavePredictionOutput?
 
     private var activeLiveSessionID = UUID()
     private var timerAnchorDate: Date?
@@ -76,9 +124,12 @@ public final class AetherAppCoordinator {
     private var sessionStartWallDate: Date?
     private var telemetryLoopTask: Task<Void, Never>?
     private var externalIntentObserver: NSObjectProtocol?
+    private var cachedOrbitHabits: [HabitNodeDTO] = []
+    private var frameCounter: Int = 0
 
     public init(modelContainer: ModelContainer) {
         self.databaseActor = TelemetryDatabaseActor(modelContainer: modelContainer)
+        refreshRoomReflectionPreview()
         wireMediaAndMotionCallbacks()
         wireExternalIntentNotifications()
     }
@@ -93,6 +144,10 @@ public final class AetherAppCoordinator {
         let mins = clamped / 60
         let secs = clamped % 60
         return String(format: "%02d:%02d", mins, secs)
+    }
+
+    public var activeRoomPreset: ShoeboxRoomPreset {
+        ShoeboxRoomPreset(rawValue: synthParameters.roomPresetIndex) ?? .obsidianStudio
     }
 
     // MARK: - Wiring System Surfaces (Lock Screen, AirPods, LiveActivity/Widget Intents)
@@ -144,12 +199,18 @@ public final class AetherAppCoordinator {
                 self.startFocusTimer()
             }
         }
-        mediaAndMotion.onHeadOrientationChanged = { [weak self] pan, elevation in
+        mediaAndMotion.onHeadQuaternionChanged = { [weak self] quat, pan, elevation in
             guard let self else { return }
             self.synthParameters.spatialPanOffset = pan
             self.synthParameters.headElevationTilt = elevation
+            self.synthParameters.headQuaternion = quat
+            self.refreshRoomReflectionPreview()
             Task {
-                await self.audioEngine.updateHeadTrackingOffsets(spatialPan: pan, elevationTilt: elevation)
+                await self.audioEngine.updateHeadTrackingOffsets(
+                    spatialPan: pan,
+                    elevationTilt: elevation,
+                    headQuaternion: quat
+                )
             }
         }
     }
@@ -175,6 +236,9 @@ public final class AetherAppCoordinator {
                 case .habitPulseLogged:
                     self.hapticDirector.playOrbitalSnap(mass: 1.4)
                     await self.refreshSharedWidgetSnapshotFromDB()
+                case .launchBioEntrainment:
+                    self.toggleBioEntrainmentClosedLoop(true)
+                    if !self.isTimerRunning { self.startFocusTimer() }
                 }
             }
         }
@@ -185,7 +249,30 @@ public final class AetherAppCoordinator {
     public func startSystemPipelines() async {
         try? await databaseActor.bootstrapDefaultsIfNeeded()
         mediaAndMotion.activateMediaIntegration()
+
+        let activeHabits = (try? await databaseActor.fetchActiveHabits()) ?? []
+        cachedOrbitHabits = activeHabits
+        synthParameters.orbitalSatellites = OrbitalSatelliteBank.build(
+            from: activeHabits,
+            rotationRadians: orbitalRotationAngle,
+            orbitalSpeedRadPerSec: hrtfOrbitalSpeedRadPerSec
+        )
         await audioEngine.updateParameters(synthParameters)
+
+        // Restore saved neural checkpoint if available, otherwise snapshot initialized GPU/SIMD model
+        if let restored = try? await neuralTrainer.loadCheckpoint() {
+            neuralTelemetry = restored
+        } else {
+            neuralTelemetry = await neuralTrainer.snapshotTelemetry()
+        }
+        let sampleBatch = BiometricTrainingBatch.makeSyntheticBiometricDataset(batchSize: 2)
+        let firstWindow = Array(sampleBatch.inputs.prefix(MPSGraphBrainwaveTrainer.sequenceLength * MPSGraphBrainwaveTrainer.featureDim))
+        latestNeuralPrediction = await neuralTrainer.predictOptimalSetpoint(sequence8x12: firstWindow)
+
+        let storedWeights = await mlPredictor.currentWeightsSnapshot()
+        onlineAdaptationEpochs = storedWeights.trainedEpochCount
+        await wireWatchBiometricBridge()
+
         await refreshSharedWidgetSnapshotFromDB()
         startTelemetryPollingLoop()
     }
@@ -202,6 +289,7 @@ public final class AetherAppCoordinator {
     }
 
     private func tickFrameUpdate() async {
+        frameCounter &+= 1
         let snap = await audioEngine.snapshotTelemetry()
         let smoothedAmp = liveAudioAmplitude * 0.65 + snap.rmsAmplitude * 2.1 * 0.35
         liveAudioAmplitude = min(max(smoothedAmp, 0.0), 1.0)
@@ -215,11 +303,48 @@ public final class AetherAppCoordinator {
             let fftFrame = fftAnalyzer.analyze(samples: scope.samples, sampleRate: scope.sampleRate)
             spectrumBars = fftFrame.bars
             dominantSpectrumHz = fftFrame.dominantFrequencyHz
-            orbitalRotationAngle += 0.0022 + Double(liveAudioAmplitude) * 0.006
+            liveSubBandEnergy = fftFrame.subBandEnergy
+            liveLowBandEnergy = fftFrame.lowBandEnergy
+            liveMidBandEnergy = fftFrame.midBandEnergy
+            liveHighBandEnergy = max(liveHighBandEnergy, fftFrame.highBandEnergy)
+
+            let angularStep = Double(hrtfOrbitalSpeedRadPerSec) * 0.033 + Double(liveAudioAmplitude) * 0.004
+            orbitalRotationAngle += angularStep
+
+            if isOrbitalSourceAutoLockEnabled {
+                let lockedAz = Float((orbitalRotationAngle * 180.0 / .pi).truncatingRemainder(dividingBy: 360.0))
+                let lockedEl = 16.0 * Float(sin(orbitalRotationAngle * 0.75))
+                synthParameters.hrtfAzimuthDeg = BinauralSourcePose.wrapAzimuthDegrees(lockedAz)
+                synthParameters.hrtfElevationDeg = lockedEl
+                if (frameCounter & 3) == 0 {
+                    refreshRoomReflectionPreview()
+                }
+            }
+
+            if (frameCounter & 7) == 0 {
+                let bank = OrbitalSatelliteBank.build(
+                    from: cachedOrbitHabits,
+                    rotationRadians: orbitalRotationAngle,
+                    orbitalSpeedRadPerSec: hrtfOrbitalSpeedRadPerSec
+                )
+                synthParameters.orbitalSatellites = bank
+                await audioEngine.updateParameters(synthParameters)
+            }
         } else if dominantSpectrumHz > 0 {
             fftAnalyzer.reset()
             spectrumBars = [Float](repeating: 0, count: SpectralFFTAnalyzer.outputBarCount)
             dominantSpectrumHz = 0
+            liveSubBandEnergy = 0
+            liveLowBandEnergy = 0
+            liveMidBandEnergy = 0
+        }
+
+        let nowWall = Date.now
+        let bioDt = nowWall.timeIntervalSince(lastBioEntrainmentTickDate)
+        if bioDt >= 2.0 {
+            let clampedDt = min(max(bioDt, 0.5), 4.0)
+            lastBioEntrainmentTickDate = nowWall
+            await tickClosedLoopBioEntrainment(dtSeconds: clampedDt)
         }
 
         guard isTimerRunning, let anchor = timerAnchorDate else { return }
@@ -234,6 +359,334 @@ public final class AetherAppCoordinator {
             elapsedSeconds = currentElapsed
             remainingSeconds = max(0, totalPlanned - currentElapsed)
         }
+    }
+
+    // MARK: - 3D KEMAR HRTF, Shoebox Room & Orbital Spatializer Controls
+
+    public func refreshRoomReflectionPreview() {
+        let pose = BinauralSourcePose(
+            azimuthDeg: synthParameters.hrtfAzimuthDeg,
+            elevationDeg: synthParameters.hrtfElevationDeg,
+            distanceMeters: synthParameters.hrtfDistanceMeters
+        )
+        let solved = ShoeboxRoomSimulator.solveImageSources(
+            configuration: activeRoomPreset.configuration,
+            sourcePose: pose,
+            headOrientation: simd_quatf(vector: synthParameters.headQuaternion)
+        )
+        currentRoomReflectionTaps = solved.taps
+    }
+
+    public func updateHRTFSourcePose(
+        azimuthDeg: Float,
+        elevationDeg: Float,
+        distanceMeters: Float
+    ) {
+        synthParameters.hrtfAzimuthDeg = BinauralSourcePose.wrapAzimuthDegrees(azimuthDeg)
+        synthParameters.hrtfElevationDeg = min(max(elevationDeg, -45.0), 90.0)
+        synthParameters.hrtfDistanceMeters = min(max(distanceMeters, 0.15), 10.0)
+        refreshRoomReflectionPreview()
+        Task {
+            await audioEngine.updateHRTFPose(
+                azimuthDeg: synthParameters.hrtfAzimuthDeg,
+                elevationDeg: synthParameters.hrtfElevationDeg,
+                distanceMeters: synthParameters.hrtfDistanceMeters
+            )
+        }
+    }
+
+    public func selectShoeboxRoomPreset(_ preset: ShoeboxRoomPreset) {
+        synthParameters.roomPresetIndex = preset.rawValue
+        refreshRoomReflectionPreview()
+        hapticDirector.playSegmentSnap()
+        Task {
+            await audioEngine.updateHRTFPose(
+                azimuthDeg: synthParameters.hrtfAzimuthDeg,
+                elevationDeg: synthParameters.hrtfElevationDeg,
+                distanceMeters: synthParameters.hrtfDistanceMeters,
+                roomPresetIndex: preset.rawValue
+            )
+        }
+    }
+
+    public func toggleHRTFSpatializer(_ enabled: Bool) {
+        synthParameters.isHRTFSpatializerEnabled = enabled
+        hapticDirector.playSegmentSnap()
+        Task {
+            await audioEngine.updateHRTFPose(
+                azimuthDeg: synthParameters.hrtfAzimuthDeg,
+                elevationDeg: synthParameters.hrtfElevationDeg,
+                distanceMeters: synthParameters.hrtfDistanceMeters,
+                isSpatializerEnabled: enabled
+            )
+        }
+    }
+
+    public func toggleOrbitalSourceAutoLock(_ enabled: Bool) {
+        isOrbitalSourceAutoLockEnabled = enabled
+        hapticDirector.playSegmentSnap()
+    }
+
+    // MARK: - 6-DoF VisionOS Bimanual Pose Modulation & Manual Bloom
+
+    public func applySpatialPoseModulation(
+        _ modulation: SpatialPoseModulationOutput,
+        coupleToDSP: Bool = true,
+        isSimulated: Bool = false
+    ) {
+        latestSpatialModulation = modulation
+        orbitalRadiusScale = Double(modulation.orbitalRadiusScale)
+
+        guard coupleToDSP else { return }
+
+        var next = synthParameters
+        if modulation.leftPinchEngaged || isSimulated {
+            next.binauralBeatHz = modulation.binauralBeatHz
+        }
+        if modulation.rightPinchEngaged || isSimulated {
+            next.filterCutoffHz = modulation.filterCutoffHz
+        }
+        next.filterResonance = modulation.filterResonance
+        next.padDetuneCents = modulation.padDetuneCents
+        next.bloomBoost = modulation.bloomBoost
+        next.spatialPanOffset = modulation.spatialPanOffset
+        next.headElevationTilt = modulation.headElevationTilt
+        next.headQuaternion = modulation.headQuaternion
+
+        synthParameters = next
+        if isSynthPlaying || isTimerRunning {
+            Task {
+                await audioEngine.updateParameters(next)
+            }
+        }
+    }
+
+    public func triggerManualHarmonicBloom(intensity: Float = 0.88) {
+        hapticDirector.playOrbitalSnap(mass: 1.55)
+        Task {
+            await audioEngine.triggerHarmonicBloom(intensity: intensity)
+        }
+    }
+
+    // MARK: - GPU MPSGraph Neural Replay Training Controls
+
+    public func run32EpochGPUReplayTrainingBatch(epochs: Int = 32) async {
+        guard !isNeuralTrainingRunning else { return }
+        isNeuralTrainingRunning = true
+        hapticDirector.playTimerIgnition(starting: true)
+
+        let seed = UInt64(max(1, neuralTelemetry.epochCount + 1)) &* 0x9E37_79B9_7F4A_7C15
+        let replayBatch = BiometricTrainingBatch.makeSyntheticBiometricDataset(batchSize: 8, seed: seed)
+
+        let snapshots = await neuralTrainer.trainEpochs(batch: replayBatch, epochs: epochs)
+        for snap in snapshots {
+            lossConvergenceHistory.append(snap.latestLoss)
+        }
+        if lossConvergenceHistory.count > 96 {
+            lossConvergenceHistory.removeFirst(lossConvergenceHistory.count - 96)
+        }
+        if let finalSnap = snapshots.last {
+            neuralTelemetry = finalSnap
+        }
+
+        let evalWindow = Array(replayBatch.inputs.prefix(MPSGraphBrainwaveTrainer.sequenceLength * MPSGraphBrainwaveTrainer.featureDim))
+        let prediction = await neuralTrainer.predictOptimalSetpoint(sequence8x12: evalWindow)
+        latestNeuralPrediction = prediction
+
+        _ = try? await neuralTrainer.saveCheckpoint()
+        isNeuralTrainingRunning = false
+        hapticDirector.playOrbitalSnap(mass: 1.45)
+        presentTransientBanner(
+            String(
+                format: "%@ trained %d epochs · Loss %.4f",
+                neuralTelemetry.activeBackend.displayTitle,
+                epochs,
+                neuralTelemetry.latestLoss
+            )
+        )
+    }
+
+    public func applyNeuralPredictionToSynth() {
+        guard let pred = latestNeuralPrediction else { return }
+        var updated = synthParameters
+        updated.binauralBeatHz = pred.binauralBeatHz
+        updated.carrierFrequencyHz = pred.carrierHz
+        updated.filterCutoffHz = pred.filterCutoffHz
+        hrtfOrbitalSpeedRadPerSec = pred.hrtfOrbitSpeed
+        updated.orbitalSatellites = OrbitalSatelliteBank.build(
+            from: cachedOrbitHabits,
+            rotationRadians: orbitalRotationAngle,
+            orbitalSpeedRadPerSec: pred.hrtfOrbitSpeed
+        )
+        pushSynthParameters(updated)
+        hapticDirector.playOrbitalSnap(mass: 1.6)
+        presentTransientBanner(
+            String(format: "Applied Neural Setpoint · %.1f Hz Beat · %.0f%% Coherence", pred.binauralBeatHz, pred.targetCoherence * 100.0)
+        )
+    }
+
+    // MARK: - watchOS 11 Biometric Bridge & 2s Closed-Loop CoreML + PID Entrainment
+
+    private func wireWatchBiometricBridge() async {
+        await watchBridge.setHandlers(
+            onTelemetry: { [weak self] snapshot, metrics in
+                await MainActor.run {
+                    guard let self else { return }
+                    self.latestBiometricSnapshot = snapshot
+                    self.latestHRVMetrics = metrics
+                    self.isWatchCounterpartReachable = true
+                }
+            },
+            onCommand: { [weak self] command in
+                await MainActor.run {
+                    self?.handleIncomingWatchCommand(command)
+                }
+            },
+            onStateSync: { [weak self] state in
+                await MainActor.run {
+                    guard let self else { return }
+                    SharedWidgetStateStore.write(state)
+                    if state.isBioEntrainmentActive && !self.isBioEntrainmentEnabled {
+                        self.isBioEntrainmentEnabled = true
+                    }
+                }
+            },
+            onReachability: { [weak self] reachable in
+                await MainActor.run {
+                    self?.isWatchCounterpartReachable = reachable
+                }
+            }
+        )
+        await watchBridge.activateBridge()
+        isWatchCounterpartReachable = await watchBridge.isCounterpartReachable
+    }
+
+    private func handleIncomingWatchCommand(_ command: WatchRemoteCommand) {
+        switch command {
+        case .startFocusSession:
+            if !isTimerRunning { startFocusTimer() }
+        case .pauseFocusSession:
+            if isTimerRunning { pauseFocusTimer() }
+        case .scrubBinauralFreq(let hz):
+            var updated = synthParameters
+            updated.binauralBeatHz = min(max(hz, 1.5), 42.0)
+            pushSynthParameters(updated, clearingPresetSelection: false)
+        case .logQuickHabitPulse(let habitID, let minutes):
+            hapticDirector.playOrbitalSnap(mass: 1.4)
+            Task {
+                _ = try? await databaseActor.logQuickHabitIncrementHelper(habitID: habitID, minutes: minutes)
+                await refreshSharedWidgetSnapshotFromDB()
+            }
+        case .triggerHarmonicBloom:
+            triggerManualHarmonicBloom(intensity: 0.90)
+        }
+    }
+
+    public func toggleBioEntrainmentClosedLoop(_ enabled: Bool) {
+        isBioEntrainmentEnabled = enabled
+        pidController.reset()
+        previousEvaluatedMetrics = nil
+        previousEvaluatedFeatures = nil
+        previousPredictionOutput = nil
+        hapticDirector.playSegmentSnap()
+
+        if enabled && !isWatchCounterpartReachable && latestBiometricSnapshot == nil {
+            isSimulateWristBiometricsEnabled = true
+        }
+        if enabled {
+            lastBioEntrainmentTickDate = .distantPast
+        }
+        syncSystemSurfaces(liveActivityActive: isTimerRunning)
+    }
+
+    public func toggleSimulateWristBiometrics(_ enabled: Bool) {
+        isSimulateWristBiometricsEnabled = enabled
+        hapticDirector.playSegmentSnap()
+        if enabled {
+            let seeded = physiologySimulator.advance(
+                dtSeconds: 12.0,
+                activeBinauralBeatHz: synthParameters.binauralBeatHz
+            )
+            latestBiometricSnapshot = seeded.snapshot
+            latestHRVMetrics = seeded.metrics
+            lastBioEntrainmentTickDate = .distantPast
+        }
+    }
+
+    private func tickClosedLoopBioEntrainment(dtSeconds: Double) async {
+        if isSimulateWristBiometricsEnabled || (isBioEntrainmentEnabled && !isWatchCounterpartReachable) {
+            let simStep = physiologySimulator.advance(
+                dtSeconds: dtSeconds,
+                activeBinauralBeatHz: synthParameters.binauralBeatHz
+            )
+            latestBiometricSnapshot = simStep.snapshot
+            latestHRVMetrics = simStep.metrics
+        }
+
+        guard isBioEntrainmentEnabled, let metrics = latestHRVMetrics else { return }
+
+        if let prevMetrics = previousEvaluatedMetrics,
+           let prevFeatures = previousEvaluatedFeatures,
+           let prevPred = previousPredictionOutput {
+            let rmssdDelta = metrics.rmssdMs - prevMetrics.rmssdMs
+            let cohDelta = metrics.rsaCoherenceScore - prevMetrics.rsaCoherenceScore
+            if rmssdDelta > 0.0 || cohDelta > 0.0 {
+                let report = await mlPredictor.updateWeightsWithObservedReward(
+                    previousFeatures: prevFeatures,
+                    predictedOutput: prevPred,
+                    observedRMSSDDelta: rmssdDelta,
+                    observedCoherenceDelta: cohDelta,
+                    learningRate: 0.025
+                )
+                onlineAdaptationEpochs = report.updatedEpochCount
+                lastOnlineHuberLoss = report.huberLoss
+            }
+        }
+
+        let featureVec = BiometricFeatureVector(
+            snapshot: latestBiometricSnapshot,
+            metrics: metrics,
+            currentBeatHz: Double(synthParameters.binauralBeatHz),
+            sessionProgressRatio: focusProgress
+        )
+
+        let prediction: BrainwavePredictionOutput
+        #if canImport(CoreML)
+        if let interop = try? await mlPredictor.predictWithCoreMLInterop(features: featureVec) {
+            prediction = interop.1
+        } else {
+            prediction = await mlPredictor.predict(features: featureVec)
+        }
+        #else
+        prediction = await mlPredictor.predict(features: featureVec)
+        #endif
+
+        latestBioEntrainmentPrediction = prediction
+        previousEvaluatedMetrics = metrics
+        previousEvaluatedFeatures = featureVec
+        previousPredictionOutput = prediction
+
+        let slewed = pidController.stepAcousticTargets(
+            currentBeatHz: synthParameters.binauralBeatHz,
+            currentCarrierHz: synthParameters.carrierFrequencyHz,
+            currentCutoffHz: synthParameters.filterCutoffHz,
+            currentPinkNoiseMix: synthParameters.pinkNoiseMix,
+            prediction: prediction,
+            dtSeconds: dtSeconds
+        )
+
+        var updated = synthParameters
+        updated.binauralBeatHz = slewed.beatHz
+        updated.carrierFrequencyHz = slewed.carrierHz
+        updated.filterCutoffHz = slewed.cutoffHz
+        updated.pinkNoiseMix = slewed.pinkNoiseMix
+        synthParameters = updated
+        activePresetName = "Bio-Entrainment Loop"
+
+        if isSynthPlaying || isTimerRunning {
+            await audioEngine.updateParameters(updated)
+        }
+        syncSystemSurfaces(liveActivityActive: isTimerRunning)
     }
 
     // MARK: - Focus Timer Controls
@@ -417,6 +870,13 @@ public final class AetherAppCoordinator {
         var next = SynthParameters(preset: preset)
         next.spatialPanOffset = synthParameters.spatialPanOffset
         next.headElevationTilt = synthParameters.headElevationTilt
+        next.hrtfAzimuthDeg = synthParameters.hrtfAzimuthDeg
+        next.hrtfElevationDeg = synthParameters.hrtfElevationDeg
+        next.hrtfDistanceMeters = synthParameters.hrtfDistanceMeters
+        next.roomPresetIndex = synthParameters.roomPresetIndex
+        next.isHRTFSpatializerEnabled = synthParameters.isHRTFSpatializerEnabled
+        next.headQuaternion = synthParameters.headQuaternion
+        next.orbitalSatellites = synthParameters.orbitalSatellites
         synthParameters = next
         hapticDirector.playSegmentSnap()
         Task {
@@ -600,17 +1060,31 @@ public final class AetherAppCoordinator {
         widgetSnap.binauralBeatHz = Double(synthParameters.binauralBeatHz)
         widgetSnap.activePresetName = activePresetName
         widgetSnap.accentHue = activeAccentHue
+        if let metrics = latestHRVMetrics {
+            widgetSnap.latestAutonomicCoherence = metrics.rsaCoherenceScore
+            widgetSnap.latestHeartRateBPM = latestBiometricSnapshot?.heartRateBPM ?? metrics.heartRateBPM
+            widgetSnap.latestRMSSDMs = metrics.rmssdMs
+        }
+        widgetSnap.isBioEntrainmentActive = isBioEntrainmentEnabled
         widgetSnap.updatedAt = .now
         SharedWidgetStateStore.write(widgetSnap)
-
-        WidgetCenter.shared.reloadAllTimelines()
-        if #available(iOS 18.0, *) {
-            ControlCenter.shared.reloadAllControls()
+        IntentNotificationBridge.reloadSystemWidgetsAndControls()
+        let syncCopy = widgetSnap
+        Task {
+            _ = try? await watchBridge.sendStateSnapshotSync(syncCopy)
         }
     }
 
     public func refreshSharedWidgetSnapshotFromDB() async {
         let habits = (try? await databaseActor.fetchActiveHabits()) ?? []
+        cachedOrbitHabits = habits
+        synthParameters.orbitalSatellites = OrbitalSatelliteBank.build(
+            from: habits,
+            rotationRadians: orbitalRotationAngle,
+            orbitalSpeedRadPerSec: hrtfOrbitalSpeedRadPerSec
+        )
+        await audioEngine.updateOrbitalSatellites(synthParameters.orbitalSatellites)
+
         let primary = habits.first(where: { $0.habitID == selectedHabitID }) ?? habits.first
 
         let calendar = Calendar.current
@@ -641,10 +1115,14 @@ public final class AetherAppCoordinator {
             binauralBeatHz: Double(synthParameters.binauralBeatHz),
             activePresetName: activePresetName,
             recentSevenDayBuckets: buckets,
+            latestAutonomicCoherence: latestHRVMetrics?.rsaCoherenceScore ?? 0.78,
+            latestHeartRateBPM: latestBiometricSnapshot?.heartRateBPM ?? latestHRVMetrics?.heartRateBPM ?? 64.0,
+            latestRMSSDMs: latestHRVMetrics?.rmssdMs ?? 52.0,
+            isBioEntrainmentActive: isBioEntrainmentEnabled,
             updatedAt: .now
         )
         SharedWidgetStateStore.write(snap)
-        WidgetCenter.shared.reloadAllTimelines()
+        IntentNotificationBridge.reloadSystemWidgetsAndControls()
     }
 }
 

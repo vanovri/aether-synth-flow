@@ -3,6 +3,9 @@ options:
   bundleIdPrefix: com.aethersynth
   deploymentTarget:
     iOS: "18.0"
+    visionOS: "2.0"
+    macOS: "15.0"
+    watchOS: "11.0"
   xcodeVersion: "16.0"
   generateEmptyDirectories: true
 
@@ -10,14 +13,13 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     SWIFT_STRICT_CONCURRENCY: complete
-    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
-    TARGETED_DEVICE_FAMILY: "1,2"
     ENABLE_USER_SCRIPT_SANDBOXING: YES
 
 targets:
   AetherSynthFlow:
     type: application
     platform: iOS
+    deploymentTarget: "18.0"
     sources:
       - path: Sources/Shared
       - path: Sources/App
@@ -28,6 +30,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aethersynth.flow
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: YES
     dependencies:
       - target: AetherSynthWidgets
@@ -36,6 +40,7 @@ targets:
   AetherSynthWidgets:
     type: app-extension
     platform: iOS
+    deploymentTarget: "18.0"
     sources:
       - path: Sources/Shared
       - path: Sources/Widgets
@@ -46,6 +51,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aethersynth.flow.widgets
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
         SKIP_INSTALL: YES
     dependencies:
       - sdk: WidgetKit.framework
@@ -53,9 +60,91 @@ targets:
       - sdk: AppIntents.framework
       - sdk: ActivityKit.framework
 
+  AetherSynthVision:
+    type: application
+    platform: visionOS
+    deploymentTarget: "2.0"
+    sources:
+      - path: Sources/Shared
+      - path: Sources/App
+      - path: Sources/VisionOS
+    info:
+      path: Config/AetherSynthVision-Info.plist
+    entitlements:
+      path: Config/AetherSynthVision.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aethersynth.flow.vision
+        XROS_DEPLOYMENT_TARGET: "2.0"
+        TARGETED_DEVICE_FAMILY: "7"
+    dependencies:
+      - sdk: SwiftUI.framework
+      - sdk: SwiftData.framework
+      - sdk: RealityKit.framework
+      - sdk: ARKit.framework
+      - sdk: CompositorServices.framework
+      - sdk: Metal.framework
+      - sdk: AVFoundation.framework
+      - sdk: Accelerate.framework
+
+  AetherSynthMac:
+    type: application
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Sources/Shared
+      - path: Sources/App
+      - path: Sources/MacOS
+    info:
+      path: Config/AetherSynthMac-Info.plist
+    entitlements:
+      path: Config/AetherSynthMac.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aethersynth.flow.mac
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        COMBINE_HIDPI_IMAGES: YES
+    dependencies:
+      - sdk: SwiftUI.framework
+      - sdk: SwiftData.framework
+      - sdk: AppKit.framework
+      - sdk: CoreAudio.framework
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: Accelerate.framework
+      - sdk: ServiceManagement.framework
+      - sdk: Metal.framework
+
+  AetherSynthWatch:
+    type: application
+    platform: watchOS
+    deploymentTarget: "11.0"
+    sources:
+      - path: Sources/Shared
+      - path: Sources/WatchOS
+    info:
+      path: Config/AetherSynthWatch-Info.plist
+    entitlements:
+      path: Config/AetherSynthWatch.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aethersynth.flow.watchkitapp
+        WATCHOS_DEPLOYMENT_TARGET: "11.0"
+        TARGETED_DEVICE_FAMILY: "4"
+        SKIP_INSTALL: YES
+    dependencies:
+      - sdk: SwiftUI.framework
+      - sdk: SwiftData.framework
+      - sdk: HealthKit.framework
+      - sdk: WatchConnectivity.framework
+      - sdk: CoreML.framework
+      - sdk: WidgetKit.framework
+      - sdk: AppIntents.framework
+
   AetherSynthTests:
     type: bundle.unit-test
     platform: iOS
+    deploymentTarget: "18.0"
     sources:
       - path: Tests/AetherSynthTests
     dependencies:
@@ -63,9 +152,27 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aethersynth.flow.tests
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
         GENERATE_INFOPLIST_FILE: YES
         BUNDLE_LOADER: "$(TEST_HOST)"
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/AetherSynthFlow.app/$(BUNDLE_EXECUTABLE_PATH)"
+
+  AetherSynthMacTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Tests/AetherSynthTests
+    dependencies:
+      - target: AetherSynthMac
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aethersynth.flow.mac.tests
+        MACOSX_DEPLOYMENT_TARGET: "15.0"
+        GENERATE_INFOPLIST_FILE: YES
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/AetherSynthMac.app/Contents/MacOS/AetherSynthMac"
 
 schemes:
   AetherSynthFlow:
@@ -81,3 +188,30 @@ schemes:
       targets:
         - name: AetherSynthTests
           parallelizable: true
+
+  AetherSynthVision:
+    build:
+      targets:
+        AetherSynthVision: all
+    run:
+      config: Debug
+
+  AetherSynthMac:
+    build:
+      targets:
+        AetherSynthMac: all
+        AetherSynthMacTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - name: AetherSynthMacTests
+          parallelizable: true
+
+  AetherSynthWatch:
+    build:
+      targets:
+        AetherSynthWatch: all
+    run:
+      config: Debug
