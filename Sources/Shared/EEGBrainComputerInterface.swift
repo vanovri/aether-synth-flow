@@ -207,7 +207,27 @@ public struct EEGBLEPacketDecoder: Sendable {
         return Data(bytes)
     }
 
-    /// Decodes 12-bit BE (9-byte or 6-byte raw), 24-bit BE (15-byte or 12-byte raw), Float32x4 (16-byte),
+    public static func encode12BitBigEndianPacket(
+        sequenceNumber: UInt16,
+        sample: EEGQuadSample
+    ) -> Data {
+        var data = encode12BitBigEndianPacket(sample: sample, sequenceNumber: sequenceNumber)
+        let checksum = data.reduce(UInt8(0), ^)
+        data.append(checksum)
+        return data
+    }
+
+    public static func encode24BitBigEndianPacket(
+        sequenceNumber: UInt16,
+        sample: EEGQuadSample
+    ) -> Data {
+        var data = encode24BitBigEndianPacket(sample: sample, sequenceNumber: sequenceNumber)
+        let checksum = data.reduce(UInt8(0), ^)
+        data.append(checksum)
+        return data
+    }
+
+    /// Decodes 12-bit BE (9/10-byte or 6-byte raw), 24-bit BE (15/16-byte or 12-byte raw), Float32x4 (16-byte),
     /// or Int16x4 (8-byte) BLE notification payloads, linearly interpolating any dropped sequence packets.
     public mutating func decodePacketWithSequenceInterpolation(_ data: Data) -> [EEGQuadSample] {
         let bytes = [UInt8](data)
@@ -219,14 +239,14 @@ public struct EEGBLEPacketDecoder: Sendable {
         let af8: Float
         let tp10: Float
 
-        if bytes.count == 9 && bytes[0] == EEGBLEPacketEncodingFormat.packed12BitBigEndian.rawValue {
+        if (bytes.count == 9 || bytes.count == 10) && bytes[0] == EEGBLEPacketEncodingFormat.packed12BitBigEndian.rawValue {
             parsedSeq = (UInt16(bytes[1]) << 8) | UInt16(bytes[2])
             let decoded = Self.unpack12BitQuadBigEndian(Array(bytes[3..<9]))
             (tp9, af7, af8, tp10) = decoded
         } else if bytes.count == 6 {
             let decoded = Self.unpack12BitQuadBigEndian(bytes)
             (tp9, af7, af8, tp10) = decoded
-        } else if bytes.count == 15 && bytes[0] == EEGBLEPacketEncodingFormat.packed24BitBigEndian.rawValue {
+        } else if (bytes.count == 15 || bytes.count == 16) && bytes[0] == EEGBLEPacketEncodingFormat.packed24BitBigEndian.rawValue {
             parsedSeq = (UInt16(bytes[1]) << 8) | UInt16(bytes[2])
             let decoded = Self.unpack24BitQuadBigEndian(Array(bytes[3..<15]))
             (tp9, af7, af8, tp10) = decoded
@@ -394,6 +414,26 @@ public struct SyntheticCorticalEEGGenerator: Sendable {
 
     public init(
         sampleRate: Double = 256.0,
+        targetAlphaHz: Double,
+        thetaGammaCouplingStrength: Float
+    ) {
+        self.init(
+            sampleRate: sampleRate,
+            thetaGammaPACStrength: thetaGammaCouplingStrength,
+            entrainedAlphaFrequencyHz: targetAlphaHz
+        )
+    }
+
+    public static func ocularBlinkDipoleWaveform(localTimeSeconds: Double) -> Float {
+        let center = 0.08
+        let width = 0.042
+        let z = (localTimeSeconds - center) / width
+        let biphasic = exp(-0.5 * z * z) - 0.22 * exp(-0.5 * pow((localTimeSeconds - (center + 0.085)) / 0.06, 2.0))
+        return Float(biphasic)
+    }
+
+    public init(
+        sampleRate: Double = 256.0,
         thalamicDriveHz: Double = 190.0,
         thetaFrequencyHz: Double = 6.0,
         gammaFrequencyHz: Double = 40.0,
@@ -445,7 +485,7 @@ public struct SyntheticCorticalEEGGenerator: Sendable {
     /// alongside the frontal EOG reference and uncontaminated cortical signal.
     public mutating func stepWithReference(
         injectBlinkAmplitude: Float = 0.0
-    ) -> (sample: EEGQuadSample, eogReference: Float, cleanCortical: Float) {
+    ) -> (sample: EEGQuadSample, eogReference: Float, cleanCortical: Float, cleanNeuroAF7: Float) {
         let dt = 1.0 / sampleRate
         let t = Double(sampleIndex) * dt
         sampleIndex += 1
@@ -497,32 +537,26 @@ public struct SyntheticCorticalEEGGenerator: Sendable {
         )
 
         // Synthetic EOG frontal corneal-retinal blink dipole (~200ms biphasic envelope)
+        if abs(injectBlinkAmplitude) > 1e-5 && manualBlinkRemainingSec <= 0.02 {
+            manualBlinkRemainingSec = 0.24
+            manualBlinkAmplitudeUV = injectBlinkAmplitude
+        }
+
         var blinkPulse: Float = 0.0
-        let effectiveBlinkAmp: Float
-        if abs(injectBlinkAmplitude) > 1e-5 {
-            effectiveBlinkAmp = injectBlinkAmplitude
-            let periodSec = 1.25
-            let localT = t.truncatingRemainder(dividingBy: periodSec)
-            let center = 0.45
-            let width = 0.055
-            let z = (localT - center) / width
-            let biphasic = exp(-0.5 * z * z) - 0.22 * exp(-0.5 * pow((localT - (center + 0.09)) / 0.07, 2.0))
-            blinkPulse = effectiveBlinkAmp * Float(biphasic)
-        } else if manualBlinkRemainingSec > 0.0 {
-            let progress = 1.0 - (manualBlinkRemainingSec / 0.28)
-            let z = (progress - 0.38) / 0.16
-            let biphasic = exp(-0.5 * z * z) - 0.22 * exp(-0.5 * pow((progress - 0.68) / 0.20, 2.0))
-            blinkPulse = manualBlinkAmplitudeUV * Float(biphasic)
+        if manualBlinkRemainingSec > 0.0 {
+            let elapsed = 0.24 - manualBlinkRemainingSec
+            blinkPulse = manualBlinkAmplitudeUV * Self.ocularBlinkDipoleWaveform(localTimeSeconds: elapsed)
             manualBlinkRemainingSec = max(0.0, manualBlinkRemainingSec - dt)
         }
 
         let leftScale = 1.0 - 0.5 * frontalAsymmetryBias
         let rightScale = 1.0 + 0.5 * frontalAsymmetryBias
+        let cleanNeuroAF7 = cleanCortical * leftScale
 
-        let tp9 = cleanCortical * 0.92 + 0.24 * blinkPulse + lineHum
-        let af7 = cleanCortical * leftScale + 0.86 * blinkPulse + lineHum
+        let tp9 = cleanCortical * leftScale + 0.14 * blinkPulse + lineHum
+        let af7 = cleanNeuroAF7 + 0.86 * blinkPulse + lineHum
         let af8 = cleanCortical * rightScale + 0.82 * blinkPulse + lineHum
-        let tp10 = cleanCortical * 0.95 + 0.22 * blinkPulse + lineHum
+        let tp10 = cleanCortical * rightScale + 0.12 * blinkPulse + lineHum
 
         let quad = EEGQuadSample(
             tp9: tp9,
@@ -531,7 +565,7 @@ public struct SyntheticCorticalEEGGenerator: Sendable {
             tp10: tp10,
             timestamp: t
         )
-        return (quad, blinkPulse, cleanCortical)
+        return (quad, blinkPulse, cleanCortical, cleanNeuroAF7)
     }
 
     public mutating func nextSample(injectBlinkAmplitude: Float = 0.0) -> EEGQuadSample {
@@ -730,6 +764,18 @@ public struct EEGArtifactFilterBank: Sendable {
 
     public init(
         sampleRate: Double = 256.0,
+        forgettingFactorLambda: Float,
+        initialInverseDelta: Double = 0.0025
+    ) {
+        self.init(
+            sampleRate: sampleRate,
+            lambda: forgettingFactorLambda,
+            initialInverseDelta: initialInverseDelta
+        )
+    }
+
+    public init(
+        sampleRate: Double = 256.0,
         lambda: Float = 0.992,
         initialInverseDelta: Double = 0.0025
     ) {
@@ -737,12 +783,12 @@ public struct EEGArtifactFilterBank: Sendable {
         self.sampleRate = fs
         self.forgettingFactorLambda = min(max(lambda, 0.90), 0.9999)
 
-        let rc = 1.0 / (2.0 * Double.pi * 0.5)
+        let rc = 1.0 / (2.0 * Double.pi * 0.15)
         let dt = 1.0 / fs
         self.dcBlockAlpha = rc / (rc + dt)
 
-        let n50 = BiquadSection.mainsNotch(notchHz: 50.0, qFactor: 35.0, sampleRate: fs)
-        let n60 = BiquadSection.mainsNotch(notchHz: 60.0, qFactor: 35.0, sampleRate: fs)
+        let n50 = BiquadSection.mainsNotch(notchHz: 50.0, qFactor: 20.0, sampleRate: fs)
+        let n60 = BiquadSection.mainsNotch(notchHz: 60.0, qFactor: 20.0, sampleRate: fs)
         self.notch50Channels = [n50, n50, n50, n50]
         self.notch60Channels = [n60, n60, n60, n60]
         self.refNotch50 = n50
@@ -925,11 +971,11 @@ public struct EEGArtifactFilterBank: Sendable {
             conditioned[ch] = notch60Channels[ch].process(n50)
         }
 
-        // Construct EOG vertical (v_AF7 + v_AF8 - temporal common mode) & horizontal (v_AF7 - v_AF8) < 12 Hz
-        let rawVert = (conditioned[1] + conditioned[2]) - 0.5 * (conditioned[0] + conditioned[3])
-        let rawHoriz = conditioned[1] - conditioned[2]
-        let vEOG = eogLowPassVertical.process(rawVert)
-        let hEOG = eogLowPassHorizontal.process(rawHoriz)
+        // Construct EOG vertical (v_AF7 + v_AF8 - (v_TP9 + v_TP10)) & horizontal ((v_AF7 - v_TP9) - (v_AF8 - v_TP10))
+        let rawVert = (conditioned[1] + conditioned[2]) - (conditioned[0] + conditioned[3])
+        let rawHoriz = (conditioned[1] - conditioned[0]) - (conditioned[2] - conditioned[3])
+        let vEOG = rawVert
+        let hEOG = rawHoriz
 
         for k in stride(from: 3, through: 1, by: -1) {
             eogVertDelay[k] = eogVertDelay[k - 1]
@@ -1173,6 +1219,29 @@ public enum CorticalSpectralAnalyzer: Sendable {
         let c = min(f1Hz, f2Hz) - 1
         guard r >= 0, c >= 0, r < res.grid.count, c < res.grid[r].count else { return 0.0 }
         return res.grid[r][c]
+    }
+
+    public static func bicoherenceAt(
+        signal: [Float],
+        sampleRate: Double = 256.0,
+        f1Hz: Int,
+        f2Hz: Int
+    ) -> Float {
+        evaluateSquaredBicoherence(
+            signal: signal,
+            f1Hz: f1Hz,
+            f2Hz: f2Hz,
+            sampleRate: sampleRate
+        )
+    }
+
+    public static func computeThetaGammaPAC(
+        signal: [Float],
+        sampleRate: Double = 256.0
+    ) -> (mi: Float, histogram: [Float]) {
+        let cleaned = signal.map { $0.isFinite ? Double($0) : 0.0 }
+        let res = computeTortThetaGammaPAC(signal: cleaned, sampleRate: max(64.0, sampleRate))
+        return (res.modulationIndex, res.histogram)
     }
 
     // MARK: - Internal Radix-2 Complex FFT & Spectral Kernels
@@ -1537,8 +1606,8 @@ public enum CorticalSpectralAnalyzer: Sendable {
 
 #if canImport(CoreBluetooth)
 public final class EEGBLEHardwareClient: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate, @unchecked Sendable {
-    public static let eegServiceUUID = CBUUID(string: "0000FE8D-0000-1000-8000-00805F9B34FB")
-    public static let quadStreamCharacteristicUUID = CBUUID(string: "273E0003-4C4D-454D-96BE-F03BAC821358")
+    public static var eegServiceUUID: CBUUID { CBUUID(string: "0000FE8D-0000-1000-8000-00805F9B34FB") }
+    public static var quadStreamCharacteristicUUID: CBUUID { CBUUID(string: "273E0003-4C4D-454D-96BE-F03BAC821358") }
 
     private let lock = NSLock()
     private var centralManager: CBCentralManager?

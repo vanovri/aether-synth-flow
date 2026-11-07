@@ -39,15 +39,13 @@ public struct RootSpatialShellView: View {
             node.isArchived == false
         },
         sort: [
-            SortDescriptor(\HabitNode.sortOrder, order: .forward),
-            SortDescriptor(\HabitNode.createdAt, order: .forward)
+            SortDescriptor(\HabitNode.sortOrder, order: .forward)
         ]
     )
     private var activeHabits: [HabitNode]
 
     @Query(
         sort: [
-            SortDescriptor(\AudioPreset.isBuiltIn, order: .reverse),
             SortDescriptor(\AudioPreset.name, order: .forward)
         ]
     )
@@ -69,6 +67,14 @@ public struct RootSpatialShellView: View {
     }
 
     public var body: some View {
+        withExportAndImportModifiers(
+            withPresentationSheets(
+                mainSpatialStack
+            )
+        )
+    }
+
+    private var mainSpatialStack: some View {
         ZStack(alignment: .bottom) {
             AetherSpatialBackdropView(
                 audioAmplitude: coordinator.liveAudioAmplitude,
@@ -160,97 +166,105 @@ public struct RootSpatialShellView: View {
                 coordinator.hapticDirector.prepareEngineIfSupported()
             }
         }
-        .sheet(isPresented: $coordinator.isHabitEditorPresented) {
-            CreateOrEditHabitSheet(
-                existingDraft: coordinator.editingHabitDraft,
-                onSave: { draft in await coordinator.saveHabitDraft(draft) },
-                onDelete: coordinator.editingHabitDraft != nil
-                    ? { id in await coordinator.removeHabit(habitID: id) }
-                    : nil
-            )
-        }
-        .sheet(isPresented: $coordinator.isSavePresetSheetPresented) {
-            SaveAudioPresetSheet(
-                currentParameters: coordinator.synthParameters,
-                onSave: { name, category in
-                    await coordinator.saveCustomAudioPreset(name: name, category: category)
+    }
+
+    private func withPresentationSheets<Content: View>(_ content: Content) -> some View {
+        content
+            .sheet(isPresented: $coordinator.isHabitEditorPresented) {
+                CreateOrEditHabitSheet(
+                    existingDraft: coordinator.editingHabitDraft,
+                    onSave: { draft in await coordinator.saveHabitDraft(draft) },
+                    onDelete: coordinator.editingHabitDraft != nil
+                        ? { id in await coordinator.removeHabit(habitID: id) }
+                        : nil
+                )
+            }
+            .sheet(isPresented: $coordinator.isSavePresetSheetPresented) {
+                SaveAudioPresetSheet(
+                    currentParameters: coordinator.synthParameters,
+                    onSave: { name, category in
+                        await coordinator.saveCustomAudioPreset(name: name, category: category)
+                    }
+                )
+            }
+            .sheet(item: $coordinator.pendingCompletedSession) { completedSession in
+                SessionSummarySheet(
+                    session: completedSession,
+                    accentHue: coordinator.activeAccentHue,
+                    onCommit: { notes in
+                        await coordinator.commitCompletedSession(completedSession, notes: notes)
+                    }
+                )
+            }
+            .sheet(isPresented: $coordinator.isMeshSyncSheetPresented) {
+                MeshSyncStatusSheetView(coordinator: coordinator)
+            }
+            .sheet(isPresented: $coordinator.isCapstoneAuditSheetPresented) {
+                CapstoneAuditRunnerSheetView(coordinator: coordinator)
+            }
+    }
+
+    private func withExportAndImportModifiers<Content: View>(_ content: Content) -> some View {
+        content
+            .fileExporter(
+                isPresented: $coordinator.isExportingWAV,
+                document: coordinator.exportWAVDocument,
+                contentType: .wav,
+                defaultFilename: coordinator.exportWAVDocument?.suggestedFilename ?? "AetherSynth-Stem.wav"
+            ) { result in
+                if case .success = result {
+                    coordinator.presentTransientBanner("RIFF/WAVE stem exported.")
                 }
-            )
-        }
-        .sheet(item: $coordinator.pendingCompletedSession) { completedSession in
-            SessionSummarySheet(
-                session: completedSession,
-                accentHue: coordinator.activeAccentHue,
-                onCommit: { notes in
-                    await coordinator.commitCompletedSession(completedSession, notes: notes)
+            }
+            .fileExporter(
+                isPresented: $coordinator.isExportingCapstoneMarkdown,
+                document: coordinator.exportCapstoneMarkdownDocument,
+                contentType: .plainText,
+                defaultFilename: "AetherSynth-Capstone-Audit-\(DayKeyFormatter.dayKey(for: .now)).md"
+            ) { result in
+                if case .success = result {
+                    coordinator.presentTransientBanner("Capstone Markdown report exported.")
                 }
-            )
-        }
-        .sheet(isPresented: $coordinator.isMeshSyncSheetPresented) {
-            MeshSyncStatusSheetView(coordinator: coordinator)
-        }
-        .sheet(isPresented: $coordinator.isCapstoneAuditSheetPresented) {
-            CapstoneAuditRunnerSheetView(coordinator: coordinator)
-        }
-        .fileExporter(
-            isPresented: $coordinator.isExportingWAV,
-            document: coordinator.exportWAVDocument,
-            contentType: .wav,
-            defaultFilename: coordinator.exportWAVDocument?.suggestedFilename ?? "AetherSynth-Stem.wav"
-        ) { result in
-            if case .success = result {
-                coordinator.presentTransientBanner("RIFF/WAVE stem exported.")
             }
-        }
-        .fileExporter(
-            isPresented: $coordinator.isExportingCapstoneMarkdown,
-            document: coordinator.exportCapstoneMarkdownDocument,
-            contentType: .plainText,
-            defaultFilename: "AetherSynth-Capstone-Audit-\(DayKeyFormatter.dayKey(for: .now)).md"
-        ) { result in
-            if case .success = result {
-                coordinator.presentTransientBanner("Capstone Markdown report exported.")
+            .fileExporter(
+                isPresented: $coordinator.isExportingCapstoneJSON,
+                document: coordinator.exportCapstoneJSONDocument,
+                contentType: .json,
+                defaultFilename: "AetherSynth-Capstone-Audit-\(DayKeyFormatter.dayKey(for: .now)).json"
+            ) { result in
+                if case .success = result {
+                    coordinator.presentTransientBanner("Capstone JSON report exported.")
+                }
             }
-        }
-        .fileExporter(
-            isPresented: $coordinator.isExportingCapstoneJSON,
-            document: coordinator.exportCapstoneJSONDocument,
-            contentType: .json,
-            defaultFilename: "AetherSynth-Capstone-Audit-\(DayKeyFormatter.dayKey(for: .now)).json"
-        ) { result in
-            if case .success = result {
-                coordinator.presentTransientBanner("Capstone JSON report exported.")
+            .fileExporter(
+                isPresented: $coordinator.isExportingJSON,
+                document: coordinator.exportJSONDocument,
+                contentType: .json,
+                defaultFilename: "AetherSynth-Archive-\(DayKeyFormatter.dayKey(for: .now))"
+            ) { result in
+                if case .success = result {
+                    coordinator.presentTransientBanner("Verified JSON archive exported.")
+                }
             }
-        }
-        .fileExporter(
-            isPresented: $coordinator.isExportingJSON,
-            document: coordinator.exportJSONDocument,
-            contentType: .json,
-            defaultFilename: "AetherSynth-Archive-\(DayKeyFormatter.dayKey(for: .now))"
-        ) { result in
-            if case .success = result {
-                coordinator.presentTransientBanner("Verified JSON archive exported.")
+            .fileExporter(
+                isPresented: $coordinator.isExportingCSV,
+                document: coordinator.exportCSVDocument,
+                contentType: .commaSeparatedText,
+                defaultFilename: "AetherSynth-Sessions-\(DayKeyFormatter.dayKey(for: .now))"
+            ) { result in
+                if case .success = result {
+                    coordinator.presentTransientBanner("CSV session ledger exported.")
+                }
             }
-        }
-        .fileExporter(
-            isPresented: $coordinator.isExportingCSV,
-            document: coordinator.exportCSVDocument,
-            contentType: .commaSeparatedText,
-            defaultFilename: "AetherSynth-Sessions-\(DayKeyFormatter.dayKey(for: .now))"
-        ) { result in
-            if case .success = result {
-                coordinator.presentTransientBanner("CSV session ledger exported.")
+            .fileImporter(
+                isPresented: $coordinator.isImportingArchive,
+                allowedContentTypes: [.json],
+                allowsMultipleSelection: false
+            ) { result in
+                if case .success(let urls) = result, let firstURL = urls.first {
+                    Task { await coordinator.importArchiveFromURL(firstURL) }
+                }
             }
-        }
-        .fileImporter(
-            isPresented: $coordinator.isImportingArchive,
-            allowedContentTypes: [.json],
-            allowsMultipleSelection: false
-        ) { result in
-            if case .success(let urls) = result, let firstURL = urls.first {
-                Task { await coordinator.importArchiveFromURL(firstURL) }
-            }
-        }
     }
 
     private var topSpatialHeaderBar: some View {

@@ -109,8 +109,29 @@ public struct FDTDCFLParameters: Sendable, Equatable {
     public let stabilityCeiling: Float
     public let wasClampedForStability: Bool
 
+    public var wasClamped: Bool { wasClampedForStability }
     public var courantLambda: Float { sqrtf(max(0.0, lambdaSq)) }
     public var stiffnessMu: Float { sqrtf(max(0.0, muSq)) }
+
+    public init(
+        waveSpeedMetersPerSec: Float,
+        stiffnessKappa: Float,
+        sigma0: Float,
+        sigma1: Float,
+        timeStepSeconds: Float,
+        gridSpacingMeters: Float,
+        spatialDimensions: Int
+    ) {
+        self.init(
+            dimension: spatialDimensions,
+            waveSpeed: waveSpeedMetersPerSec,
+            stiffnessKappa: stiffnessKappa,
+            gridSpacingMeters: gridSpacingMeters,
+            timeStepSeconds: timeStepSeconds,
+            sigma0: sigma0,
+            sigma1: sigma1
+        )
+    }
 
     public var isStable: Bool {
         let dimFactor = Float(max(1, dimension))
@@ -567,6 +588,29 @@ public struct RealtimeFDTDResonatorKernel: @unchecked Sendable {
             nonlinearGamma: 0.08
         )
     }
+
+    @inline(__always)
+    public mutating func triggerPluckedImpulse(amplitude: Float = 0.85) {
+        triggerRaisedCosinePluck(amplitude: amplitude)
+    }
+
+    @inline(__always)
+    public mutating func stepSample(
+        excitationInput: Float,
+        waveSpeed: Float = 343.0,
+        stiffnessNormalize: Float = 0.18,
+        dampingSigma0: Float = 1.8,
+        nonlinearTension: Float = 0.08
+    ) -> SIMD2<Float> {
+        let (l, r) = stepSample(
+            excitation: excitationInput,
+            waveSpeed: waveSpeed,
+            stiffnessKappa: stiffnessNormalize,
+            dampingSigma: dampingSigma0,
+            nonlinearGamma: nonlinearTension
+        )
+        return SIMD2<Float>(l, r)
+    }
 }
 
 // MARK: - 4. High-Resolution 2D Isotropic 9-Point Wave Tank with Cubic PML (> 35 dB Suppression)
@@ -578,6 +622,8 @@ public struct FDTDWaveTankGrid2D: Sendable {
         case absorbingPML = 0
         case rigidDirichlet = 1
         case rigidNeumann = 2
+
+        public static let reflectiveDirichlet: BoundaryMode = .rigidDirichlet
     }
 
     public let gridSize: Int
@@ -1034,6 +1080,10 @@ public struct FDTDWaveTankGrid2D: Sendable {
         return energy
     }
 
+    public func totalInteriorMechanicalEnergy() -> Float {
+        interiorDiscreteEnergy()
+    }
+
     /// Central-difference spatial pressure gradient `(dp/dx, dp/dy)` for Track 35 Acousto-Optic Caustics.
     @inline(__always)
     public func pressureGradient(atX x: Int, y: Int) -> SIMD2<Float> {
@@ -1076,6 +1126,10 @@ public struct FDTDWaveTankGrid3D: Sendable {
     private var pressureNext: [Float]
     private let pmlDamping: [Float]
 
+    public init(gridSize: Int, pmlThickness: Int = 4, pmlMaxSigma: Float = 0.30) {
+        self.init(size: gridSize, pmlThickness: pmlThickness, pmlMaxSigma: pmlMaxSigma)
+    }
+
     public init(size: Int = 20, pmlThickness: Int = 4, pmlMaxSigma: Float = 0.30) {
         let n = max(10, size)
         let safePML = min(max(2, pmlThickness), n / 3)
@@ -1116,14 +1170,32 @@ public struct FDTDWaveTankGrid3D: Sendable {
     }
 
     public mutating func injectCenteredGaussianPulse(sigmaCells: Float = 1.8, amplitude: Float = 1.0) {
-        let c = Float(sizeX / 2)
-        let inv2S2 = 1.0 / (2.0 * sigmaCells * sigmaCells)
+        injectGaussianPulse3D(
+            centerX: sizeX / 2,
+            centerY: sizeY / 2,
+            centerZ: sizeZ / 2,
+            sigmaCells: sigmaCells,
+            amplitude: amplitude
+        )
+    }
+
+    public mutating func injectGaussianPulse3D(
+        centerX: Int,
+        centerY: Int,
+        centerZ: Int,
+        sigmaCells: Float = 1.8,
+        amplitude: Float = 1.0
+    ) {
+        let cx = Float(centerX)
+        let cy = Float(centerY)
+        let cz = Float(centerZ)
+        let inv2S2 = 1.0 / max(0.25, 2.0 * sigmaCells * sigmaCells)
         for z in 1..<(sizeZ - 1) {
             for y in 1..<(sizeY - 1) {
                 for x in 1..<(sizeX - 1) {
-                    let dx = Float(x) - c
-                    let dy = Float(y) - c
-                    let dz = Float(z) - c
+                    let dx = Float(x) - cx
+                    let dy = Float(y) - cy
+                    let dz = Float(z) - cz
                     let val = amplitude * expf(-(dx * dx + dy * dy + dz * dz) * inv2S2)
                     let idx = (z * sizeY + y) * sizeX + x
                     pressureCurr[idx] += val

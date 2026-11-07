@@ -41,6 +41,8 @@ public struct SPWVDResult: Sendable, Equatable {
 }
 
 public enum SPWVDAnalyzer: Sendable {
+    public static let canonicalBlockSize: Int = 128
+
     public struct ComplexSample: Sendable, Equatable {
         public var real: Double
         public var imag: Double
@@ -127,6 +129,22 @@ public enum SPWVDAnalyzer: Sendable {
 
     /// Evaluates the Smoothed Pseudo Wigner-Ville Distribution `W_z[n, k]` with Gaussian time-smoothing
     /// and Hann lag-windowing, extracts the instantaneous frequency ridge in Hz, and computes Order-3 Rényi entropy.
+    public static func analyze(
+        signal: [Float],
+        sampleRate: Double = 256.0,
+        freqBins: Int = 64,
+        halfLagL: Int,
+        halfTimeM: Int
+    ) -> SPWVDResult {
+        analyze(
+            signal: signal,
+            sampleRate: sampleRate,
+            freqBins: freqBins,
+            timeSigmaSamples: Double(max(1, halfTimeM)) * 0.5,
+            maxLagSamples: halfLagL
+        )
+    }
+
     public static func analyze(
         signal: [Float],
         sampleRate: Double = 256.0,

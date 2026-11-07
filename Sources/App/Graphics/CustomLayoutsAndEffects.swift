@@ -212,7 +212,7 @@ public extension AnyTransition {
 
 // MARK: - Custom Segmented Control with .matchedGeometryEffect
 
-public struct AetherSegmentItem<ID: Hashable>: Identifiable, Sendable {
+public struct AetherSegmentItem<ID: Hashable & Sendable>: Identifiable, Sendable {
     public let id: ID
     public let title: String
     public let symbolName: String
