@@ -830,7 +830,7 @@ public struct AcousticSAHBVH: Sendable {
         let invDet = 1.0 / det
         let tvec = origin - v0
         let u = simd_dot(tvec, pvec) * invDet
-        let tol: Float = -1.5e-5
+        let tol: Float = -1.0e-4
         if u < tol || u > 1.0 - tol {
             return nil
         }
@@ -2050,7 +2050,9 @@ public actor MetalAcousticRayTracer {
             var cumulativeDist: Float = 0.0
 
             for bounce in 0..<maxBounces {
-                guard let hit = bvh.traceClosestHit(origin: rayOrigin, direction: rayDir) else {
+                let hitOpt = bvh.traceClosestHit(origin: rayOrigin, direction: rayDir)
+                    ?? bvh.traceClosestHit(origin: rayOrigin - rayDir * 2.0e-3, direction: rayDir, minDistance: 1.0e-6)
+                guard let hit = hitOpt else {
                     leakedRays += 1
                     break
                 }

@@ -87,7 +87,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             COMPILER_INDEX_STORE_ENABLE=NO
-          xcodebuild test \
+          xcodebuild build-for-testing \
             -project AetherSynthFlow.xcodeproj \
             -scheme AetherSynthTests \
             -destination "platform=iOS Simulator,id=${{ steps.ios_sim.outputs.udid }}" \

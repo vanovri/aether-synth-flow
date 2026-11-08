@@ -470,7 +470,7 @@ public actor AetherMeshSyncActor {
             lamportClock: lamportClock,
             key: sessionKey
         )
-        _ = try await remotePeer.ingestDirectEncryptedEnvelope(
+        let remoteSummary = try await remotePeer.ingestDirectEncryptedEnvelope(
             localEnvelope,
             initiatorHello: localHello,
             responderSalt: remoteHello.hkdfSalt,
@@ -486,7 +486,19 @@ public actor AetherMeshSyncActor {
             isConnected: true
         )
 
-        return try await databaseActor.importFullArchive(openedRemote, conflictPolicy: .higherRevisionWins)
+        let localSummary = try await databaseActor.importFullArchive(openedRemote, conflictPolicy: .higherRevisionWins)
+        return ArchiveImportSummary(
+            importedHabits: localSummary.importedHabits + remoteSummary.importedHabits,
+            importedPresets: localSummary.importedPresets + remoteSummary.importedPresets,
+            sessionReport: BatchIngestReport(
+                insertedSessions: localSummary.sessionReport.insertedSessions + remoteSummary.sessionReport.insertedSessions,
+                updatedSessions: localSummary.sessionReport.updatedSessions + remoteSummary.sessionReport.updatedSessions,
+                skippedSessions: localSummary.sessionReport.skippedSessions + remoteSummary.sessionReport.skippedSessions,
+                affectedTelemetryDays: localSummary.sessionReport.affectedTelemetryDays + remoteSummary.sessionReport.affectedTelemetryDays,
+                updatedHabits: localSummary.sessionReport.updatedHabits + remoteSummary.sessionReport.updatedHabits
+            ),
+            upsertedTelemetryDays: localSummary.upsertedTelemetryDays + remoteSummary.upsertedTelemetryDays
+        )
     }
 
     private func acceptDirectHandshakeAndExport(

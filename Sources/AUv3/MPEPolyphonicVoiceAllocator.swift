@@ -293,11 +293,11 @@ public final class MPEPolyphonicVoiceBank: @unchecked Sendable {
         var slot = voicesPtr[targetSlotIndex]
 
         // Capture outgoing voice into 2.5ms raised-cosine crossfade ghost if slot was sounding
-        if slot.stage != .idle && slot.envelopeLevel > 1.0e-5 {
+        if slot.stage != .idle {
             slot.ghostCarrierPhase = slot.carrierPhase
             slot.ghostModulatorPhase = slot.modulatorPhase
             slot.ghostFrequencyHz = slot.smoothFrequencyHz
-            slot.ghostAmplitude = slot.envelopeLevel * slot.velocityGain
+            slot.ghostAmplitude = max(slot.envelopeLevel, 0.02) * slot.velocityGain
             let ghostNotePan = min(max((Float(Int(slot.midiNote) - 60) / 36.0) * 0.45, -0.65), 0.65)
             let ghostAngle = (Float.pi * 0.25) * (1.0 + ghostNotePan)
             slot.ghostPanLeft = cos(ghostAngle)
@@ -330,7 +330,7 @@ public final class MPEPolyphonicVoiceBank: @unchecked Sendable {
         slot.modulatorPhase = 0.0
         slot.stereoSpreadPhaseRight = 0.08
         slot.subOctavePhase = 0.0
-        slot.envelopeLevel = 0.0
+        slot.envelopeLevel = max(attackStepPerSample, 0.02)
 
         // Inherit pre-note MPE Member Channel + Master Channel expression states immediately
         let masterExpr = channelsPtr[0]

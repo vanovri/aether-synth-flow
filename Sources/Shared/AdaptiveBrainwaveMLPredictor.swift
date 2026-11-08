@@ -603,8 +603,7 @@ public struct ScalarPIDAxisState: Codable, Sendable, Equatable {
     ) -> Double {
         let dt = max(1e-3, min(dtSeconds, 10.0))
         let error = target - current
-
-        integralAccum = min(max(integralAccum + error * dt, -integralClamp), integralClamp)
+        let maxDelta = maxSlewPerSecond * dt
 
         let rawDerivative: Double
         if let prev = previousError {
@@ -615,9 +614,20 @@ public struct ScalarPIDAxisState: Codable, Sendable, Equatable {
         previousError = error
         smoothedDerivative = 0.60 * smoothedDerivative + 0.40 * rawDerivative
 
+        // Conditional anti-windup: only integrate when proportional term is within slew saturation bounds
+        if abs(kp * error) < maxDelta {
+            integralAccum = min(max(integralAccum + error * dt, -integralClamp), integralClamp)
+        } else {
+            integralAccum *= 0.5
+        }
+
         let pidDelta = kp * error + ki * integralAccum + kd * smoothedDerivative
-        let maxDelta = maxSlewPerSecond * dt
-        let clampedDelta = min(max(pidDelta, -maxDelta), maxDelta)
+        var clampedDelta = min(max(pidDelta, -maxDelta), maxDelta)
+        if error < 0.0 {
+            clampedDelta = min(0.0, max(clampedDelta, error * 0.85))
+        } else if error > 0.0 {
+            clampedDelta = max(0.0, min(clampedDelta, error * 0.85))
+        }
 
         return min(max(current + clampedDelta, validRange.lowerBound), validRange.upperBound)
     }

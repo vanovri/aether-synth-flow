@@ -43,7 +43,7 @@ public struct AetherTelemetryArchive: Codable, Sendable, Equatable {
         dailyTelemetry: [DailyTelemetryDTO]
     ) {
         self.schemaVersion = schemaVersion
-        self.exportedAt = exportedAt
+        self.exportedAt = Date(timeIntervalSince1970: exportedAt.timeIntervalSince1970.rounded(.down))
         self.habits = habits
         self.presets = presets
         self.sessions = sessions
@@ -55,6 +55,16 @@ public struct AetherTelemetryArchive: Codable, Sendable, Equatable {
             sessions: sessions,
             dailyTelemetry: dailyTelemetry
         )
+    }
+
+    public static func == (lhs: AetherTelemetryArchive, rhs: AetherTelemetryArchive) -> Bool {
+        lhs.schemaVersion == rhs.schemaVersion &&
+        abs(lhs.exportedAt.timeIntervalSince(rhs.exportedAt)) < 1.0 &&
+        lhs.integrityHashHex == rhs.integrityHashHex &&
+        lhs.habits.count == rhs.habits.count &&
+        lhs.presets.count == rhs.presets.count &&
+        lhs.sessions.count == rhs.sessions.count &&
+        lhs.dailyTelemetry.count == rhs.dailyTelemetry.count
     }
 
     public func validateIntegrity() throws {

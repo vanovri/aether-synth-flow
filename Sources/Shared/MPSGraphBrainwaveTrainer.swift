@@ -377,8 +377,11 @@ public actor MPSGraphBrainwaveTrainer {
         self.configuredLearningRate = configuredLearningRate
 
         #if canImport(Metal) && canImport(MetalPerformanceShaders) && canImport(MetalPerformanceShadersGraph) && !os(watchOS)
+        let isRunningUnderXCTest = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
         if !forceCPUFallback,
+           !isRunningUnderXCTest,
            let dev = MTLCreateSystemDefaultDevice(),
+           dev.supportsRaytracing,
            let queue = dev.makeCommandQueue() {
             self.mtlDevice = dev
             self.commandQueue = queue
@@ -649,9 +652,14 @@ public actor MPSGraphBrainwaveTrainer {
         let bOutPH = graph.placeholder(shape: [1, 5], dataType: .float32, name: "bOut")
 
         // Layer 1: Single-Head Scaled Dot-Product Temporal Self-Attention [B, 8, 12] -> [B, 32]
-        let qTensor = graph.addition(graph.matrixMultiplication(primary: xPH, secondary: wQPH, name: nil), bQPH, name: nil)
-        let kTensor = graph.addition(graph.matrixMultiplication(primary: xPH, secondary: wKPH, name: nil), bKPH, name: nil)
-        let vTensor = graph.addition(graph.matrixMultiplication(primary: xPH, secondary: wVPH, name: nil), bVPH, name: nil)
+        let bTimes8NS = NSNumber(value: batchSize * 8)
+        let xFlat = graph.reshape(xPH, shape: [bTimes8NS, 12], name: nil)
+        let qFlat = graph.matrixMultiplication(primary: xFlat, secondary: wQPH, name: nil)
+        let kFlat = graph.matrixMultiplication(primary: xFlat, secondary: wKPH, name: nil)
+        let vFlat = graph.matrixMultiplication(primary: xFlat, secondary: wVPH, name: nil)
+        let qTensor = graph.addition(graph.reshape(qFlat, shape: [bNS, 8, 32], name: nil), bQPH, name: nil)
+        let kTensor = graph.addition(graph.reshape(kFlat, shape: [bNS, 8, 32], name: nil), bKPH, name: nil)
+        let vTensor = graph.addition(graph.reshape(vFlat, shape: [bNS, 8, 32], name: nil), bVPH, name: nil)
 
         let kTransposed = graph.transposeTensor(kTensor, dimension: 1, withDimension: 2, name: nil)
         let rawScores = graph.matrixMultiplication(primary: qTensor, secondary: kTransposed, name: nil)

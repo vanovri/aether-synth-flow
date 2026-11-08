@@ -516,21 +516,21 @@ public enum KEMARHRIRSynthesizer: Sendable {
         }
 
         var bqConcha = BiquadSection.peakingEQ(
-            frequencyHz: 4_300.0,
+            frequencyHz: 3_400.0,
             q: 2.2,
-            gainDB: 5.5,
+            gainDB: 4.0,
             sampleRate: sampleRate
         )
         var bqPinnaN1 = BiquadSection.peakingEQ(
             frequencyHz: fNotch1,
-            q: 6.5,
-            gainDB: -14.0,
+            q: 5.5,
+            gainDB: -18.5,
             sampleRate: sampleRate
         )
         var bqPinnaN2 = BiquadSection.peakingEQ(
             frequencyHz: fNotch2,
-            q: 8.0,
-            gainDB: -11.0,
+            q: 4.5,
+            gainDB: -7.0,
             sampleRate: sampleRate
         )
         var bqRearShadow = BiquadSection.highShelf(

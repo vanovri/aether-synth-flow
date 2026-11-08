@@ -83,7 +83,7 @@ public struct SynthParameters: Sendable, Equatable {
         latentGuidanceScale: Float = 2.2,
         latentTemperature: Float = 0.85,
         rayTracedAcousticsEnabled: Bool = false,
-        reverbWetMix: Float = 0.22,
+        reverbWetMix: Float = 0.0,
         reverbDecaySeconds: Float = 2.4,
         reverbDamping: Float = 0.38,
         fmModulationIndex: Float = 1.6,
@@ -149,10 +149,10 @@ public struct SynthParameters: Sendable, Equatable {
             bloomBoost: 0.0,
             spatialPanOffset: 0.0,
             headElevationTilt: 0.0,
-            neuralSoundscapeMix: 0.24,
+            neuralSoundscapeMix: 0.0,
             latentGuidanceScale: 2.2,
             latentTemperature: 0.85,
-            rayTracedAcousticsEnabled: true,
+            rayTracedAcousticsEnabled: false,
             isMuted: false
         )
     }

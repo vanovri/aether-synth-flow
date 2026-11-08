@@ -753,7 +753,7 @@ public enum AetherPersistenceSchema {
         let config: ModelConfiguration
         if inMemory {
             config = ModelConfiguration(
-                "AetherSynthStore",
+                "AetherSynthStore-\(UUID().uuidString)",
                 schema: schema,
                 isStoredInMemoryOnly: true,
                 allowsSave: true
