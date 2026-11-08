@@ -91,6 +91,12 @@ public struct FDTDWavefieldUniforms: Sendable, Equatable {
 // MARK: - 2. Courant-Friedrichs-Lewy (CFL) Von Neumann Stability Enforcer
 
 public struct FDTDCFLParameters: Sendable, Equatable {
+    /// Maximum discrete Laplacian eigenvalue `max_k(-L_hat(k*h))` for 1D 3-pt (`4`), 2D 9-pt ISO (`16/3`), and 3D 27-pt Patra-Karttunen (`92/15`).
+    public static let maxCompactEigenvalue1D: Float = 4.0
+    public static let maxCompactEigenvalue2D: Float = 16.0 / 3.0
+    public static let maxCompactEigenvalue3D: Float = 92.0 / 15.0
+    public static let safetyMarginFactor: Float = 0.96
+
     public let dimension: Int
     public let waveSpeed: Float
     public let stiffnessKappa: Float
@@ -113,6 +119,15 @@ public struct FDTDCFLParameters: Sendable, Equatable {
     public var courantLambda: Float { sqrtf(max(0.0, lambdaSq)) }
     public var stiffnessMu: Float { sqrtf(max(0.0, muSq)) }
 
+    public static func maxCompactEigenvalue(forDimension dim: Int) -> Float {
+        if dim >= 3 {
+            return maxCompactEigenvalue3D
+        } else if dim == 2 {
+            return maxCompactEigenvalue2D
+        }
+        return maxCompactEigenvalue1D
+    }
+
     public init(
         waveSpeedMetersPerSec: Float,
         stiffnessKappa: Float,
@@ -133,16 +148,19 @@ public struct FDTDCFLParameters: Sendable, Equatable {
         )
     }
 
+    /// Exact Schur-Cohn / Von Neumann stability predicate verifying both standard Courant `S <= 1/sqrt(D)`
+    /// (`lambda^2 + 4*mu^2 + v <= 1/D`) and compact stencil spectral radius (`0.25*E_max*(lambda^2 + E_max*mu^2 + 2*v) <= 1`).
     public var isStable: Bool {
         let dimFactor = Float(max(1, dimension))
-        let maxCompactEig: Float = (dimension == 3) ? (92.0 / 15.0) : ((dimension == 2) ? (16.0 / 3.0) : 4.0)
-        let compactDiscreteOK = (
-            0.25 * maxCompactEig * lambdaSq
-            + 0.25 * maxCompactEig * maxCompactEig * muSq
-            + 0.25 * maxCompactEig * viscousTerm
-        ) <= 1.0 + 1.0e-5
+        let maxCompactEig = Self.maxCompactEigenvalue(forDimension: dimension)
+        let compactTerm1 = 0.25 * maxCompactEig * lambdaSq
+        let compactTerm2 = 0.25 * maxCompactEig * maxCompactEig * muSq
+        let compactTerm3 = 0.50 * maxCompactEig * viscousTerm
+        let compactDiscreteOK = (compactTerm1 + compactTerm2 + compactTerm3) <= 1.0 + 1.0e-5
+            && (maxCompactEig * viscousTerm) <= 2.0 + 1.0e-5
         return lambdaSq >= 0.0
             && muSq >= 0.0
+            && viscousTerm >= 0.0
             && (lambdaSq + 4.0 * muSq) <= (1.0 / dimFactor - viscousTerm) + 1.0e-5
             && compactDiscreteOK
     }
@@ -164,30 +182,27 @@ public struct FDTDCFLParameters: Sendable, Equatable {
         let safeSigma0 = max(0.0, sigma0)
         let safeSigma1 = max(0.0, sigma1)
 
-        let minRequiredH = sqrtf(
-            dimF * safeC * safeC * safeDt * safeDt
-                + 2.0 * dimF * safeSigma1 * safeDt
-                + sqrtf(
-                    powf(dimF * safeC * safeC * safeDt * safeDt + 2.0 * dimF * safeSigma1 * safeDt, 2.0)
-                        + 16.0 * dimF * dimF * safeKappa * safeKappa * safeDt * safeDt
-                )
-        )
+        let baseTerm = dimF * safeC * safeC * safeDt * safeDt + 2.0 * dimF * safeSigma1 * safeDt
+        let discTerm = powf(baseTerm, 2.0) + 16.0 * dimF * dimF * safeKappa * safeKappa * safeDt * safeDt
+        let minRequiredH = sqrtf(baseTerm + sqrtf(discTerm))
         let h = max(1.0e-4, gridSpacingMeters ?? (minRequiredH * 1.12))
         let hSq = h * h
 
-        let maxViscous = 0.42 / dimF
+        let maxCompactEig = Self.maxCompactEigenvalue(forDimension: safeDim)
+        let maxViscous = min(0.42 / dimF, (2.0 / maxCompactEig) * Self.safetyMarginFactor)
         let rawViscous = 2.0 * safeSigma1 * safeDt / hSq
         let clampedViscous = min(rawViscous, maxViscous)
 
         let ceiling = (1.0 / dimF) - clampedViscous
-        let safeBudget = max(0.008, ceiling * 0.96)
+        let safeBudget = max(0.008, ceiling * Self.safetyMarginFactor)
 
-        let rawLambdaSq = (safeC * safeDt / h) * (safeC * safeDt / h)
-        let rawMuSq = (safeKappa * safeDt / hSq) * (safeKappa * safeDt / hSq)
+        let rawLambda = safeC * safeDt / h
+        let rawLambdaSq = rawLambda * rawLambda
+        let rawMu = safeKappa * safeDt / hSq
+        let rawMuSq = rawMu * rawMu
 
-        // Enforce BOTH Von Neumann `lambda^2 + 4*mu^2 <= 1/D - viscous` AND compact-stencil discrete spectral radius
-        let maxCompactEig: Float = (safeDim == 3) ? (92.0 / 15.0) : ((safeDim == 2) ? (16.0 / 3.0) : 4.0)
-        let discreteCeiling = max(0.008, (4.0 / maxCompactEig - clampedViscous) * 0.96)
+        // Enforce BOTH Von Neumann `lambda^2 + 4*mu^2 <= 1/D - viscous` AND compact-stencil `lambda^2 + E_max*mu^2 <= 4/E_max - 2*viscous`
+        let discreteCeiling = max(0.008, (4.0 / maxCompactEig - 2.0 * clampedViscous) * Self.safetyMarginFactor)
         let effectiveCeiling = min(safeBudget, discreteCeiling)
         let biharmWeight = max(4.0, maxCompactEig)
 
@@ -213,6 +228,142 @@ public struct FDTDCFLParameters: Sendable, Equatable {
         self.viscousTerm = clampedViscous
         self.stabilityCeiling = ceiling
     }
+
+    /// Returns a copy guaranteed to satisfy the CFL bound for `targetDimension` (e.g. when a 1D/2D struct is assigned to a 2D/3D tank).
+    public func clamped(toDimension targetDimension: Int) -> FDTDCFLParameters {
+        let safeTarget = min(max(targetDimension, 1), 3)
+        if safeTarget == dimension && isStable {
+            return self
+        }
+        return FDTDCFLParameters(
+            dimension: safeTarget,
+            waveSpeed: waveSpeed,
+            stiffnessKappa: stiffnessKappa,
+            gridSpacingMeters: gridSpacingMeters,
+            timeStepSeconds: timeStepSeconds,
+            sigma0: sigma0,
+            sigma1: sigma1
+        )
+    }
+
+    /// Maximum stable local `lambda^2` ceiling for a given spatial dimension after accounting for `viscousTerm` and `muSq`.
+    public func maxLocalLambdaSq(forDimension targetDimension: Int? = nil) -> Float {
+        let d = min(max(targetDimension ?? dimension, 1), 3)
+        let dimF = Float(d)
+        let eMax = Self.maxCompactEigenvalue(forDimension: d)
+        let vSafe = min(max(0.0, viscousTerm), 0.42 / dimF)
+        let stdMax = (1.0 / dimF - vSafe) * Self.safetyMarginFactor - 4.0 * muSq
+        let compactMax = (4.0 / eMax - 2.0 * vSafe) * Self.safetyMarginFactor - eMax * muSq
+        return max(0.0, min(stdMax, compactMax))
+    }
+
+    // MARK: - Von Neumann Numerical Dispersion Relation & Bandwidth Limits
+
+    /// Discrete-to-continuous phase velocity ratio `c_num / c` from the Von Neumann dispersion relation
+    /// `sin^2(omega * dt / 2) = (lambda^2 / 4) * (-L_hat(k * h))` for the 2D 9-pt ISO or 3D 27-pt Patra-Karttunen stencil.
+    public static func phaseVelocityRatio(
+        pointsPerWavelength ppw: Float,
+        courantLambda lambda: Float,
+        dimension: Int = 2,
+        propagationAngleRadians theta: Float = 0.0
+    ) -> Float {
+        let safePPW = max(2.05, ppw)
+        let safeLambda = min(max(lambda, 1.0e-4), 1.0 / sqrtf(Float(max(1, dimension))))
+        let kh = (2.0 * Float.pi) / safePPW
+
+        let negLapSymbol: Float
+        if dimension >= 3 {
+            // Evaluate along worst-case or specified angle in 3D (interpolating axial theta=0 to body-diagonal)
+            let ux = cosf(theta)
+            let uy = sinf(theta) * (1.0 / sqrtf(2.0))
+            let uz = sinf(theta) * (1.0 / sqrtf(2.0))
+            let cx = cosf(kh * ux)
+            let cy = cosf(kh * uy)
+            let cz = cosf(kh * uz)
+            let faces = 2.0 * (cx + cy + cz)
+            let edges = 4.0 * (cx * cy + cy * cz + cz * cx)
+            let corners = 8.0 * cx * cy * cz
+            let lap = (7.0 / 15.0) * faces + (1.0 / 10.0) * edges + (1.0 / 30.0) * corners - (64.0 / 15.0)
+            negLapSymbol = max(0.0, -lap)
+        } else if dimension == 2 {
+            let kxH = kh * cosf(theta)
+            let kyH = kh * sinf(theta)
+            let cx = cosf(kxH)
+            let cy = cosf(kyH)
+            let lap = (4.0 / 3.0) * (cx + cy) + (2.0 / 3.0) * cx * cy - (10.0 / 3.0)
+            negLapSymbol = max(0.0, -lap)
+        } else {
+            negLapSymbol = max(0.0, 2.0 - 2.0 * cosf(kh))
+        }
+
+        let sinArg = min(1.0, 0.5 * safeLambda * sqrtf(negLapSymbol))
+        let omegaDt = 2.0 * asinf(sinArg)
+        return omegaDt / max(1.0e-7, safeLambda * kh)
+    }
+
+    /// Worst-case directional relative phase velocity error `max_theta |c_num(ppw, theta)/c - 1|`.
+    public static func worstDirectionalDispersionError(
+        pointsPerWavelength ppw: Float,
+        courantLambda lambda: Float,
+        dimension: Int = 2
+    ) -> Float {
+        let errAxial = abs(phaseVelocityRatio(pointsPerWavelength: ppw, courantLambda: lambda, dimension: dimension, propagationAngleRadians: 0.0) - 1.0)
+        let errDiag = abs(phaseVelocityRatio(pointsPerWavelength: ppw, courantLambda: lambda, dimension: dimension, propagationAngleRadians: Float.pi * 0.25) - 1.0)
+        if dimension >= 3 {
+            let bodyAngle = acosf(1.0 / sqrtf(3.0))
+            let errBody = abs(phaseVelocityRatio(pointsPerWavelength: ppw, courantLambda: lambda, dimension: 3, propagationAngleRadians: bodyAngle) - 1.0)
+            return max(errAxial, max(errDiag, errBody))
+        }
+        return max(errAxial, errDiag)
+    }
+
+    /// Minimum points-per-wavelength `N_ppw` required to keep numerical phase velocity dispersion within `maxPhaseVelocityError` (default 2%).
+    public func minimumPointsPerWavelength(maxPhaseVelocityError tolerance: Float = 0.02) -> Float {
+        let safeTol = min(max(tolerance, 0.001), 0.15)
+        let lam = max(0.05, courantLambda)
+        var low: Float = 2.2
+        var high: Float = 64.0
+        for _ in 0..<24 {
+            let mid = 0.5 * (low + high)
+            let err = Self.worstDirectionalDispersionError(
+                pointsPerWavelength: mid,
+                courantLambda: lam,
+                dimension: dimension
+            )
+            if err <= safeTol {
+                high = mid
+            } else {
+                low = mid
+            }
+        }
+        return high
+    }
+
+    /// Maximum physical frequency `f_max = c_eff / (h * N_ppw)` before numerical phase-velocity dispersion exceeds `maxPhaseVelocityError`.
+    public func dispersionLimitedMaxFrequency(maxPhaseVelocityError tolerance: Float = 0.02) -> Float {
+        let ppw = minimumPointsPerWavelength(maxPhaseVelocityError: tolerance)
+        let effectiveWaveSpeed = courantLambda * gridSpacingMeters / max(1.0e-7, timeStepSeconds)
+        let nyquistCap = 0.45 / max(1.0e-7, timeStepSeconds)
+        return min(nyquistCap, effectiveWaveSpeed / max(1.0e-5, gridSpacingMeters * ppw))
+    }
+
+    /// Default 2% phase-velocity dispersion cutoff frequency `f_max` in Hz.
+    public var dispersionLimitedMaxFrequency: Float {
+        dispersionLimitedMaxFrequency(maxPhaseVelocityError: 0.02)
+    }
+
+    /// Recommended excitation source -3 dB bandwidth in Hz to prevent high-frequency numerical dispersion rings.
+    public var recommendedSourceBandwidth: Float {
+        dispersionLimitedMaxFrequency(maxPhaseVelocityError: 0.02)
+    }
+
+    /// Minimum spatial Gaussian standard deviation `sigma_min` (in grid cells) whose -3 dB wavenumber stays below `k_max = 2*pi / N_ppw`.
+    public func minimumGaussianSigmaCells(maxPhaseVelocityError tolerance: Float = 0.02) -> Float {
+        let ppw = minimumPointsPerWavelength(maxPhaseVelocityError: tolerance)
+        // Half-power (-3 dB) wavenumber for exp(-r^2/(2*sigma^2)) is k_3dB * h = sqrt(ln 2) / sigma <= 2*pi / ppw
+        let sigma3dB = (sqrtf(logf(2.0)) / (2.0 * Float.pi)) * ppw
+        return max(1.2, sigma3dB)
+    }
 }
 
 // MARK: - 3. Pre-Allocated Flat `UnsafeMutablePointer<Float>` Audio-Rate 24x24 SIMD4 Waveguide Mesh
@@ -223,6 +374,7 @@ private final class RawFDTDMeshArena: @unchecked Sendable {
     var pCurr: UnsafeMutablePointer<Float>
     var pPrev: UnsafeMutablePointer<Float>
     let lapCurrScratch: UnsafeMutablePointer<Float>
+    let lapPrevScratch: UnsafeMutablePointer<Float>
     let pmlDamping: UnsafeMutablePointer<Float>
     let obstacleMask: UnsafeMutablePointer<UInt8>
 
@@ -234,6 +386,7 @@ private final class RawFDTDMeshArena: @unchecked Sendable {
         self.pCurr = UnsafeMutablePointer<Float>.allocate(capacity: count)
         self.pPrev = UnsafeMutablePointer<Float>.allocate(capacity: count)
         self.lapCurrScratch = UnsafeMutablePointer<Float>.allocate(capacity: count)
+        self.lapPrevScratch = UnsafeMutablePointer<Float>.allocate(capacity: count)
         self.pmlDamping = UnsafeMutablePointer<Float>.allocate(capacity: count)
         self.obstacleMask = UnsafeMutablePointer<UInt8>.allocate(capacity: count)
 
@@ -241,14 +394,16 @@ private final class RawFDTDMeshArena: @unchecked Sendable {
         self.pCurr.initialize(repeating: 0.0, count: count)
         self.pPrev.initialize(repeating: 0.0, count: count)
         self.lapCurrScratch.initialize(repeating: 0.0, count: count)
+        self.lapPrevScratch.initialize(repeating: 0.0, count: count)
         self.obstacleMask.initialize(repeating: 0, count: count)
 
+        let safeSigmaMax = min(max(0.0, pmlSigmaMaxDt), 0.48)
         for y in 0..<gridDimension {
             let dy = min(y, gridDimension - 1 - y)
             let sy: Float
             if dy < pmlWidth {
                 let uy = Float(pmlWidth - dy) / Float(pmlWidth)
-                sy = pmlSigmaMaxDt * uy * uy * uy
+                sy = safeSigmaMax * uy * uy * uy
             } else {
                 sy = 0.0
             }
@@ -257,11 +412,11 @@ private final class RawFDTDMeshArena: @unchecked Sendable {
                 let sx: Float
                 if dx < pmlWidth {
                     let ux = Float(pmlWidth - dx) / Float(pmlWidth)
-                    sx = pmlSigmaMaxDt * ux * ux * ux
+                    sx = safeSigmaMax * ux * ux * ux
                 } else {
                     sx = 0.0
                 }
-                self.pmlDamping[y * gridDimension + x] = sx + sy
+                self.pmlDamping[y * gridDimension + x] = min(sx + sy, 0.96)
             }
         }
     }
@@ -273,6 +428,7 @@ private final class RawFDTDMeshArena: @unchecked Sendable {
         self.pCurr = UnsafeMutablePointer<Float>.allocate(capacity: count)
         self.pPrev = UnsafeMutablePointer<Float>.allocate(capacity: count)
         self.lapCurrScratch = UnsafeMutablePointer<Float>.allocate(capacity: count)
+        self.lapPrevScratch = UnsafeMutablePointer<Float>.allocate(capacity: count)
         self.pmlDamping = UnsafeMutablePointer<Float>.allocate(capacity: count)
         self.obstacleMask = UnsafeMutablePointer<UInt8>.allocate(capacity: count)
 
@@ -280,6 +436,7 @@ private final class RawFDTDMeshArena: @unchecked Sendable {
         self.pCurr.initialize(from: other.pCurr, count: count)
         self.pPrev.initialize(from: other.pPrev, count: count)
         self.lapCurrScratch.initialize(from: other.lapCurrScratch, count: count)
+        self.lapPrevScratch.initialize(from: other.lapPrevScratch, count: count)
         self.pmlDamping.initialize(from: other.pmlDamping, count: count)
         self.obstacleMask.initialize(from: other.obstacleMask, count: count)
     }
@@ -293,6 +450,8 @@ private final class RawFDTDMeshArena: @unchecked Sendable {
         pPrev.deallocate()
         lapCurrScratch.deinitialize(count: cellCount)
         lapCurrScratch.deallocate()
+        lapPrevScratch.deinitialize(count: cellCount)
+        lapPrevScratch.deallocate()
         pmlDamping.deinitialize(count: cellCount)
         pmlDamping.deallocate()
         obstacleMask.deinitialize(count: cellCount)
@@ -312,15 +471,29 @@ private final class RawFDTDMeshArena: @unchecked Sendable {
         pCurr.update(repeating: 0.0, count: cellCount)
         pPrev.update(repeating: 0.0, count: cellCount)
         lapCurrScratch.update(repeating: 0.0, count: cellCount)
+        lapPrevScratch.update(repeating: 0.0, count: cellCount)
     }
 }
 
 public struct RealtimeFDTDResonatorKernel: @unchecked Sendable {
     public static let gridDimension: Int = 24
     public static let cellCount: Int = 576
+    /// Reference audio sample rate (48 kHz) at which discrete plate modal parameters are calibrated.
+    public static let referenceSampleRate: Double = 48_000.0
+    /// One-pole DC-blocker feedback pole `R = 0.9965` (~26.7 Hz high-pass corner at 48 kHz).
+    public static let dcBlockerPole: Float = 0.9965
+    /// Output hyperbolic tangent soft-clip drive gain.
+    public static let outputSaturationDrive: Float = 2.1
+    /// Maximum input excitation magnitude before spatial force injection.
+    public static let maxExcitationAmplitude: Float = 2.5
+    /// Force injection coupling gain into the 3x3 excitation footprint.
+    public static let excitationInjectionGain: Float = 0.14
+    /// Per-cell hard pressure safety clamp for real-time audio stability.
+    public static let pressureSafetyClamp: Float = 4.0
 
     public let sampleRate: Double
     private let dt: Float
+    private let rateScale: Float
     private var arena: RawFDTDMeshArena
 
     // One-pole DC-blocking filters for stereo virtual microphone probes
@@ -328,6 +501,16 @@ public struct RealtimeFDTDResonatorKernel: @unchecked Sendable {
     private var dcBlockYLeft: Float = 0.0
     private var dcBlockXRight: Float = 0.0
     private var dcBlockYRight: Float = 0.0
+
+    // Pre-allocated 2nd-order Butterworth anti-dispersion low-pass biquad state (zero heap allocation)
+    private var excLPZ1: Float = 0.0
+    private var excLPZ2: Float = 0.0
+    private var excLPB0: Float = 1.0
+    private var excLPB1: Float = 0.0
+    private var excLPB2: Float = 0.0
+    private var excLPA1: Float = 0.0
+    private var excLPA2: Float = 0.0
+    private var cachedCutoffLambdaSq: Float = -1.0
 
     public var leftMicNormalized: SIMD2<Float> = SIMD2<Float>(0.30, 0.44)
     public var rightMicNormalized: SIMD2<Float> = SIMD2<Float>(0.70, 0.56)
@@ -342,7 +525,117 @@ public struct RealtimeFDTDResonatorKernel: @unchecked Sendable {
         let safeRate = max(8_000.0, sampleRate)
         self.sampleRate = safeRate
         self.dt = Float(1.0 / safeRate)
-        self.arena = RawFDTDMeshArena(gridDimension: Self.gridDimension)
+        self.rateScale = Float(Self.referenceSampleRate / safeRate)
+        self.arena = RawFDTDMeshArena(
+            gridDimension: Self.gridDimension,
+            pmlWidth: 3,
+            pmlSigmaMaxDt: min(0.45, 0.085 * Float(Self.referenceSampleRate / safeRate))
+        )
+    }
+
+    /// Computes CFL-guaranteed `(baseLambdaSq, maxLocalLambdaSq, muSq, viscous)` for the 24x24 9-point isotropic resonator.
+    @inline(__always)
+    public func resolveStableCoefficients(
+        waveSpeed: Float,
+        stiffnessKappa: Float,
+        dampingSigma: Float
+    ) -> (baseLambdaSq: Float, maxLocalLambdaSq: Float, muSq: Float, viscous: Float) {
+        let normSpeed = min(max((waveSpeed - 80.0) / 600.0, 0.0), 1.0)
+        let normKappa = min(max(stiffnessKappa, 0.0), 1.0)
+        let dampNorm = min(max(dampingSigma * 0.1, 0.0), 1.0)
+
+        let rawViscous: Float = (0.0025 + 0.0035 * dampNorm) * rateScale
+        let viscous: Float = min(max(0.0, rawViscous), 0.21)
+
+        let stdBudget: Float = (0.5 - viscous) * 0.95
+        let compactBudget: Float = (0.75 - 2.0 * viscous) * 0.95
+        let cflBudget: Float = max(0.015, min(stdBudget, compactBudget))
+
+        let rateScaleSq: Float = rateScale * rateScale
+        let rawMuSq: Float = (0.0008 + 0.0165 * normKappa * normKappa) * rateScaleSq
+        let muSq: Float = min(rawMuSq, cflBudget / 8.0)
+
+        let rawLambdaSq: Float = (0.055 + 0.245 * normSpeed) * rateScaleSq
+        let biharmPenalty: Float = (16.0 / 3.0) * muSq
+        let maxLocalLambdaSq: Float = max(0.01, cflBudget - biharmPenalty)
+        let baseLambdaSq: Float = min(rawLambdaSq, max(0.015, cflBudget - 6.0 * muSq))
+        return (baseLambdaSq, maxLocalLambdaSq, muSq, viscous)
+    }
+
+    /// Maximum excitation frequency `f_max` in Hz before 2D 9-point isotropic numerical dispersion exceeds `maxPhaseVelocityError`.
+    public func dispersionLimitedMaxFrequency(
+        waveSpeed: Float = 343.0,
+        stiffnessKappa: Float = 0.18,
+        dampingSigma: Float = 1.8,
+        maxPhaseVelocityError: Float = 0.02
+    ) -> Float {
+        let coeffs = resolveStableCoefficients(
+            waveSpeed: waveSpeed,
+            stiffnessKappa: stiffnessKappa,
+            dampingSigma: dampingSigma
+        )
+        let lambda = sqrtf(max(1.0e-4, coeffs.baseLambdaSq))
+        let safeTol = min(max(maxPhaseVelocityError, 0.002), 0.15)
+        var low: Float = 2.2
+        var high: Float = 32.0
+        for _ in 0..<20 {
+            let mid = 0.5 * (low + high)
+            let err = FDTDCFLParameters.worstDirectionalDispersionError(
+                pointsPerWavelength: mid,
+                courantLambda: lambda,
+                dimension: 2
+            )
+            if err <= safeTol {
+                high = mid
+            } else {
+                low = mid
+            }
+        }
+        let fs = Float(sampleRate)
+        return min(0.45 * fs, (lambda / high) * fs)
+    }
+
+    public var dispersionLimitedMaxFrequency: Float {
+        dispersionLimitedMaxFrequency(waveSpeed: 343.0)
+    }
+
+    public var recommendedSourceBandwidth: Float {
+        dispersionLimitedMaxFrequency(waveSpeed: 343.0)
+    }
+
+    @inline(__always)
+    private mutating func updateExcitationLowPassIfNeeded(baseLambdaSq: Float) {
+        guard abs(baseLambdaSq - cachedCutoffLambdaSq) > 1.0e-5 else { return }
+        cachedCutoffLambdaSq = baseLambdaSq
+        let lambda = sqrtf(max(1.0e-4, baseLambdaSq))
+        let ppw = FDTDCFLParameters.worstDirectionalDispersionError(
+            pointsPerWavelength: 6.5,
+            courantLambda: lambda,
+            dimension: 2
+        ) <= 0.025 ? 6.5 : 8.0
+        let fs = Float(sampleRate)
+        let fc = min(max((lambda / ppw) * fs, 180.0), 0.44 * fs)
+        let w0 = 2.0 * Float.pi * fc / fs
+        let cosW0 = cosf(w0)
+        let sinW0 = sinf(w0)
+        let alpha = sinW0 * 0.70710678
+        let invA0 = 1.0 / (1.0 + alpha)
+        let b1 = (1.0 - cosW0) * invA0
+        excLPB0 = 0.5 * b1
+        excLPB1 = b1
+        excLPB2 = 0.5 * b1
+        excLPA1 = -2.0 * cosW0 * invA0
+        excLPA2 = (1.0 - alpha) * invA0
+    }
+
+    @inline(__always)
+    private mutating func filterExcitationBandLimited(_ rawExcitation: Float, baseLambdaSq: Float) -> Float {
+        updateExcitationLowPassIfNeeded(baseLambdaSq: baseLambdaSq)
+        let x = min(max(rawExcitation, -Self.maxExcitationAmplitude), Self.maxExcitationAmplitude)
+        let y = excLPB0 * x + excLPZ1
+        excLPZ1 = excLPB1 * x - excLPA1 * y + excLPZ2
+        excLPZ2 = excLPB2 * x - excLPA2 * y
+        return y.isFinite ? y : 0.0
     }
 
     /// Ensures independent state if a parent `ProceduralSynthKernel` struct was copied before rendering.
@@ -358,6 +651,9 @@ public struct RealtimeFDTDResonatorKernel: @unchecked Sendable {
         dcBlockYLeft = 0.0
         dcBlockXRight = 0.0
         dcBlockYRight = 0.0
+        excLPZ1 = 0.0
+        excLPZ2 = 0.0
+        cachedCutoffLambdaSq = -1.0
     }
 
     /// Injects a raised-cosine spatial pluck directly into the pre-allocated flat `pCurr`/`pPrev` pointers (zero heap allocation).
@@ -371,7 +667,7 @@ public struct RealtimeFDTDResonatorKernel: @unchecked Sendable {
         let n = Self.gridDimension
         let cx = 2.5 + min(max(normalizedX, 0.0), 1.0) * Float(n - 6)
         let cy = 2.5 + min(max(normalizedY, 0.0), 1.0) * Float(n - 6)
-        let rMax = max(1.2, radiusCells)
+        let rMax = max(1.5, radiusCells)
         let pCurr = arena.pCurr
         let pPrev = arena.pPrev
         let obs = arena.obstacleMask
@@ -422,7 +718,53 @@ public struct RealtimeFDTDResonatorKernel: @unchecked Sendable {
         return top + fy * (bot - top)
     }
 
-    /// Real-time SIMD4 audio-rate FDTD waveguide step operating strictly on flat `UnsafeMutablePointer<Float>` grids.
+    @inline(__always)
+    private static func scalarLaplacian9PtAt(
+        _ field: UnsafePointer<Float>,
+        row: Int,
+        rowM1: Int,
+        rowP1: Int,
+        x: Int
+    ) -> Float {
+        let idx = row + x
+        let c = field[idx]
+        let ax = field[idx - 1] + field[idx + 1] + field[rowM1 + x] + field[rowP1 + x]
+        let dg = field[rowM1 + x - 1] + field[rowM1 + x + 1] + field[rowP1 + x - 1] + field[rowP1 + x + 1]
+        return (2.0 / 3.0) * ax + (1.0 / 6.0) * dg - (10.0 / 3.0) * c
+    }
+
+    @inline(__always)
+    private static func simd4Laplacian9PtAt(
+        _ field: UnsafePointer<Float>,
+        row: Int,
+        rowM1: Int,
+        rowP1: Int,
+        x: Int,
+        twoThirds: SIMD4<Float>,
+        oneSixth: SIMD4<Float>,
+        tenThirds: SIMD4<Float>
+    ) -> SIMD4<Float> {
+        let base = row + x
+        let cVec = SIMD4<Float>(field[base], field[base + 1], field[base + 2], field[base + 3])
+        let lVec = SIMD4<Float>(field[base - 1], field[base], field[base + 1], field[base + 2])
+        let rVec = SIMD4<Float>(field[base + 1], field[base + 2], field[base + 3], field[base + 4])
+        let dVec = SIMD4<Float>(field[rowM1 + x], field[rowM1 + x + 1], field[rowM1 + x + 2], field[rowM1 + x + 3])
+        let uVec = SIMD4<Float>(field[rowP1 + x], field[rowP1 + x + 1], field[rowP1 + x + 2], field[rowP1 + x + 3])
+
+        let dlVec = SIMD4<Float>(field[rowM1 + x - 1], field[rowM1 + x], field[rowM1 + x + 1], field[rowM1 + x + 2])
+        let drVec = SIMD4<Float>(field[rowM1 + x + 1], field[rowM1 + x + 2], field[rowM1 + x + 3], field[rowM1 + x + 4])
+        let ulVec = SIMD4<Float>(field[rowP1 + x - 1], field[rowP1 + x], field[rowP1 + x + 1], field[rowP1 + x + 2])
+        let urVec = SIMD4<Float>(field[rowP1 + x + 1], field[rowP1 + x + 2], field[rowP1 + x + 3], field[rowP1 + x + 4])
+
+        let axialVec: SIMD4<Float> = (lVec + rVec) + (dVec + uVec)
+        let diagVec: SIMD4<Float> = (dlVec + drVec) + (ulVec + urVec)
+        let scaledAxial: SIMD4<Float> = twoThirds * axialVec
+        let scaledDiag: SIMD4<Float> = oneSixth * diagVec
+        let scaledCenter: SIMD4<Float> = tenThirds * cVec
+        return (scaledAxial + scaledDiag) - scaledCenter
+    }
+
+    /// Real-time SIMD4 audio-rate FDTD waveguide step operating strictly on flat `UnsafeMutablePointer<Float>` grids (zero heap allocation).
     @inline(__always)
     public mutating func stepSample(
         excitation: Float,
@@ -431,30 +773,34 @@ public struct RealtimeFDTDResonatorKernel: @unchecked Sendable {
         dampingSigma: Float = 1.8,
         nonlinearGamma: Float = 0.08,
         sourceXY: SIMD2<Float> = SIMD2<Float>(0.50, 0.50),
-        micLeftXY: SIMD2<Float> = SIMD2<Float>(0.30, 0.44),
-        micRightXY: SIMD2<Float> = SIMD2<Float>(0.70, 0.56)
+        micLeftXY: SIMD2<Float>? = nil,
+        micRightXY: SIMD2<Float>? = nil
     ) -> (Float, Float) {
         let n = Self.gridDimension
         let pCurr = arena.pCurr
         let pPrev = arena.pPrev
         let pNext = arena.pNext
         let lapScratch = arena.lapCurrScratch
+        let lapPrevScratch = arena.lapPrevScratch
         let pml = arena.pmlDamping
         let obs = arena.obstacleMask
 
-        // Map physical waveSpeed [80..680 m/s] & plate stiffness [0..1] into CFL-guaranteed parameters
-        let normSpeed = min(max((waveSpeed - 80.0) / 600.0, 0.0), 1.0)
-        let normKappa = min(max(stiffnessKappa, 0.0), 1.0)
-        let viscous: Float = 0.0025 + 0.0035 * min(max(dampingSigma * 0.1, 0.0), 1.0)
-        let cflBudget: Float = (0.5 - viscous) * 0.95
-
-        let muSq: Float = 0.0008 + 0.0165 * normKappa * normKappa
-        let rawLambdaSq: Float = 0.055 + 0.245 * normSpeed
-        let baseLambdaSq: Float = min(rawLambdaSq, max(0.015, cflBudget - 6.0 * muSq))
+        let coeffs = resolveStableCoefficients(
+            waveSpeed: waveSpeed,
+            stiffnessKappa: stiffnessKappa,
+            dampingSigma: dampingSigma
+        )
+        let baseLambdaSq = coeffs.baseLambdaSq
+        let maxLocalLambda = coeffs.maxLocalLambdaSq
+        let muSq = coeffs.muSq
+        let viscous = coeffs.viscous
         let sigma0Dt: Float = max(0.2, dampingSigma) * dt
         let gammaNL: Float = min(max(nonlinearGamma, 0.0), 0.35)
 
-        // Pass 1: SIMD4-vectorized isotropic 9-point compact Laplacian L_h(p^n) over interior [1 ..< n-1]
+        let bandLimitedExcitation = filterExcitationBandLimited(excitation, baseLambdaSq: baseLambdaSq)
+        let boundedDrive = bandLimitedExcitation * Self.excitationInjectionGain
+
+        // Pass 1: SIMD4-vectorized isotropic 9-point compact Laplacian L_h(p^n) and L_h(p^{n-1}) over interior [1 ..< n-1]
         let twoThirds = SIMD4<Float>(repeating: 2.0 / 3.0)
         let oneSixth = SIMD4<Float>(repeating: 1.0 / 6.0)
         let tenThirds = SIMD4<Float>(repeating: 10.0 / 3.0)
@@ -464,124 +810,274 @@ public struct RealtimeFDTDResonatorKernel: @unchecked Sendable {
             let rowM1 = (y - 1) * n
             let rowP1 = (y + 1) * n
 
-            // Process 20 interior cells [2..21] as 5 contiguous SIMD4 vectors + border cells x=1, x=22
-            for x in [1, 22] {
-                let idx = row + x
-                if obs[idx] != 0 {
-                    lapScratch[idx] = 0.0
-                } else {
-                    let c = pCurr[idx]
-                    let ax = pCurr[idx - 1] + pCurr[idx + 1] + pCurr[rowM1 + x] + pCurr[rowP1 + x]
-                    let dg = pCurr[rowM1 + x - 1] + pCurr[rowM1 + x + 1] + pCurr[rowP1 + x - 1] + pCurr[rowP1 + x + 1]
-                    lapScratch[idx] = (2.0 / 3.0) * ax + (1.0 / 6.0) * dg - (10.0 / 3.0) * c
-                }
+            // Border columns x = 1 and x = 22 (zero array literal allocation on audio thread)
+            let idxLeft = row + 1
+            if obs[idxLeft] != 0 {
+                lapScratch[idxLeft] = 0.0
+                lapPrevScratch[idxLeft] = 0.0
+            } else {
+                lapScratch[idxLeft] = Self.scalarLaplacian9PtAt(pCurr, row: row, rowM1: rowM1, rowP1: rowP1, x: 1)
+                lapPrevScratch[idxLeft] = Self.scalarLaplacian9PtAt(pPrev, row: row, rowM1: rowM1, rowP1: rowP1, x: 1)
             }
 
+            let idxRight = row + (n - 2)
+            if obs[idxRight] != 0 {
+                lapScratch[idxRight] = 0.0
+                lapPrevScratch[idxRight] = 0.0
+            } else {
+                lapScratch[idxRight] = Self.scalarLaplacian9PtAt(pCurr, row: row, rowM1: rowM1, rowP1: rowP1, x: n - 2)
+                lapPrevScratch[idxRight] = Self.scalarLaplacian9PtAt(pPrev, row: row, rowM1: rowM1, rowP1: rowP1, x: n - 2)
+            }
+
+            // 20 interior columns [2..21] as 5 contiguous SIMD4 vectors
             var x = 2
             while x <= 18 {
                 let base = row + x
-                let cVec = SIMD4<Float>(pCurr[base], pCurr[base + 1], pCurr[base + 2], pCurr[base + 3])
-                let lVec = SIMD4<Float>(pCurr[base - 1], pCurr[base], pCurr[base + 1], pCurr[base + 2])
-                let rVec = SIMD4<Float>(pCurr[base + 1], pCurr[base + 2], pCurr[base + 3], pCurr[base + 4])
-                let dVec = SIMD4<Float>(pCurr[rowM1 + x], pCurr[rowM1 + x + 1], pCurr[rowM1 + x + 2], pCurr[rowM1 + x + 3])
-                let uVec = SIMD4<Float>(pCurr[rowP1 + x], pCurr[rowP1 + x + 1], pCurr[rowP1 + x + 2], pCurr[rowP1 + x + 3])
+                let lapCVec = Self.simd4Laplacian9PtAt(
+                    pCurr,
+                    row: row,
+                    rowM1: rowM1,
+                    rowP1: rowP1,
+                    x: x,
+                    twoThirds: twoThirds,
+                    oneSixth: oneSixth,
+                    tenThirds: tenThirds
+                )
+                let lapPVec = Self.simd4Laplacian9PtAt(
+                    pPrev,
+                    row: row,
+                    rowM1: rowM1,
+                    rowP1: rowP1,
+                    x: x,
+                    twoThirds: twoThirds,
+                    oneSixth: oneSixth,
+                    tenThirds: tenThirds
+                )
 
-                let dlVec = SIMD4<Float>(pCurr[rowM1 + x - 1], pCurr[rowM1 + x], pCurr[rowM1 + x + 1], pCurr[rowM1 + x + 2])
-                let drVec = SIMD4<Float>(pCurr[rowM1 + x + 1], pCurr[rowM1 + x + 2], pCurr[rowM1 + x + 3], pCurr[rowM1 + x + 4])
-                let ulVec = SIMD4<Float>(pCurr[rowP1 + x - 1], pCurr[rowP1 + x], pCurr[rowP1 + x + 1], pCurr[rowP1 + x + 2])
-                let urVec = SIMD4<Float>(pCurr[rowP1 + x + 1], pCurr[rowP1 + x + 2], pCurr[rowP1 + x + 3], pCurr[rowP1 + x + 4])
+                lapScratch[base] = obs[base] == 0 ? lapCVec[0] : 0.0
+                lapScratch[base + 1] = obs[base + 1] == 0 ? lapCVec[1] : 0.0
+                lapScratch[base + 2] = obs[base + 2] == 0 ? lapCVec[2] : 0.0
+                lapScratch[base + 3] = obs[base + 3] == 0 ? lapCVec[3] : 0.0
 
-                let axialVec: SIMD4<Float> = (lVec + rVec) + (dVec + uVec)
-                let diagVec: SIMD4<Float> = (dlVec + drVec) + (ulVec + urVec)
-                let scaledAxial: SIMD4<Float> = twoThirds * axialVec
-                let scaledDiag: SIMD4<Float> = oneSixth * diagVec
-                let scaledCenter: SIMD4<Float> = tenThirds * cVec
-                let lapVec: SIMD4<Float> = (scaledAxial + scaledDiag) - scaledCenter
-
-                lapScratch[base] = obs[base] == 0 ? lapVec[0] : 0.0
-                lapScratch[base + 1] = obs[base + 1] == 0 ? lapVec[1] : 0.0
-                lapScratch[base + 2] = obs[base + 2] == 0 ? lapVec[2] : 0.0
-                lapScratch[base + 3] = obs[base + 3] == 0 ? lapVec[3] : 0.0
+                lapPrevScratch[base] = obs[base] == 0 ? lapPVec[0] : 0.0
+                lapPrevScratch[base + 1] = obs[base + 1] == 0 ? lapPVec[1] : 0.0
+                lapPrevScratch[base + 2] = obs[base + 2] == 0 ? lapPVec[2] : 0.0
+                lapPrevScratch[base + 3] = obs[base + 3] == 0 ? lapPVec[3] : 0.0
                 x += 4
             }
         }
 
-        // Pass 2: SIMD4 time-marching with biharmonic L_h^2(p^n), visco-thermal damping & cubic tension modulation
-        let maxLocalLambda = max(0.01, cflBudget - 5.4 * muSq)
+        // Pass 2: Full SIMD4 time-marching with biharmonic L_h^2(p^n), visco-thermal damping & cubic tension modulation
         let srcCellX = min(max(Int((2.0 + min(max(sourceXY.x, 0.0), 1.0) * Float(n - 5)).rounded()), 2), n - 3)
         let srcCellY = min(max(Int((2.0 + min(max(sourceXY.y, 0.0), 1.0) * Float(n - 5)).rounded()), 2), n - 3)
-        let boundedDrive = min(max(excitation, -2.5), 2.5) * 0.14
+
+        let halfVec = SIMD4<Float>(repeating: 0.5)
+        let oneVec = SIMD4<Float>(repeating: 1.0)
+        let twoVec = SIMD4<Float>(repeating: 2.0)
+        let gradCapVec = SIMD4<Float>(repeating: 1.5)
+        let baseLambdaVec = SIMD4<Float>(repeating: baseLambdaSq)
+        let maxLambdaVec = SIMD4<Float>(repeating: maxLocalLambda)
+        let gammaVec = SIMD4<Float>(repeating: gammaNL)
+        let viscousVec = SIMD4<Float>(repeating: viscous)
+        let muSqVec = SIMD4<Float>(repeating: muSq)
+        let sigma0DtVec = SIMD4<Float>(repeating: sigma0Dt)
+        let minClampVec = SIMD4<Float>(repeating: -Self.pressureSafetyClamp)
+        let maxClampVec = SIMD4<Float>(repeating: Self.pressureSafetyClamp)
 
         for y in 2..<(n - 2) {
             let row = y * n
             let rowM1 = (y - 1) * n
             let rowP1 = (y + 1) * n
+            let dySrc = abs(y - srcCellY)
 
             var x = 2
             while x <= 18 {
+                let base = row + x
+                let p0Vec = SIMD4<Float>(pCurr[base], pCurr[base + 1], pCurr[base + 2], pCurr[base + 3])
+                let pOldVec = SIMD4<Float>(pPrev[base], pPrev[base + 1], pPrev[base + 2], pPrev[base + 3])
+                let lapCVec = SIMD4<Float>(lapScratch[base], lapScratch[base + 1], lapScratch[base + 2], lapScratch[base + 3])
+                let lapPVec = SIMD4<Float>(lapPrevScratch[base], lapPrevScratch[base + 1], lapPrevScratch[base + 2], lapPrevScratch[base + 3])
+
+                let biharmVec = Self.simd4Laplacian9PtAt(
+                    lapScratch,
+                    row: row,
+                    rowM1: rowM1,
+                    rowP1: rowP1,
+                    x: x,
+                    twoThirds: twoThirds,
+                    oneSixth: oneSixth,
+                    tenThirds: tenThirds
+                )
+
+                let lCurr = SIMD4<Float>(pCurr[base - 1], pCurr[base], pCurr[base + 1], pCurr[base + 2])
+                let rCurr = SIMD4<Float>(pCurr[base + 1], pCurr[base + 2], pCurr[base + 3], pCurr[base + 4])
+                let dCurr = SIMD4<Float>(pCurr[rowM1 + x], pCurr[rowM1 + x + 1], pCurr[rowM1 + x + 2], pCurr[rowM1 + x + 3])
+                let uCurr = SIMD4<Float>(pCurr[rowP1 + x], pCurr[rowP1 + x + 1], pCurr[rowP1 + x + 2], pCurr[rowP1 + x + 3])
+
+                let gxVec: SIMD4<Float> = halfVec * (rCurr - lCurr)
+                let gyVec: SIMD4<Float> = halfVec * (uCurr - dCurr)
+                let rawGradSq: SIMD4<Float> = gxVec * gxVec + gyVec * gyVec
+                let gradSqVec: SIMD4<Float> = simd_min(rawGradSq, gradCapVec)
+                let nlFactor: SIMD4<Float> = oneVec + gammaVec * gradSqVec
+                let effLambdaVec: SIMD4<Float> = simd_min(baseLambdaVec * nlFactor, maxLambdaVec)
+
+                var forceVec = SIMD4<Float>.zero
+                if dySrc <= 1 {
+                    for lane in 0..<4 {
+                        let dxSrc = abs((x + lane) - srcCellX)
+                        if dxSrc <= 1 {
+                            let weight: Float = (dxSrc == 0 && dySrc == 0) ? 1.0 : ((dxSrc + dySrc == 1) ? 0.5 : 0.25)
+                            forceVec[lane] = boundedDrive * weight
+                        }
+                    }
+                }
+
+                let pmlVec = SIMD4<Float>(pml[base], pml[base + 1], pml[base + 2], pml[base + 3])
+                let lossVec: SIMD4<Float> = sigma0DtVec + pmlVec
+                let invDenomVec: SIMD4<Float> = oneVec / (oneVec + lossVec)
+
+                let waveTerm: SIMD4<Float> = twoVec * p0Vec - (oneVec - lossVec) * pOldVec
+                let lapTerm: SIMD4<Float> = effLambdaVec * lapCVec + viscousVec * (lapCVec - lapPVec)
+                let stiffTerm: SIMD4<Float> = muSqVec * biharmVec
+                let totalNumer: SIMD4<Float> = (waveTerm + lapTerm) - stiffTerm + forceVec
+                let nextVec: SIMD4<Float> = invDenomVec * totalNumer
+                let clampedVec: SIMD4<Float> = simd_clamp(nextVec, minClampVec, maxClampVec)
+
                 for lane in 0..<4 {
-                    let cx = x + lane
-                    let idx = row + cx
+                    let idx = base + lane
                     if obs[idx] != 0 {
                         pNext[idx] = 0.0
-                        continue
+                    } else {
+                        let v = nextVec[lane]
+                        pNext[idx] = v.isFinite ? clampedVec[lane] : 0.0
                     }
-
-                    let p0 = pCurr[idx]
-                    let pOld = pPrev[idx]
-                    let lapC = lapScratch[idx]
-
-                    let axPrev = pPrev[idx - 1] + pPrev[idx + 1] + pPrev[rowM1 + cx] + pPrev[rowP1 + cx]
-                    let dgPrev = pPrev[rowM1 + cx - 1] + pPrev[rowM1 + cx + 1] + pPrev[rowP1 + cx - 1] + pPrev[rowP1 + cx + 1]
-                    let lapP = (2.0 / 3.0) * axPrev + (1.0 / 6.0) * dgPrev - (10.0 / 3.0) * pOld
-
-                    let axLap = lapScratch[idx - 1] + lapScratch[idx + 1] + lapScratch[rowM1 + cx] + lapScratch[rowP1 + cx]
-                    let dgLap = lapScratch[rowM1 + cx - 1] + lapScratch[rowM1 + cx + 1] + lapScratch[rowP1 + cx - 1] + lapScratch[rowP1 + cx + 1]
-                    let biharm = (2.0 / 3.0) * axLap + (1.0 / 6.0) * dgLap - (10.0 / 3.0) * lapC
-
-                    let gx = 0.5 * (pCurr[idx + 1] - pCurr[idx - 1])
-                    let gy = 0.5 * (pCurr[rowP1 + cx] - pCurr[rowM1 + cx])
-                    let gradSq = min(gx * gx + gy * gy, 1.5)
-                    let effLambdaSq = min(baseLambdaSq * (1.0 + gammaNL * gradSq), maxLocalLambda)
-
-                    var force: Float = 0.0
-                    let dxSrc = abs(cx - srcCellX)
-                    let dySrc = abs(y - srcCellY)
-                    if dxSrc <= 1 && dySrc <= 1 {
-                        let weight: Float = (dxSrc == 0 && dySrc == 0) ? 1.0 : ((dxSrc + dySrc == 1) ? 0.5 : 0.25)
-                        force = boundedDrive * weight
-                    }
-
-                    let loss = sigma0Dt + pml[idx]
-                    let invDenom = 1.0 / (1.0 + loss)
-                    let nextVal = invDenom * (
-                        2.0 * p0
-                        - (1.0 - loss) * pOld
-                        + effLambdaSq * lapC
-                        + viscous * (lapC - lapP)
-                        - muSq * biharm
-                        + force
-                    )
-                    pNext[idx] = nextVal.isFinite ? min(max(nextVal, -4.0), 4.0) : 0.0
                 }
                 x += 4
             }
         }
 
-        let rawL = Self.readBilinearPointer(pNext, normalizedXY: micLeftXY)
-        let rawR = Self.readBilinearPointer(pNext, normalizedXY: micRightXY)
+        let effLeftMic = micLeftXY ?? leftMicNormalized
+        let effRightMic = micRightXY ?? rightMicNormalized
+        let rawL = Self.readBilinearPointer(pNext, normalizedXY: effLeftMic)
+        let rawR = Self.readBilinearPointer(pNext, normalizedXY: effRightMic)
         arena.rotateTripleBuffers()
 
         // Zero-drift DC blocker + hyperbolic saturation
-        let yL = rawL - dcBlockXLeft + 0.9965 * dcBlockYLeft
+        let yL = rawL - dcBlockXLeft + Self.dcBlockerPole * dcBlockYLeft
         dcBlockXLeft = rawL
         dcBlockYLeft = yL
 
-        let yR = rawR - dcBlockXRight + 0.9965 * dcBlockYRight
+        let yR = rawR - dcBlockXRight + Self.dcBlockerPole * dcBlockYRight
         dcBlockXRight = rawR
         dcBlockYRight = yR
 
-        return (tanhf(yL * 2.1), tanhf(yR * 2.1))
+        return (tanhf(yL * Self.outputSaturationDrive), tanhf(yR * Self.outputSaturationDrive))
+    }
+
+    /// Scalar reference implementation of `stepSample` for numerical equivalence verification in unit tests.
+    public mutating func stepSampleScalarReference(
+        excitation: Float,
+        waveSpeed: Float = 343.0,
+        stiffnessKappa: Float = 0.18,
+        dampingSigma: Float = 1.8,
+        nonlinearGamma: Float = 0.08,
+        sourceXY: SIMD2<Float> = SIMD2<Float>(0.50, 0.50),
+        micLeftXY: SIMD2<Float>? = nil,
+        micRightXY: SIMD2<Float>? = nil
+    ) -> (Float, Float) {
+        let n = Self.gridDimension
+        let pCurr = arena.pCurr
+        let pPrev = arena.pPrev
+        let pNext = arena.pNext
+        let lapScratch = arena.lapCurrScratch
+        let pml = arena.pmlDamping
+        let obs = arena.obstacleMask
+
+        let coeffs = resolveStableCoefficients(
+            waveSpeed: waveSpeed,
+            stiffnessKappa: stiffnessKappa,
+            dampingSigma: dampingSigma
+        )
+        let baseLambdaSq = coeffs.baseLambdaSq
+        let maxLocalLambda = coeffs.maxLocalLambdaSq
+        let muSq = coeffs.muSq
+        let viscous = coeffs.viscous
+        let sigma0Dt: Float = max(0.2, dampingSigma) * dt
+        let gammaNL: Float = min(max(nonlinearGamma, 0.0), 0.35)
+
+        let bandLimitedExcitation = filterExcitationBandLimited(excitation, baseLambdaSq: baseLambdaSq)
+        let boundedDrive = bandLimitedExcitation * Self.excitationInjectionGain
+
+        for y in 1..<(n - 1) {
+            let row = y * n
+            let rowM1 = (y - 1) * n
+            let rowP1 = (y + 1) * n
+            for x in 1..<(n - 1) {
+                let idx = row + x
+                if obs[idx] != 0 {
+                    lapScratch[idx] = 0.0
+                } else {
+                    lapScratch[idx] = Self.scalarLaplacian9PtAt(pCurr, row: row, rowM1: rowM1, rowP1: rowP1, x: x)
+                }
+            }
+        }
+
+        let srcCellX = min(max(Int((2.0 + min(max(sourceXY.x, 0.0), 1.0) * Float(n - 5)).rounded()), 2), n - 3)
+        let srcCellY = min(max(Int((2.0 + min(max(sourceXY.y, 0.0), 1.0) * Float(n - 5)).rounded()), 2), n - 3)
+
+        for y in 2..<(n - 2) {
+            let row = y * n
+            let rowM1 = (y - 1) * n
+            let rowP1 = (y + 1) * n
+            for cx in 2..<(n - 2) {
+                let idx = row + cx
+                if obs[idx] != 0 {
+                    pNext[idx] = 0.0
+                    continue
+                }
+                let p0 = pCurr[idx]
+                let pOld = pPrev[idx]
+                let lapC = lapScratch[idx]
+                let lapP = Self.scalarLaplacian9PtAt(pPrev, row: row, rowM1: rowM1, rowP1: rowP1, x: cx)
+                let biharm = Self.scalarLaplacian9PtAt(lapScratch, row: row, rowM1: rowM1, rowP1: rowP1, x: cx)
+
+                let gx = 0.5 * (pCurr[idx + 1] - pCurr[idx - 1])
+                let gy = 0.5 * (pCurr[rowP1 + cx] - pCurr[rowM1 + cx])
+                let gradSq = min(gx * gx + gy * gy, 1.5)
+                let effLambdaSq = min(baseLambdaSq * (1.0 + gammaNL * gradSq), maxLocalLambda)
+
+                var force: Float = 0.0
+                let dxSrc = abs(cx - srcCellX)
+                let dySrc = abs(y - srcCellY)
+                if dxSrc <= 1 && dySrc <= 1 {
+                    let weight: Float = (dxSrc == 0 && dySrc == 0) ? 1.0 : ((dxSrc + dySrc == 1) ? 0.5 : 0.25)
+                    force = boundedDrive * weight
+                }
+
+                let loss = sigma0Dt + pml[idx]
+                let invDenom = 1.0 / (1.0 + loss)
+                let waveTerm = 2.0 * p0 - (1.0 - loss) * pOld
+                let lapTerm = effLambdaSq * lapC + viscous * (lapC - lapP)
+                let nextVal = invDenom * ((waveTerm + lapTerm) - muSq * biharm + force)
+                pNext[idx] = nextVal.isFinite ? min(max(nextVal, -Self.pressureSafetyClamp), Self.pressureSafetyClamp) : 0.0
+            }
+        }
+
+        let effLeftMic = micLeftXY ?? leftMicNormalized
+        let effRightMic = micRightXY ?? rightMicNormalized
+        let rawL = Self.readBilinearPointer(pNext, normalizedXY: effLeftMic)
+        let rawR = Self.readBilinearPointer(pNext, normalizedXY: effRightMic)
+        arena.rotateTripleBuffers()
+
+        let yL = rawL - dcBlockXLeft + Self.dcBlockerPole * dcBlockYLeft
+        dcBlockXLeft = rawL
+        dcBlockYLeft = yL
+
+        let yR = rawR - dcBlockXRight + Self.dcBlockerPole * dcBlockYRight
+        dcBlockXRight = rawR
+        dcBlockYRight = yR
+
+        return (tanhf(yL * Self.outputSaturationDrive), tanhf(yR * Self.outputSaturationDrive))
     }
 
     @inline(__always)
@@ -632,21 +1128,42 @@ public struct FDTDWaveTankGrid2D: Sendable {
         public static let reflectiveDirichlet: BoundaryMode = .rigidDirichlet
     }
 
+    public static let pressureSafetyClamp: Float = 20.0
+
     public let gridSize: Int
     public let pmlThickness: Int
     public var boundaryMode: BoundaryMode
-    public var cflParameters: FDTDCFLParameters
+    public var cflParameters: FDTDCFLParameters {
+        didSet {
+            if cflParameters.dimension != 2 || !cflParameters.isStable {
+                cflParameters = cflParameters.clamped(toDimension: 2)
+            }
+        }
+    }
     public var nonlinearGamma: Float = 0.02
+
+    public var dispersionLimitedMaxFrequency: Float {
+        cflParameters.dispersionLimitedMaxFrequency
+    }
+
+    public var recommendedSourceBandwidth: Float {
+        cflParameters.recommendedSourceBandwidth
+    }
 
     public private(set) var pressureCurr: [Float]
     public private(set) var pressurePrev: [Float]
     private var pressureNext: [Float]
     private var laplacianScratch: [Float]
+    private var laplacianPrevScratch: [Float]
 
     /// `true` marks solid interior obstacle cells (`obstacleCode != 0`).
     public private(set) var obstacleMask: [Bool]
     /// `0` = fluid, `1` = Dirichlet absorber, `2` = Neumann rigid wall, `3` = metamaterial lens.
     public private(set) var obstacleCodes: [UInt8]
+    /// Precomputed center-cell weight `10/3 - (2/3)*N_axialNeumann - (1/6)*N_diagNeumann` for branchless SIMD8 Laplacian.
+    private var stencilCenterWeight: [Float]
+    /// Precomputed `1.0` for fluid/lens cells and `0.0` for solid obstacle cells (`code == 1 || code == 2`).
+    private var fluidMaskFloat: [Float]
     /// Per-cell relative squared wave speed `(c_local / c_0)^2` for refractive acoustic lenses.
     public private(set) var relativeSpeedSq: [Float]
     /// Precomputed cubic PML sponge profile `sigma_max * (d / L_pml)^3`.
@@ -662,10 +1179,11 @@ public struct FDTDWaveTankGrid2D: Sendable {
     ) {
         let n = max(32, gridSize)
         let safePML = min(max(4, pmlThickness), n / 3)
+        let safeMaxSigma = min(max(0.0, pmlMaxSigma), 0.48)
         self.gridSize = n
         self.pmlThickness = safePML
         self.boundaryMode = boundaryMode
-        self.pmlMaxSigma = pmlMaxSigma
+        self.pmlMaxSigma = safeMaxSigma
 
         self.cflParameters = FDTDCFLParameters(
             dimension: 2,
@@ -682,8 +1200,11 @@ public struct FDTDWaveTankGrid2D: Sendable {
         self.pressurePrev = [Float](repeating: 0.0, count: total)
         self.pressureNext = [Float](repeating: 0.0, count: total)
         self.laplacianScratch = [Float](repeating: 0.0, count: total)
+        self.laplacianPrevScratch = [Float](repeating: 0.0, count: total)
         self.obstacleMask = [Bool](repeating: false, count: total)
         self.obstacleCodes = [UInt8](repeating: 0, count: total)
+        self.stencilCenterWeight = [Float](repeating: 10.0 / 3.0, count: total)
+        self.fluidMaskFloat = [Float](repeating: 1.0, count: total)
         self.relativeSpeedSq = [Float](repeating: 1.0, count: total)
 
         var profile = [Float](repeating: 0.0, count: total)
@@ -692,7 +1213,7 @@ public struct FDTDWaveTankGrid2D: Sendable {
             let sy: Float
             if distY < safePML {
                 let uy = Float(safePML - distY) / Float(safePML)
-                sy = pmlMaxSigma * (uy * uy * uy)
+                sy = safeMaxSigma * (uy * uy * uy)
             } else {
                 sy = 0.0
             }
@@ -701,21 +1222,101 @@ public struct FDTDWaveTankGrid2D: Sendable {
                 let sx: Float
                 if distX < safePML {
                     let ux = Float(safePML - distX) / Float(safePML)
-                    sx = pmlMaxSigma * (ux * ux * ux)
+                    sx = safeMaxSigma * (ux * ux * ux)
                 } else {
                     sx = 0.0
                 }
-                profile[y * n + x] = sx + sy
+                profile[y * n + x] = min(sx + sy, 0.96)
             }
         }
         self.pmlDampingProfile = profile
+    }
+
+    private mutating func rebuildObstacleStencilWeights() {
+        let n = gridSize
+        obstacleCodes.withUnsafeBufferPointer { codeBuf in
+            stencilCenterWeight.withUnsafeMutableBufferPointer { wBuf in
+                fluidMaskFloat.withUnsafeMutableBufferPointer { mBuf in
+                    guard let codes = codeBuf.baseAddress,
+                          let weights = wBuf.baseAddress,
+                          let masks = mBuf.baseAddress else { return }
+                    for i in 0..<(n * n) {
+                        let c = codes[i]
+                        masks[i] = (c == 1 || c == 2) ? 0.0 : 1.0
+                        weights[i] = (c == 1 || c == 2) ? 0.0 : (10.0 / 3.0)
+                    }
+                    for y in 1..<(n - 1) {
+                        let row = y * n
+                        let rowM1 = (y - 1) * n
+                        let rowP1 = (y + 1) * n
+                        for x in 1..<(n - 1) {
+                            let idx = row + x
+                            let c = codes[idx]
+                            if c == 1 || c == 2 {
+                                continue
+                            }
+                            var axNeumann: Int = 0
+                            if codes[idx - 1] == 2 { axNeumann += 1 }
+                            if codes[idx + 1] == 2 { axNeumann += 1 }
+                            if codes[rowM1 + x] == 2 { axNeumann += 1 }
+                            if codes[rowP1 + x] == 2 { axNeumann += 1 }
+
+                            var dgNeumann: Int = 0
+                            if codes[rowM1 + x - 1] == 2 { dgNeumann += 1 }
+                            if codes[rowM1 + x + 1] == 2 { dgNeumann += 1 }
+                            if codes[rowP1 + x - 1] == 2 { dgNeumann += 1 }
+                            if codes[rowP1 + x + 1] == 2 { dgNeumann += 1 }
+
+                            let axSub = (2.0 / 3.0) * Float(axNeumann)
+                            let dgSub = (1.0 / 6.0) * Float(dgNeumann)
+                            weights[idx] = (10.0 / 3.0) - axSub - dgSub
+                        }
+                    }
+                }
+            }
+        }
     }
 
     public mutating func syncFromGPUBuffers(curr: [Float], prev: [Float], stepsAdded: Int) {
         guard curr.count == pressureCurr.count, prev.count == pressurePrev.count else { return }
         self.pressureCurr = curr
         self.pressurePrev = prev
+        for i in 0..<obstacleMask.count where obstacleMask[i] {
+            self.pressureCurr[i] = 0.0
+            self.pressurePrev[i] = 0.0
+        }
         self.stepCounter += max(0, stepsAdded)
+    }
+
+    /// Zero-allocation GPU buffer synchronization directly into pre-allocated `[Float]` storage.
+    public mutating func syncFromGPUPointers(
+        currPtr: UnsafePointer<Float>,
+        prevPtr: UnsafePointer<Float>,
+        count: Int,
+        stepsAdded: Int
+    ) {
+        guard count == pressureCurr.count, count == pressurePrev.count else { return }
+        var localCurr = pressureCurr
+        var localPrev = pressurePrev
+        pressureCurr = []
+        pressurePrev = []
+        fluidMaskFloat.withUnsafeBufferPointer { maskBuf in
+            localCurr.withUnsafeMutableBufferPointer { cBuf in
+                localPrev.withUnsafeMutableBufferPointer { pBuf in
+                    guard let cDst = cBuf.baseAddress,
+                          let pDst = pBuf.baseAddress,
+                          let mask = maskBuf.baseAddress else { return }
+                    for i in 0..<count {
+                        let m = mask[i]
+                        cDst[i] = currPtr[i] * m
+                        pDst[i] = prevPtr[i] * m
+                    }
+                }
+            }
+        }
+        pressureCurr = localCurr
+        pressurePrev = localPrev
+        stepCounter += max(0, stepsAdded)
     }
 
     public mutating func resetField(keepObstaclesAndLenses: Bool = true) {
@@ -725,9 +1326,12 @@ public struct FDTDWaveTankGrid2D: Sendable {
             pressurePrev[i] = 0.0
             pressureNext[i] = 0.0
             laplacianScratch[i] = 0.0
+            laplacianPrevScratch[i] = 0.0
             if !keepObstaclesAndLenses {
                 obstacleMask[i] = false
                 obstacleCodes[i] = 0
+                stencilCenterWeight[i] = 10.0 / 3.0
+                fluidMaskFloat[i] = 1.0
                 relativeSpeedSq[i] = 1.0
             }
         }
@@ -741,6 +1345,7 @@ public struct FDTDWaveTankGrid2D: Sendable {
                 obstacleCodes[i] = 0
             }
         }
+        rebuildObstacleStencilWeights()
     }
 
     public mutating func clearRefractiveLenses() {
@@ -761,6 +1366,7 @@ public struct FDTDWaveTankGrid2D: Sendable {
             pressureCurr[idx] = 0.0
             pressurePrev[idx] = 0.0
         }
+        rebuildObstacleStencilWeights()
     }
 
     public mutating func paintBrushDisk(
@@ -796,6 +1402,7 @@ public struct FDTDWaveTankGrid2D: Sendable {
                 }
             }
         }
+        rebuildObstacleStencilWeights()
     }
 
     public mutating func drawWallSegment(from start: SIMD2<Int>, to end: SIMD2<Int>, thickness: Int = 1) {
@@ -810,10 +1417,18 @@ public struct FDTDWaveTankGrid2D: Sendable {
             let cy = Int((Float(start.y) + Float(end.y - start.y) * t).rounded())
             for oy in -halfT...halfT {
                 for ox in -halfT...halfT {
-                    setObstacle(x: cx + ox, y: cy + oy, isSolid: true)
+                    let gx = cx + ox
+                    let gy = cy + oy
+                    guard gx >= 0, gx < gridSize, gy >= 0, gy < gridSize else { continue }
+                    let idx = gy * gridSize + gx
+                    obstacleMask[idx] = true
+                    obstacleCodes[idx] = 2
+                    pressureCurr[idx] = 0.0
+                    pressurePrev[idx] = 0.0
                 }
             }
         }
+        rebuildObstacleStencilWeights()
     }
 
     /// Configures a Young double-slit diffraction barrier at `barrierX`.
@@ -832,9 +1447,17 @@ public struct FDTDWaveTankGrid2D: Sendable {
 
         for y in 0..<gridSize {
             let isOpen = slit1Range.contains(y) || slit2Range.contains(y)
-            setObstacle(x: bx, y: y, isSolid: !isOpen)
-            setObstacle(x: bx + 1, y: y, isSolid: !isOpen)
+            for ox in 0...1 {
+                let idx = y * gridSize + (bx + ox)
+                obstacleMask[idx] = !isOpen
+                obstacleCodes[idx] = isOpen ? 0 : 2
+                if !isOpen {
+                    pressureCurr[idx] = 0.0
+                    pressurePrev[idx] = 0.0
+                }
+            }
         }
+        rebuildObstacleStencilWeights()
     }
 
     /// Configures an interior Helmholtz acoustic cavity resonator with a narrow neck aperture facing the source.
@@ -880,14 +1503,16 @@ public struct FDTDWaveTankGrid2D: Sendable {
         }
     }
 
+    /// Injects a spatially band-limited Gaussian pulse (clamping `sigmaCells` to `minimumGaussianSigmaCells()`).
     public mutating func injectGaussianPulse(
         centerX: Int,
         centerY: Int,
         sigmaCells: Float = 2.8,
         amplitude: Float = 1.0
     ) {
-        let invTwoSigmaSq = 1.0 / max(0.25, 2.0 * sigmaCells * sigmaCells)
-        let support = max(2, Int(ceilf(sigmaCells * 3.5)))
+        let safeSigma = max(sigmaCells, cflParameters.minimumGaussianSigmaCells())
+        let invTwoSigmaSq = 1.0 / max(0.25, 2.0 * safeSigma * safeSigma)
+        let support = max(2, Int(ceilf(safeSigma * 3.5)))
         let yMin = max(1, centerY - support)
         let yMax = min(gridSize - 2, centerY + support)
         let xMin = max(1, centerX - support)
@@ -906,24 +1531,367 @@ public struct FDTDWaveTankGrid2D: Sendable {
         }
     }
 
+    /// Injects a spatially smoothed 3x3 isotropic point drive so high-wavenumber `(pi, pi)` grid modes are suppressed.
     public mutating func injectPointDrive(x: Int, y: Int, pressureDelta: Float) {
         guard x > 1, x < gridSize - 2, y > 1, y < gridSize - 2 else { return }
         let idx = y * gridSize + x
         guard !obstacleMask[idx] else { return }
-        pressureCurr[idx] += pressureDelta
+        pressureCurr[idx] += pressureDelta * 0.50
+        let axialOffsets = [-1, 1, -gridSize, gridSize]
+        for off in axialOffsets {
+            let nb = idx + off
+            if !obstacleMask[nb] {
+                pressureCurr[nb] += pressureDelta * 0.10
+            }
+        }
+        let diagOffsets = [-gridSize - 1, -gridSize + 1, gridSize - 1, gridSize + 1]
+        for off in diagOffsets {
+            let nb = idx + off
+            if !obstacleMask[nb] {
+                pressureCurr[nb] += pressureDelta * 0.025
+            }
+        }
     }
 
-    /// Advances the 2D isotropic 9-point compact FDTD solver by one step.
+    @inline(__always)
+    private static func loadSIMD8(_ ptr: UnsafePointer<Float>, _ base: Int) -> SIMD8<Float> {
+        SIMD8<Float>(
+            ptr[base],
+            ptr[base + 1],
+            ptr[base + 2],
+            ptr[base + 3],
+            ptr[base + 4],
+            ptr[base + 5],
+            ptr[base + 6],
+            ptr[base + 7]
+        )
+    }
+
+    /// Advances the 2D isotropic 9-point compact FDTD solver by one step using `SIMD8<Float>` interior vectorization
+    /// and zero-CoW `withUnsafeMutableBufferPointer` buffer exchange.
     public mutating func step() {
         let n = gridSize
-        let baseLambdaSq = cflParameters.lambdaSq
-        let muSq = cflParameters.muSq
-        let viscous = cflParameters.viscousTerm
-        let baseSigma0Dt = cflParameters.sigma0 * cflParameters.timeStepSeconds
-        let cflBudget = max(0.01, (0.5 - viscous) * 0.96)
+        let safeCFL = (cflParameters.dimension == 2 && cflParameters.isStable)
+            ? cflParameters
+            : cflParameters.clamped(toDimension: 2)
+        let maxLocalLambdaSq = safeCFL.maxLocalLambdaSq(forDimension: 2)
+        let baseLambdaSq = min(safeCFL.lambdaSq, maxLocalLambdaSq)
+        let muSq = safeCFL.muSq
+        let viscous = safeCFL.viscousTerm
+        let baseSigma0Dt = safeCFL.sigma0 * safeCFL.timeStepSeconds
+        let usePML = (boundaryMode == .absorbingPML)
+        let mode = boundaryMode
+
+        // Zero-CoW local ownership swap before opening UnsafeMutableBufferPointers
+        var localCurr = pressureCurr
+        var localPrev = pressurePrev
+        var localNext = pressureNext
+        var localLapC = laplacianScratch
+        var localLapP = laplacianPrevScratch
+        pressureCurr = []
+        pressurePrev = []
+        pressureNext = []
+        laplacianScratch = []
+        laplacianPrevScratch = []
+
+        localCurr.withUnsafeBufferPointer { currBuf in
+            localPrev.withUnsafeBufferPointer { prevBuf in
+                localNext.withUnsafeMutableBufferPointer { nextBuf in
+                    localLapC.withUnsafeMutableBufferPointer { lapCBuf in
+                        localLapP.withUnsafeMutableBufferPointer { lapPBuf in
+                            stencilCenterWeight.withUnsafeBufferPointer { wBuf in
+                                fluidMaskFloat.withUnsafeBufferPointer { maskBuf in
+                                    relativeSpeedSq.withUnsafeBufferPointer { spdBuf in
+                                        pmlDampingProfile.withUnsafeBufferPointer { pmlBuf in
+                                            guard let pCurr = currBuf.baseAddress,
+                                                  let pPrev = prevBuf.baseAddress,
+                                                  let pNext = nextBuf.baseAddress,
+                                                  let lapC = lapCBuf.baseAddress,
+                                                  let lapP = lapPBuf.baseAddress,
+                                                  let wCenter = wBuf.baseAddress,
+                                                  let fluidMask = maskBuf.baseAddress,
+                                                  let relSpeed = spdBuf.baseAddress,
+                                                  let pml = pmlBuf.baseAddress else { return }
+
+                                            Self.stepSIMD8Core(
+                                                n: n,
+                                                baseLambdaSq: baseLambdaSq,
+                                                maxLocalLambdaSq: maxLocalLambdaSq,
+                                                muSq: muSq,
+                                                viscous: viscous,
+                                                baseSigma0Dt: baseSigma0Dt,
+                                                usePML: usePML,
+                                                boundaryMode: mode,
+                                                pCurr: pCurr,
+                                                pPrev: pPrev,
+                                                pNext: pNext,
+                                                lapC: lapC,
+                                                lapP: lapP,
+                                                wCenter: wCenter,
+                                                fluidMask: fluidMask,
+                                                relSpeed: relSpeed,
+                                                pml: pml
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Rotate triple buffers (prev <- curr, curr <- next, next <- prev) with zero copies
+        pressurePrev = localCurr
+        pressureCurr = localNext
+        pressureNext = localPrev
+        laplacianScratch = localLapC
+        laplacianPrevScratch = localLapP
+        stepCounter += 1
+    }
+
+    @inline(__always)
+    private static func stepSIMD8Core(
+        n: Int,
+        baseLambdaSq: Float,
+        maxLocalLambdaSq: Float,
+        muSq: Float,
+        viscous: Float,
+        baseSigma0Dt: Float,
+        usePML: Bool,
+        boundaryMode: BoundaryMode,
+        pCurr: UnsafePointer<Float>,
+        pPrev: UnsafePointer<Float>,
+        pNext: UnsafeMutablePointer<Float>,
+        lapC: UnsafeMutablePointer<Float>,
+        lapP: UnsafeMutablePointer<Float>,
+        wCenter: UnsafePointer<Float>,
+        fluidMask: UnsafePointer<Float>,
+        relSpeed: UnsafePointer<Float>,
+        pml: UnsafePointer<Float>
+    ) {
+        let twoThirds8 = SIMD8<Float>(repeating: 2.0 / 3.0)
+        let oneSixth8 = SIMD8<Float>(repeating: 1.0 / 6.0)
+        let tenThirds8 = SIMD8<Float>(repeating: 10.0 / 3.0)
+
+        // Pass 1: SIMD8-vectorized isotropic 9-point compact Laplacian L_h(p^n) and L_h(p^{n-1})
+        for y in 1..<(n - 1) {
+            let row = y * n
+            let rowM1 = (y - 1) * n
+            let rowP1 = (y + 1) * n
+
+            var x = 1
+            while x + 8 <= n - 1 {
+                let base = row + x
+                let mVec = loadSIMD8(fluidMask, base)
+                let wVec = loadSIMD8(wCenter, base)
+
+                let cVec = loadSIMD8(pCurr, base)
+                let lVec = loadSIMD8(pCurr, base - 1)
+                let rVec = loadSIMD8(pCurr, base + 1)
+                let dVec = loadSIMD8(pCurr, rowM1 + x)
+                let uVec = loadSIMD8(pCurr, rowP1 + x)
+                let dlVec = loadSIMD8(pCurr, rowM1 + x - 1)
+                let drVec = loadSIMD8(pCurr, rowM1 + x + 1)
+                let ulVec = loadSIMD8(pCurr, rowP1 + x - 1)
+                let urVec = loadSIMD8(pCurr, rowP1 + x + 1)
+
+                let axC: SIMD8<Float> = (lVec + rVec) + (dVec + uVec)
+                let dgC: SIMD8<Float> = (dlVec + drVec) + (ulVec + urVec)
+                let rawLapC: SIMD8<Float> = (twoThirds8 * axC + oneSixth8 * dgC) - (wVec * cVec)
+                let maskedLapC: SIMD8<Float> = rawLapC * mVec
+
+                let cPrev = loadSIMD8(pPrev, base)
+                let lPrev = loadSIMD8(pPrev, base - 1)
+                let rPrev = loadSIMD8(pPrev, base + 1)
+                let dPrev = loadSIMD8(pPrev, rowM1 + x)
+                let uPrev = loadSIMD8(pPrev, rowP1 + x)
+                let dlPrev = loadSIMD8(pPrev, rowM1 + x - 1)
+                let drPrev = loadSIMD8(pPrev, rowM1 + x + 1)
+                let ulPrev = loadSIMD8(pPrev, rowP1 + x - 1)
+                let urPrev = loadSIMD8(pPrev, rowP1 + x + 1)
+
+                let axP: SIMD8<Float> = (lPrev + rPrev) + (dPrev + uPrev)
+                let dgP: SIMD8<Float> = (dlPrev + drPrev) + (ulPrev + urPrev)
+                let rawLapP: SIMD8<Float> = (twoThirds8 * axP + oneSixth8 * dgP) - (wVec * cPrev)
+                let maskedLapP: SIMD8<Float> = rawLapP * mVec
+
+                for lane in 0..<8 {
+                    lapC[base + lane] = maskedLapC[lane]
+                    lapP[base + lane] = maskedLapP[lane]
+                }
+                x += 8
+            }
+
+            while x < n - 1 {
+                let idx = row + x
+                let m = fluidMask[idx]
+                if m == 0.0 {
+                    lapC[idx] = 0.0
+                    lapP[idx] = 0.0
+                } else {
+                    let w = wCenter[idx]
+                    let c = pCurr[idx]
+                    let ax = pCurr[idx - 1] + pCurr[idx + 1] + pCurr[rowM1 + x] + pCurr[rowP1 + x]
+                    let dg = pCurr[rowM1 + x - 1] + pCurr[rowM1 + x + 1] + pCurr[rowP1 + x - 1] + pCurr[rowP1 + x + 1]
+                    lapC[idx] = (2.0 / 3.0) * ax + (1.0 / 6.0) * dg - w * c
+
+                    let cP = pPrev[idx]
+                    let axP = pPrev[idx - 1] + pPrev[idx + 1] + pPrev[rowM1 + x] + pPrev[rowP1 + x]
+                    let dgP = pPrev[rowM1 + x - 1] + pPrev[rowM1 + x + 1] + pPrev[rowP1 + x - 1] + pPrev[rowP1 + x + 1]
+                    lapP[idx] = (2.0 / 3.0) * axP + (1.0 / 6.0) * dgP - w * cP
+                }
+                x += 1
+            }
+        }
+
+        // Pass 2: SIMD8 time-marching update with L_h^2 biharmonic stiffness, visco-thermal damping & cubic PML
+        let one8 = SIMD8<Float>(repeating: 1.0)
+        let two8 = SIMD8<Float>(repeating: 2.0)
+        let baseLambda8 = SIMD8<Float>(repeating: baseLambdaSq)
+        let maxLambda8 = SIMD8<Float>(repeating: maxLocalLambdaSq)
+        let viscous8 = SIMD8<Float>(repeating: viscous)
+        let muSq8 = SIMD8<Float>(repeating: muSq)
+        let sigma0Dt8 = SIMD8<Float>(repeating: baseSigma0Dt)
+        let minClamp8 = SIMD8<Float>(repeating: -pressureSafetyClamp)
+        let maxClamp8 = SIMD8<Float>(repeating: pressureSafetyClamp)
+
+        for y in 1..<(n - 1) {
+            let row = y * n
+            let rowM1 = (y - 1) * n
+            let rowP1 = (y + 1) * n
+            let canBiharmRow = (muSq > 0.0 && y >= 2 && y < n - 2)
+
+            // Border cell x = 1 handled scalar when biharmonic is active so SIMD8 loop starts at x = 2
+            var x = 1
+            if canBiharmRow {
+                let idx = row + 1
+                if fluidMask[idx] == 0.0 {
+                    pNext[idx] = 0.0
+                } else {
+                    let p0 = pCurr[idx]
+                    let pOld = pPrev[idx]
+                    let lc = lapC[idx]
+                    let lp = lapP[idx]
+                    let localLam = min(baseLambdaSq * relSpeed[idx], maxLocalLambdaSq)
+                    let pmlLoss = usePML ? pml[idx] : 0.0
+                    let totalLoss = baseSigma0Dt + pmlLoss
+                    let invDenom = 1.0 / (1.0 + totalLoss)
+                    let waveTerm = 2.0 * p0 - (1.0 - totalLoss) * pOld
+                    let updated = (waveTerm + localLam * lc + viscous * (lc - lp)) * invDenom
+                    pNext[idx] = updated.isFinite ? min(max(updated, -pressureSafetyClamp), pressureSafetyClamp) : 0.0
+                }
+                x = 2
+            }
+
+            let simdLimit = canBiharmRow ? (n - 2) : (n - 1)
+            while x + 8 <= simdLimit {
+                let base = row + x
+                let mVec = loadSIMD8(fluidMask, base)
+                let p0Vec = loadSIMD8(pCurr, base)
+                let pOldVec = loadSIMD8(pPrev, base)
+                let lcVec = loadSIMD8(lapC, base)
+                let lpVec = loadSIMD8(lapP, base)
+                let spdVec = loadSIMD8(relSpeed, base)
+
+                var biharmVec = SIMD8<Float>.zero
+                if canBiharmRow {
+                    let lLap = loadSIMD8(lapC, base - 1)
+                    let rLap = loadSIMD8(lapC, base + 1)
+                    let dLap = loadSIMD8(lapC, rowM1 + x)
+                    let uLap = loadSIMD8(lapC, rowP1 + x)
+                    let dlLap = loadSIMD8(lapC, rowM1 + x - 1)
+                    let drLap = loadSIMD8(lapC, rowM1 + x + 1)
+                    let ulLap = loadSIMD8(lapC, rowP1 + x - 1)
+                    let urLap = loadSIMD8(lapC, rowP1 + x + 1)
+                    let axL: SIMD8<Float> = (lLap + rLap) + (dLap + uLap)
+                    let dgL: SIMD8<Float> = (dlLap + drLap) + (ulLap + urLap)
+                    biharmVec = (twoThirds8 * axL + oneSixth8 * dgL) - (tenThirds8 * lcVec)
+                }
+
+                let localLamVec: SIMD8<Float> = simd_min(baseLambda8 * spdVec, maxLambda8)
+                let pmlVec: SIMD8<Float> = usePML ? loadSIMD8(pml, base) : .zero
+                let totalLossVec: SIMD8<Float> = sigma0Dt8 + pmlVec
+                let invDenomVec: SIMD8<Float> = one8 / (one8 + totalLossVec)
+
+                let waveTerm: SIMD8<Float> = two8 * p0Vec - (one8 - totalLossVec) * pOldVec
+                let lapTerm: SIMD8<Float> = localLamVec * lcVec + viscous8 * (lcVec - lpVec)
+                let rawUpdated: SIMD8<Float> = ((waveTerm + lapTerm) - (muSq8 * biharmVec)) * invDenomVec
+                let clampedVec: SIMD8<Float> = simd_clamp(rawUpdated, minClamp8, maxClamp8) * mVec
+
+                for lane in 0..<8 {
+                    let v = rawUpdated[lane]
+                    pNext[base + lane] = v.isFinite ? clampedVec[lane] : 0.0
+                }
+                x += 8
+            }
+
+            while x < n - 1 {
+                let idx = row + x
+                if fluidMask[idx] == 0.0 {
+                    pNext[idx] = 0.0
+                } else {
+                    let p0 = pCurr[idx]
+                    let pOld = pPrev[idx]
+                    let lc = lapC[idx]
+                    let lp = lapP[idx]
+
+                    var biharm: Float = 0.0
+                    if canBiharmRow && x >= 2 && x < n - 2 {
+                        let axL = lapC[idx - 1] + lapC[idx + 1] + lapC[rowM1 + x] + lapC[rowP1 + x]
+                        let dgL = lapC[rowM1 + x - 1] + lapC[rowM1 + x + 1] + lapC[rowP1 + x - 1] + lapC[rowP1 + x + 1]
+                        biharm = (2.0 / 3.0) * axL + (1.0 / 6.0) * dgL - (10.0 / 3.0) * lc
+                    }
+
+                    let localLam = min(baseLambdaSq * relSpeed[idx], maxLocalLambdaSq)
+                    let pmlLoss = usePML ? pml[idx] : 0.0
+                    let totalLoss = baseSigma0Dt + pmlLoss
+                    let invDenom = 1.0 / (1.0 + totalLoss)
+                    let waveTerm = 2.0 * p0 - (1.0 - totalLoss) * pOld
+                    let lapTerm = localLam * lc + viscous * (lc - lp)
+                    let updated = ((waveTerm + lapTerm) - muSq * biharm) * invDenom
+                    pNext[idx] = updated.isFinite ? min(max(updated, -pressureSafetyClamp), pressureSafetyClamp) : 0.0
+                }
+                x += 1
+            }
+        }
+
+        switch boundaryMode {
+        case .absorbingPML, .rigidDirichlet:
+            for i in 0..<n {
+                pNext[i] = 0.0
+                pNext[(n - 1) * n + i] = 0.0
+                pNext[i * n] = 0.0
+                pNext[i * n + (n - 1)] = 0.0
+            }
+        case .rigidNeumann:
+            for i in 1..<(n - 1) {
+                pNext[i] = pNext[n + i]
+                pNext[(n - 1) * n + i] = pNext[(n - 2) * n + i]
+                pNext[i * n] = pNext[i * n + 1]
+                pNext[i * n + (n - 1)] = pNext[i * n + (n - 2)]
+            }
+            pNext[0] = pNext[n + 1]
+            pNext[n - 1] = pNext[2 * n - 2]
+            pNext[(n - 1) * n] = pNext[(n - 2) * n + 1]
+            pNext[n * n - 1] = pNext[(n - 1) * n - 2]
+        }
+    }
+
+    /// Scalar reference implementation of `step()` for verifying SIMD8 vs scalar equivalence in unit tests.
+    public mutating func stepScalarReference() {
+        let n = gridSize
+        let safeCFL = (cflParameters.dimension == 2 && cflParameters.isStable)
+            ? cflParameters
+            : cflParameters.clamped(toDimension: 2)
+        let maxLocalLambdaSq = safeCFL.maxLocalLambdaSq(forDimension: 2)
+        let baseLambdaSq = min(safeCFL.lambdaSq, maxLocalLambdaSq)
+        let muSq = safeCFL.muSq
+        let viscous = safeCFL.viscousTerm
+        let baseSigma0Dt = safeCFL.sigma0 * safeCFL.timeStepSeconds
         let usePML = (boundaryMode == .absorbingPML)
 
-        // Pass 1: Isotropic 9-point compact Laplacian L_h(p^n)
         for y in 1..<(n - 1) {
             let row = y * n
             let rowM1 = (y - 1) * n
@@ -952,7 +1920,6 @@ public struct FDTDWaveTankGrid2D: Sendable {
             }
         }
 
-        // Pass 2: Explicit 2nd-order central-difference update with L_h^2 biharmonic stiffness & cubic PML
         for y in 1..<(n - 1) {
             let row = y * n
             let rowM1 = (y - 1) * n
@@ -992,20 +1959,15 @@ public struct FDTDWaveTankGrid2D: Sendable {
                     biharm = (2.0 / 3.0) * axL + (1.0 / 6.0) * dgL - (10.0 / 3.0) * lapC
                 }
 
-                let localLambdaSq = min(baseLambdaSq * relativeSpeedSq[idx], max(0.0, cflBudget - 4.0 * muSq))
+                let localLambdaSq = min(baseLambdaSq * relativeSpeedSq[idx], maxLocalLambdaSq)
                 let pmlLoss = usePML ? pmlDampingProfile[idx] : 0.0
                 let totalLoss = baseSigma0Dt + pmlLoss
                 let invDenom = 1.0 / (1.0 + totalLoss)
+                let waveTerm = 2.0 * p0 - (1.0 - totalLoss) * pOld
+                let lapTerm = localLambdaSq * lapC + viscous * (lapC - lapP)
+                let updated = ((waveTerm + lapTerm) - muSq * biharm) * invDenom
 
-                let updated = (
-                    2.0 * p0
-                    - (1.0 - totalLoss) * pOld
-                    + localLambdaSq * lapC
-                    + viscous * (lapC - lapP)
-                    - muSq * biharm
-                ) * invDenom
-
-                pressureNext[idx] = updated.isFinite ? min(max(updated, -20.0), 20.0) : 0.0
+                pressureNext[idx] = updated.isFinite ? min(max(updated, -Self.pressureSafetyClamp), Self.pressureSafetyClamp) : 0.0
             }
         }
 
@@ -1125,7 +2087,21 @@ public struct FDTDWaveTankGrid3D: Sendable {
     public let sizeY: Int
     public let sizeZ: Int
     public let pmlThickness: Int
-    public var cflParameters: FDTDCFLParameters
+    public var cflParameters: FDTDCFLParameters {
+        didSet {
+            if cflParameters.dimension != 3 || !cflParameters.isStable {
+                cflParameters = cflParameters.clamped(toDimension: 3)
+            }
+        }
+    }
+
+    public var dispersionLimitedMaxFrequency: Float {
+        cflParameters.dispersionLimitedMaxFrequency
+    }
+
+    public var recommendedSourceBandwidth: Float {
+        cflParameters.recommendedSourceBandwidth
+    }
 
     public private(set) var pressureCurr: [Float]
     public private(set) var pressurePrev: [Float]
@@ -1139,6 +2115,7 @@ public struct FDTDWaveTankGrid3D: Sendable {
     public init(size: Int = 20, pmlThickness: Int = 4, pmlMaxSigma: Float = 0.30) {
         let n = max(10, size)
         let safePML = min(max(2, pmlThickness), n / 3)
+        let safeMaxSigma = min(max(0.0, pmlMaxSigma), 0.32)
         self.sizeX = n
         self.sizeY = n
         self.sizeZ = n
@@ -1161,14 +2138,14 @@ public struct FDTDWaveTankGrid3D: Sendable {
         var pml = [Float](repeating: 0.0, count: total)
         for z in 0..<n {
             let dz = min(z, n - 1 - z)
-            let sz: Float = dz < safePML ? pmlMaxSigma * powf(Float(safePML - dz) / Float(safePML), 3.0) : 0.0
+            let sz: Float = dz < safePML ? safeMaxSigma * powf(Float(safePML - dz) / Float(safePML), 3.0) : 0.0
             for y in 0..<n {
                 let dy = min(y, n - 1 - y)
-                let sy: Float = dy < safePML ? pmlMaxSigma * powf(Float(safePML - dy) / Float(safePML), 3.0) : 0.0
+                let sy: Float = dy < safePML ? safeMaxSigma * powf(Float(safePML - dy) / Float(safePML), 3.0) : 0.0
                 for x in 0..<n {
                     let dx = min(x, n - 1 - x)
-                    let sx: Float = dx < safePML ? pmlMaxSigma * powf(Float(safePML - dx) / Float(safePML), 3.0) : 0.0
-                    pml[(z * n + y) * n + x] = sx + sy + sz
+                    let sx: Float = dx < safePML ? safeMaxSigma * powf(Float(safePML - dx) / Float(safePML), 3.0) : 0.0
+                    pml[(z * n + y) * n + x] = min(sx + sy + sz, 0.96)
                 }
             }
         }
@@ -1192,10 +2169,11 @@ public struct FDTDWaveTankGrid3D: Sendable {
         sigmaCells: Float = 1.8,
         amplitude: Float = 1.0
     ) {
+        let safeSigma = max(sigmaCells, cflParameters.minimumGaussianSigmaCells())
         let cx = Float(centerX)
         let cy = Float(centerY)
         let cz = Float(centerZ)
-        let inv2S2 = 1.0 / max(0.25, 2.0 * sigmaCells * sigmaCells)
+        let inv2S2 = 1.0 / max(0.25, 2.0 * safeSigma * safeSigma)
         for z in 1..<(sizeZ - 1) {
             for y in 1..<(sizeY - 1) {
                 for x in 1..<(sizeX - 1) {
@@ -1211,35 +2189,164 @@ public struct FDTDWaveTankGrid3D: Sendable {
         }
     }
 
+    @inline(__always)
+    private static func loadSIMD4(_ ptr: UnsafePointer<Float>, _ base: Int) -> SIMD4<Float> {
+        SIMD4<Float>(ptr[base], ptr[base + 1], ptr[base + 2], ptr[base + 3])
+    }
+
+    @inline(__always)
+    private static func lap27Pointer(
+        _ field: UnsafePointer<Float>,
+        nx: Int,
+        ny: Int,
+        x: Int,
+        y: Int,
+        z: Int
+    ) -> Float {
+        let idx = (z * ny + y) * nx + x
+        let c = field[idx]
+        var faces: Float = 0.0
+        var edges: Float = 0.0
+        var corners: Float = 0.0
+        for dz in -1...1 {
+            let rz = (z + dz) * ny
+            for dy in -1...1 {
+                let ryz = (rz + y + dy) * nx
+                for dx in -1...1 {
+                    let m = abs(dx) + abs(dy) + abs(dz)
+                    if m == 0 { continue }
+                    let v = field[ryz + x + dx]
+                    if m == 1 { faces += v }
+                    else if m == 2 { edges += v }
+                    else { corners += v }
+                }
+            }
+        }
+        return (7.0 / 15.0) * faces + (1.0 / 10.0) * edges + (1.0 / 30.0) * corners - (64.0 / 15.0) * c
+    }
+
+    @inline(__always)
+    private static func lap27SIMD4(
+        _ field: UnsafePointer<Float>,
+        nx: Int,
+        ny: Int,
+        x: Int,
+        y: Int,
+        z: Int
+    ) -> SIMD4<Float> {
+        let base = (z * ny + y) * nx + x
+        let cVec = loadSIMD4(field, base)
+        var faces = SIMD4<Float>.zero
+        var edges = SIMD4<Float>.zero
+        var corners = SIMD4<Float>.zero
+        for dz in -1...1 {
+            let rz = (z + dz) * ny
+            for dy in -1...1 {
+                let ryz = (rz + y + dy) * nx
+                for dx in -1...1 {
+                    let m = abs(dx) + abs(dy) + abs(dz)
+                    if m == 0 { continue }
+                    let v = loadSIMD4(field, ryz + x + dx)
+                    if m == 1 { faces += v }
+                    else if m == 2 { edges += v }
+                    else { corners += v }
+                }
+            }
+        }
+        let wFace = SIMD4<Float>(repeating: 7.0 / 15.0)
+        let wEdge = SIMD4<Float>(repeating: 1.0 / 10.0)
+        let wCorner = SIMD4<Float>(repeating: 1.0 / 30.0)
+        let wCenter = SIMD4<Float>(repeating: 64.0 / 15.0)
+        return (wFace * faces + wEdge * edges) + (wCorner * corners - wCenter * cVec)
+    }
+
     public mutating func step() {
         let nx = sizeX, ny = sizeY, nz = sizeZ
-        let lambdaSq = cflParameters.lambdaSq
-        let viscous = cflParameters.viscousTerm
-        let sigma0Dt = cflParameters.sigma0 * cflParameters.timeStepSeconds
+        let safeCFL = (cflParameters.dimension == 3 && cflParameters.isStable)
+            ? cflParameters
+            : cflParameters.clamped(toDimension: 3)
+        let lambdaSq = min(safeCFL.lambdaSq, safeCFL.maxLocalLambdaSq(forDimension: 3))
+        let viscous = safeCFL.viscousTerm
+        let sigma0Dt = safeCFL.sigma0 * safeCFL.timeStepSeconds
 
-        @inline(__always)
-        func lap27(_ field: [Float], _ x: Int, _ y: Int, _ z: Int) -> Float {
-            let idx = (z * ny + y) * nx + x
-            let c = field[idx]
-            var faces: Float = 0.0
-            var edges: Float = 0.0
-            var corners: Float = 0.0
-            for dz in -1...1 {
-                let rz = (z + dz) * ny
-                for dy in -1...1 {
-                    let ryz = (rz + y + dy) * nx
-                    for dx in -1...1 {
-                        let m = abs(dx) + abs(dy) + abs(dz)
-                        if m == 0 { continue }
-                        let v = field[ryz + x + dx]
-                        if m == 1 { faces += v }
-                        else if m == 2 { edges += v }
-                        else { corners += v }
+        var localCurr = pressureCurr
+        var localPrev = pressurePrev
+        var localNext = pressureNext
+        pressureCurr = []
+        pressurePrev = []
+        pressureNext = []
+
+        localCurr.withUnsafeBufferPointer { currBuf in
+            localPrev.withUnsafeBufferPointer { prevBuf in
+                localNext.withUnsafeMutableBufferPointer { nextBuf in
+                    pmlDamping.withUnsafeBufferPointer { pmlBuf in
+                        guard let pCurr = currBuf.baseAddress,
+                              let pPrev = prevBuf.baseAddress,
+                              let pNext = nextBuf.baseAddress,
+                              let pml = pmlBuf.baseAddress else { return }
+
+                        let one4 = SIMD4<Float>(repeating: 1.0)
+                        let two4 = SIMD4<Float>(repeating: 2.0)
+                        let lam4 = SIMD4<Float>(repeating: lambdaSq)
+                        let visc4 = SIMD4<Float>(repeating: viscous)
+                        let sig4 = SIMD4<Float>(repeating: sigma0Dt)
+                        let min4 = SIMD4<Float>(repeating: -16.0)
+                        let max4 = SIMD4<Float>(repeating: 16.0)
+
+                        for z in 1..<(nz - 1) {
+                            for y in 1..<(ny - 1) {
+                                let rowBase = (z * ny + y) * nx
+                                var x = 1
+                                while x + 4 <= nx - 1 {
+                                    let base = rowBase + x
+                                    let p0Vec = Self.loadSIMD4(pCurr, base)
+                                    let pOldVec = Self.loadSIMD4(pPrev, base)
+                                    let lcVec = Self.lap27SIMD4(pCurr, nx: nx, ny: ny, x: x, y: y, z: z)
+                                    let lpVec = viscous > 0.0
+                                        ? Self.lap27SIMD4(pPrev, nx: nx, ny: ny, x: x, y: y, z: z)
+                                        : SIMD4<Float>.zero
+                                    let lossVec: SIMD4<Float> = sig4 + Self.loadSIMD4(pml, base)
+                                    let waveTerm: SIMD4<Float> = two4 * p0Vec - (one4 - lossVec) * pOldVec
+                                    let lapTerm: SIMD4<Float> = lam4 * lcVec + visc4 * (lcVec - lpVec)
+                                    let nextVec: SIMD4<Float> = (waveTerm + lapTerm) / (one4 + lossVec)
+                                    let clampedVec: SIMD4<Float> = simd_clamp(nextVec, min4, max4)
+                                    for lane in 0..<4 {
+                                        let v = nextVec[lane]
+                                        pNext[base + lane] = v.isFinite ? clampedVec[lane] : 0.0
+                                    }
+                                    x += 4
+                                }
+                                while x < nx - 1 {
+                                    let idx = rowBase + x
+                                    let p0 = pCurr[idx]
+                                    let pOld = pPrev[idx]
+                                    let lc = Self.lap27Pointer(pCurr, nx: nx, ny: ny, x: x, y: y, z: z)
+                                    let lp = viscous > 0.0 ? Self.lap27Pointer(pPrev, nx: nx, ny: ny, x: x, y: y, z: z) : 0.0
+                                    let loss = sigma0Dt + pml[idx]
+                                    let nextV = (2.0 * p0 - (1.0 - loss) * pOld + lambdaSq * lc + viscous * (lc - lp)) / (1.0 + loss)
+                                    pNext[idx] = nextV.isFinite ? min(max(nextV, -16.0), 16.0) : 0.0
+                                    x += 1
+                                }
+                            }
+                        }
                     }
                 }
             }
-            return (7.0 / 15.0) * faces + (1.0 / 10.0) * edges + (1.0 / 30.0) * corners - (64.0 / 15.0) * c
         }
+
+        pressurePrev = localCurr
+        pressureCurr = localNext
+        pressureNext = localPrev
+    }
+
+    public mutating func stepScalarReference() {
+        let nx = sizeX, ny = sizeY, nz = sizeZ
+        let safeCFL = (cflParameters.dimension == 3 && cflParameters.isStable)
+            ? cflParameters
+            : cflParameters.clamped(toDimension: 3)
+        let lambdaSq = min(safeCFL.lambdaSq, safeCFL.maxLocalLambdaSq(forDimension: 3))
+        let viscous = safeCFL.viscousTerm
+        let sigma0Dt = safeCFL.sigma0 * safeCFL.timeStepSeconds
 
         for z in 1..<(nz - 1) {
             for y in 1..<(ny - 1) {
@@ -1247,8 +2354,12 @@ public struct FDTDWaveTankGrid3D: Sendable {
                     let idx = (z * ny + y) * nx + x
                     let p0 = pressureCurr[idx]
                     let pOld = pressurePrev[idx]
-                    let lc = lap27(pressureCurr, x, y, z)
-                    let lp = viscous > 0.0 ? lap27(pressurePrev, x, y, z) : 0.0
+                    let lc = pressureCurr.withUnsafeBufferPointer {
+                        Self.lap27Pointer($0.baseAddress!, nx: nx, ny: ny, x: x, y: y, z: z)
+                    }
+                    let lp = viscous > 0.0 ? pressurePrev.withUnsafeBufferPointer {
+                        Self.lap27Pointer($0.baseAddress!, nx: nx, ny: ny, x: x, y: y, z: z)
+                    } : 0.0
                     let loss = sigma0Dt + pmlDamping[idx]
                     let nextV = (2.0 * p0 - (1.0 - loss) * pOld + lambdaSq * lc + viscous * (lc - lp)) / (1.0 + loss)
                     pressureNext[idx] = nextV.isFinite ? min(max(nextV, -16.0), 16.0) : 0.0
@@ -1300,6 +2411,14 @@ public final class VisualFDTDWaveTankController {
 
     public var latestRMSPressure: Float {
         waveTank.interiorRMSPressure()
+    }
+
+    public var dispersionLimitedMaxFrequency: Float {
+        waveTank.dispersionLimitedMaxFrequency
+    }
+
+    public var recommendedSourceBandwidth: Float {
+        waveTank.recommendedSourceBandwidth
     }
 
     private var oscillatorPhase: Float = 0.0
@@ -1478,7 +2597,7 @@ public final class VisualFDTDWaveTankController {
     }
 
     public func syncWithSynthParameters(_ params: FDTDCFLParameters, nonlinearGamma: Float = 0.04) {
-        waveTank.cflParameters = params
+        waveTank.cflParameters = params.clamped(toDimension: 2)
         waveTank.nonlinearGamma = nonlinearGamma
     }
 
@@ -1488,6 +2607,8 @@ public final class VisualFDTDWaveTankController {
         guard !isPaused else { return }
         let count = max(1, substeps)
         let n = waveTank.gridSize
+        let bandLimitedSourceHz = min(max(continuousSourceFrequencyHz, 1.0), waveTank.dispersionLimitedMaxFrequency)
+        let minSafeSigma = max(2.0, waveTank.cflParameters.minimumGaussianSigmaCells())
 
         #if canImport(Metal) && !os(watchOS)
         if isUsingMetalCompute,
@@ -1507,7 +2628,7 @@ public final class VisualFDTDWaveTankController {
             for s in 0..<count {
                 var driveVal: Float = 0.0
                 if isContinuousSourceEnabled {
-                    oscillatorPhase += 2.0 * Float.pi * continuousSourceFrequencyHz * waveTank.cflParameters.timeStepSeconds
+                    oscillatorPhase += 2.0 * Float.pi * bandLimitedSourceHz * waveTank.cflParameters.timeStepSeconds
                     if oscillatorPhase > 2.0 * Float.pi { oscillatorPhase -= 2.0 * Float.pi }
                     driveVal = 0.28 * sinf(oscillatorPhase) / max(1.0e-12, waveTank.cflParameters.timeStepSeconds * waveTank.cflParameters.timeStepSeconds)
                 }
@@ -1539,7 +2660,7 @@ public final class VisualFDTDWaveTankController {
                     sourceY: srcY,
                     sourceZ: 0.0,
                     sourceValue: driveVal,
-                    sourceSigmaCells: 2.0,
+                    sourceSigmaCells: minSafeSigma,
                     micLeftX: micLeftNormalized.x * Float(n),
                     micLeftY: micLeftNormalized.y * Float(n),
                     micRightX: micRightNormalized.x * Float(n),
@@ -1571,9 +2692,7 @@ public final class VisualFDTDWaveTankController {
             let total = n * n
             let currPtr = latestCurrBuf.contents().bindMemory(to: Float.self, capacity: total)
             let prevPtr = latestPrevBuf.contents().bindMemory(to: Float.self, capacity: total)
-            let hostCurr = Array(UnsafeBufferPointer(start: currPtr, count: total))
-            let hostPrev = Array(UnsafeBufferPointer(start: prevPtr, count: total))
-            waveTank.syncFromGPUBuffers(curr: hostCurr, prev: hostPrev, stepsAdded: count)
+            waveTank.syncFromGPUPointers(currPtr: currPtr, prevPtr: prevPtr, count: total, stepsAdded: count)
             return
         }
         #endif
@@ -1584,7 +2703,7 @@ public final class VisualFDTDWaveTankController {
 
         for _ in 0..<count {
             if isContinuousSourceEnabled {
-                oscillatorPhase += 2.0 * Float.pi * continuousSourceFrequencyHz * waveTank.cflParameters.timeStepSeconds
+                oscillatorPhase += 2.0 * Float.pi * bandLimitedSourceHz * waveTank.cflParameters.timeStepSeconds
                 if oscillatorPhase > 2.0 * Float.pi {
                     oscillatorPhase -= 2.0 * Float.pi
                 }

@@ -130,16 +130,80 @@ public struct EEGBLEPacketDecoder: Sendable {
     public let sampleRate: Double
     private var lastSequenceNumber: UInt16?
     private var lastSample: EEGQuadSample?
+    private var secondLastSample: EEGQuadSample?
     private var cumulativeSampleIndex: UInt64 = 0
     public private(set) var interpolatedDropCount: Int = 0
+    public private(set) var uninterpolatedDropCount: Int = 0
+    public private(set) var duplicateOrStaleDropCount: Int = 0
+    public private(set) var corruptedChecksumDropCount: Int = 0
 
     /// Conversion scale for 12-bit unsigned offset binary (`0...4095`, midpoint `2048` -> `0.0 uV`, `0.48828125 uV/LSB`).
     public static let scale12BitMicrovoltsPerLSB: Float = 1000.0 / 2048.0
     /// Conversion scale for 24-bit signed two's complement (`ADS1299`-class `0.02235174 uV/LSB`).
     public static let scale24BitMicrovoltsPerLSB: Float = 4_500_000.0 / (24.0 * 8_388_608.0)
+    /// Maximum missing sequence steps bridged by smooth endpoint-matched interpolation (`16` samples = `62.5 ms` at `256 Hz`).
+    public static let maxInterpolatedGapSamples: Int = 16
 
     public init(sampleRate: Double = 256.0) {
         self.sampleRate = max(64.0, sampleRate)
+    }
+
+    /// Computes the signed modular `UInt16` sequence distance `seq - reference` in `[-32768, 32767]`,
+    /// handling wrap-around across `65535 -> 0` seamlessly.
+    @inline(__always)
+    public static func signedSequenceDelta(_ seq: UInt16, _ reference: UInt16) -> Int {
+        let wrapped = seq &- reference
+        return Int(Int16(bitPattern: wrapped))
+    }
+
+    /// Monotone Fritsch-Carlson endpoint-matched cubic Hermite interpolation across a short packet gap.
+    /// Guarantees exact midpoint symmetry when `prev2 == nil` or `alpha == 0.5` and zero overshoot (`y in [min(y0, y1), max(y0, y1)]`).
+    public static func monotoneHermiteInterpolateChannel(
+        prev2: Float?,
+        prev y0: Float,
+        next y1: Float,
+        alpha: Float,
+        gapSteps: Int
+    ) -> Float {
+        let chord = y1 - y0
+        guard let yPrev2 = prev2, gapSteps > 1 else {
+            return y0 + alpha * chord
+        }
+        let rawSlope = (y0 - yPrev2) * Float(gapSteps)
+        let damp = 1.0 / (1.0 + 0.25 * Float(gapSteps - 1))
+        let maxMag = 2.0 * abs(chord)
+        let m0: Float
+        if rawSlope * chord > 0.0 {
+            m0 = min(max(rawSlope * damp, -maxMag), maxMag)
+        } else {
+            m0 = 0.0
+        }
+        let m1 = chord
+        let t2 = alpha * alpha
+        let t3 = t2 * alpha
+        let h00: Float = 2.0 * t3 - 3.0 * t2 + 1.0
+        let h10: Float = t3 - 2.0 * t2 + alpha
+        let h01: Float = -2.0 * t3 + 3.0 * t2
+        let h11: Float = t3 - t2
+        let rawVal = h00 * y0 + h10 * m0 + h01 * y1 + h11 * m1
+        let lo = min(y0, y1)
+        let hi = max(y0, y1)
+        return min(max(rawVal, lo), hi)
+    }
+
+    public static func monotoneHermiteInterpolateQuad(
+        prev2: EEGQuadSample?,
+        prev: EEGQuadSample,
+        next: EEGQuadSample,
+        alpha: Float,
+        gapSteps: Int,
+        timestamp: TimeInterval
+    ) -> EEGQuadSample {
+        let tp9 = monotoneHermiteInterpolateChannel(prev2: prev2?.tp9, prev: prev.tp9, next: next.tp9, alpha: alpha, gapSteps: gapSteps)
+        let af7 = monotoneHermiteInterpolateChannel(prev2: prev2?.af7, prev: prev.af7, next: next.af7, alpha: alpha, gapSteps: gapSteps)
+        let af8 = monotoneHermiteInterpolateChannel(prev2: prev2?.af8, prev: prev.af8, next: next.af8, alpha: alpha, gapSteps: gapSteps)
+        let tp10 = monotoneHermiteInterpolateChannel(prev2: prev2?.tp10, prev: prev.tp10, next: next.tp10, alpha: alpha, gapSteps: gapSteps)
+        return EEGQuadSample(tp9: tp9, af7: af7, af8: af8, tp10: tp10, timestamp: timestamp)
     }
 
     /// Encodes a 4-channel `EEGQuadSample` into a 9-byte **12-bit big-endian packed** BLE GATT payload:
@@ -227,78 +291,110 @@ public struct EEGBLEPacketDecoder: Sendable {
         return data
     }
 
-    /// Decodes 12-bit BE (9/10-byte or 6-byte raw), 24-bit BE (15/16-byte or 12-byte raw), Float32x4 (16-byte),
-    /// or Int16x4 (8-byte) BLE notification payloads, linearly interpolating any dropped sequence packets.
-    public mutating func decodePacketWithSequenceInterpolation(_ data: Data) -> [EEGQuadSample] {
+    /// Parses a single BLE GATT notification frame, verifying XOR checksums on 10-byte (`0x12`) and 16-byte (`0x24`) frames
+    /// and rejecting non-finite `Float32` payloads.
+    public mutating func parsePacketFrame(_ data: Data) -> (sequenceNumber: UInt16?, channels: (Float, Float, Float, Float))? {
         let bytes = [UInt8](data)
-        guard !bytes.isEmpty else { return [] }
-
-        var parsedSeq: UInt16?
-        let tp9: Float
-        let af7: Float
-        let af8: Float
-        let tp10: Float
+        guard !bytes.isEmpty else { return nil }
 
         if (bytes.count == 9 || bytes.count == 10) && bytes[0] == EEGBLEPacketEncodingFormat.packed12BitBigEndian.rawValue {
-            parsedSeq = (UInt16(bytes[1]) << 8) | UInt16(bytes[2])
+            if bytes.count == 10 {
+                let xorCheck = bytes.reduce(UInt8(0), ^)
+                if xorCheck != 0 {
+                    corruptedChecksumDropCount += 1
+                    return nil
+                }
+            }
+            let seq = (UInt16(bytes[1]) << 8) | UInt16(bytes[2])
             let decoded = Self.unpack12BitQuadBigEndian(Array(bytes[3..<9]))
-            (tp9, af7, af8, tp10) = decoded
+            return (seq, decoded)
         } else if bytes.count == 6 {
             let decoded = Self.unpack12BitQuadBigEndian(bytes)
-            (tp9, af7, af8, tp10) = decoded
+            return (nil, decoded)
         } else if (bytes.count == 15 || bytes.count == 16) && bytes[0] == EEGBLEPacketEncodingFormat.packed24BitBigEndian.rawValue {
-            parsedSeq = (UInt16(bytes[1]) << 8) | UInt16(bytes[2])
+            if bytes.count == 16 {
+                let xorCheck = bytes.reduce(UInt8(0), ^)
+                if xorCheck != 0 {
+                    corruptedChecksumDropCount += 1
+                    return nil
+                }
+            }
+            let seq = (UInt16(bytes[1]) << 8) | UInt16(bytes[2])
             let decoded = Self.unpack24BitQuadBigEndian(Array(bytes[3..<15]))
-            (tp9, af7, af8, tp10) = decoded
+            return (seq, decoded)
         } else if bytes.count == 12 {
             let decoded = Self.unpack24BitQuadBigEndian(bytes)
-            (tp9, af7, af8, tp10) = decoded
+            return (nil, decoded)
         } else if bytes.count >= 16 {
             func readFloatLE(_ offset: Int) -> Float {
-                let bits = UInt32(bytes[offset])
-                    | (UInt32(bytes[offset + 1]) << 8)
-                    | (UInt32(bytes[offset + 2]) << 16)
-                    | (UInt32(bytes[offset + 3]) << 24)
-                return Float(bitPattern: bits)
+                let b0 = UInt32(bytes[offset])
+                let b1 = UInt32(bytes[offset + 1]) << 8
+                let b2 = UInt32(bytes[offset + 2]) << 16
+                let b3 = UInt32(bytes[offset + 3]) << 24
+                return Float(bitPattern: b0 | b1 | b2 | b3)
             }
-            tp9 = readFloatLE(0)
-            af7 = readFloatLE(4)
-            af8 = readFloatLE(8)
-            tp10 = readFloatLE(12)
+            let tp9 = readFloatLE(0)
+            let af7 = readFloatLE(4)
+            let af8 = readFloatLE(8)
+            let tp10 = readFloatLE(12)
+            guard tp9.isFinite && af7.isFinite && af8.isFinite && tp10.isFinite else {
+                corruptedChecksumDropCount += 1
+                return nil
+            }
+            return (nil, (tp9, af7, af8, tp10))
         } else if bytes.count >= 8 {
             func readMicrovoltsInt16LE(_ offset: Int) -> Float {
                 let raw = UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
                 return Float(Int16(bitPattern: raw)) * 0.1
             }
-            tp9 = readMicrovoltsInt16LE(0)
-            af7 = readMicrovoltsInt16LE(2)
-            af8 = readMicrovoltsInt16LE(4)
-            tp10 = readMicrovoltsInt16LE(6)
+            let tp9 = readMicrovoltsInt16LE(0)
+            let af7 = readMicrovoltsInt16LE(2)
+            let af8 = readMicrovoltsInt16LE(4)
+            let tp10 = readMicrovoltsInt16LE(6)
+            return (nil, (tp9, af7, af8, tp10))
         } else {
-            return []
+            return nil
         }
+    }
+
+    /// Decodes 12-bit BE (9/10-byte or 6-byte raw), 24-bit BE (15/16-byte or 12-byte raw), Float32x4 (16-byte),
+    /// or Int16x4 (8-byte) BLE notification payloads, interpolating short sequence gaps (`<= 16` samples)
+    /// and rejecting duplicate or out-of-order stale sequence numbers across `UInt16` rollover.
+    public mutating func decodePacketWithSequenceInterpolation(_ data: Data) -> [EEGQuadSample] {
+        guard let parsed = parsePacketFrame(data) else { return [] }
+        let parsedSeq = parsed.sequenceNumber
+        let (tp9, af7, af8, tp10) = parsed.channels
 
         var emitted: [EEGQuadSample] = []
 
         if let seq = parsedSeq, let prevSeq = lastSequenceNumber, let prevSample = lastSample {
-            let diff = Int(seq &- prevSeq)
-            if diff > 1 && diff <= 16 {
-                let missingCount = diff - 1
+            let signedDiff = Self.signedSequenceDelta(seq, prevSeq)
+            if signedDiff <= 0 {
+                duplicateOrStaleDropCount += 1
+                return []
+            }
+            if signedDiff > 1 && signedDiff <= Self.maxInterpolatedGapSamples + 1 {
+                let missingCount = signedDiff - 1
                 interpolatedDropCount += missingCount
+                let nextEndpoint = EEGQuadSample(tp9: tp9, af7: af7, af8: af8, tp10: tp10, timestamp: 0.0)
                 for step in 1...missingCount {
-                    let alpha = Float(step) / Float(diff)
+                    let alpha = Float(step) / Float(signedDiff)
                     let t = Double(cumulativeSampleIndex) / sampleRate
                     cumulativeSampleIndex &+= 1
-                    emitted.append(
-                        EEGQuadSample(
-                            tp9: prevSample.tp9 + alpha * (tp9 - prevSample.tp9),
-                            af7: prevSample.af7 + alpha * (af7 - prevSample.af7),
-                            af8: prevSample.af8 + alpha * (af8 - prevSample.af8),
-                            tp10: prevSample.tp10 + alpha * (tp10 - prevSample.tp10),
-                            timestamp: t
-                        )
+                    let interpSample = Self.monotoneHermiteInterpolateQuad(
+                        prev2: secondLastSample,
+                        prev: prevSample,
+                        next: nextEndpoint,
+                        alpha: alpha,
+                        gapSteps: signedDiff,
+                        timestamp: t
                     )
+                    emitted.append(interpSample)
                 }
+            } else if signedDiff > Self.maxInterpolatedGapSamples + 1 {
+                let skipped = signedDiff - 1
+                uninterpolatedDropCount += skipped
+                cumulativeSampleIndex &+= UInt64(skipped)
             }
         }
 
@@ -316,6 +412,7 @@ public struct EEGBLEPacketDecoder: Sendable {
         if let parsedSeq {
             lastSequenceNumber = parsedSeq
         }
+        secondLastSample = lastSample
         lastSample = currentSample
         return emitted
     }
@@ -352,7 +449,8 @@ public struct EEGBLEPacketDecoder: Sendable {
         )
     }
 
-    /// Estimates skin-electrode contact impedance (`kOhm`) from high-frequency line-hum leakage & rail saturation.
+    /// Heuristic skin-electrode contact impedance proxy (`kOhm`) derived from sample-to-sample high-frequency line-hum RMS slew
+    /// when hardware AC lead-off current injection telemetry is not present on the GATT stream.
     public static func estimateContactImpedance(recentSamples: [EEGQuadSample]) -> EEGElectrodeImpedanceReport {
         guard recentSamples.count >= 16 else {
             return EEGElectrodeImpedanceReport()
@@ -378,6 +476,512 @@ public struct EEGBLEPacketDecoder: Sendable {
             af8KOhm: channelImpedance({ $0.af8 }, baselineKOhm: 11.2),
             tp10KOhm: channelImpedance({ $0.tp10 }, baselineKOhm: 14.1)
         )
+    }
+}
+
+// MARK: - 2B. Fixed-Capacity BLE Jitter/Reorder Buffer, Gap Classifier & Lockstep 4-Ch Ring Buffer
+
+public struct EEGBLESynchronizedSample: Codable, Sendable, Equatable {
+    public let sample: EEGQuadSample
+    public let sampleIndex: UInt64
+    public let sequenceNumber: UInt16
+    /// `true` when synthesized via monotone Hermite short-gap interpolation (`<= 16` missing packets); `false` for measured BLE packets.
+    public let isSynthetic: Bool
+    /// `true` on the first measured sample following a large burst drop (`> 16` missing packets), triggering soft filter re-priming.
+    public let isPostDiscontinuity: Bool
+    /// Number of dropped sequence steps immediately preceding this sample (`0` for contiguous packets).
+    public let gapLengthSamples: Int
+
+    public init(
+        sample: EEGQuadSample,
+        sampleIndex: UInt64,
+        sequenceNumber: UInt16,
+        isSynthetic: Bool,
+        isPostDiscontinuity: Bool,
+        gapLengthSamples: Int
+    ) {
+        self.sample = sample
+        self.sampleIndex = sampleIndex
+        self.sequenceNumber = sequenceNumber
+        self.isSynthetic = isSynthetic
+        self.isPostDiscontinuity = isPostDiscontinuity
+        self.gapLengthSamples = max(0, gapLengthSamples)
+    }
+}
+
+/// Fixed-capacity `O(1)` sequence-indexed reorder and jitter absorption buffer for 256 Hz BLE GATT notifications.
+public struct EEGBLEJitterReorderBuffer: Sendable {
+    private struct Slot: Sendable {
+        var sequenceNumber: UInt16 = 0
+        var arrivalTimestamp: TimeInterval = 0.0
+        var channels: (Float, Float, Float, Float) = (0.0, 0.0, 0.0, 0.0)
+        var isOccupied: Bool = false
+    }
+
+    public let capacity: Int
+    public let maxHoldSeconds: TimeInterval
+    private var slots: [Slot]
+    public private(set) var expectedSequenceNumber: UInt16?
+    public private(set) var duplicateOrLateDropCount: Int = 0
+    public private(set) var reorderedRecoveredCount: Int = 0
+    public private(set) var forcedHoldAdvanceCount: Int = 0
+
+    public init(capacity: Int = 64, maxHoldSeconds: TimeInterval = 0.105) {
+        var pow2 = 8
+        while pow2 < min(max(capacity, 8), 512) {
+            pow2 <<= 1
+        }
+        self.capacity = pow2
+        self.maxHoldSeconds = max(0.008, maxHoldSeconds)
+        self.slots = [Slot](repeating: Slot(), count: pow2)
+    }
+
+    @inline(__always)
+    private func slotIndex(for seq: UInt16) -> Int {
+        Int(seq) & (capacity - 1)
+    }
+
+    public mutating func reset() {
+        for idx in 0..<capacity {
+            slots[idx].isOccupied = false
+        }
+        expectedSequenceNumber = nil
+        duplicateOrLateDropCount = 0
+        reorderedRecoveredCount = 0
+        forcedHoldAdvanceCount = 0
+    }
+
+    /// Inserts a parsed packet at `arrivalTimestamp` and returns any sequence-ordered packets ready for release.
+    public mutating func insert(
+        sequenceNumber: UInt16,
+        arrivalTimestamp: TimeInterval,
+        channels: (Float, Float, Float, Float)
+    ) -> [(sequenceNumber: UInt16, channels: (Float, Float, Float, Float))] {
+        var ready: [(sequenceNumber: UInt16, channels: (Float, Float, Float, Float))] = []
+
+        guard let currentExpected = expectedSequenceNumber else {
+            expectedSequenceNumber = sequenceNumber &+ 1
+            ready.append((sequenceNumber, channels))
+            return ready
+        }
+
+        var delta = EEGBLEPacketDecoder.signedSequenceDelta(sequenceNumber, currentExpected)
+        if delta < 0 {
+            duplicateOrLateDropCount += 1
+            return ready
+        }
+
+        while delta >= capacity {
+            if !forceAdvanceEarliestSlot(into: &ready) {
+                expectedSequenceNumber = sequenceNumber
+                delta = 0
+                break
+            }
+            if let updatedExpected = expectedSequenceNumber {
+                delta = EEGBLEPacketDecoder.signedSequenceDelta(sequenceNumber, updatedExpected)
+            } else {
+                delta = 0
+                break
+            }
+        }
+
+        let targetIdx = slotIndex(for: sequenceNumber)
+        if slots[targetIdx].isOccupied && slots[targetIdx].sequenceNumber == sequenceNumber {
+            duplicateOrLateDropCount += 1
+            return ready
+        }
+
+        if delta > 0 {
+            reorderedRecoveredCount += 1
+        }
+
+        slots[targetIdx] = Slot(
+            sequenceNumber: sequenceNumber,
+            arrivalTimestamp: arrivalTimestamp,
+            channels: channels,
+            isOccupied: true
+        )
+
+        drainReadySlots(nowTimestamp: arrivalTimestamp, into: &ready)
+        return ready
+    }
+
+    public mutating func flush() -> [(sequenceNumber: UInt16, channels: (Float, Float, Float, Float))] {
+        var ready: [(sequenceNumber: UInt16, channels: (Float, Float, Float, Float))] = []
+        while forceAdvanceEarliestSlot(into: &ready) {}
+        return ready
+    }
+
+    private mutating func drainReadySlots(
+        nowTimestamp: TimeInterval,
+        into ready: inout [(sequenceNumber: UInt16, channels: (Float, Float, Float, Float))]
+    ) {
+        while let expected = expectedSequenceNumber {
+            let idx = slotIndex(for: expected)
+            if slots[idx].isOccupied && slots[idx].sequenceNumber == expected {
+                let entry = slots[idx]
+                slots[idx].isOccupied = false
+                ready.append((entry.sequenceNumber, entry.channels))
+                expectedSequenceNumber = expected &+ 1
+                continue
+            }
+
+            var oldestWait: TimeInterval = 0.0
+            for slot in slots where slot.isOccupied {
+                let wait = nowTimestamp - slot.arrivalTimestamp
+                if wait > oldestWait {
+                    oldestWait = wait
+                }
+            }
+            if oldestWait >= maxHoldSeconds {
+                forcedHoldAdvanceCount += 1
+                if !forceAdvanceEarliestSlot(into: &ready) {
+                    break
+                }
+            } else {
+                break
+            }
+        }
+    }
+
+    private mutating func forceAdvanceEarliestSlot(
+        into ready: inout [(sequenceNumber: UInt16, channels: (Float, Float, Float, Float))]
+    ) -> Bool {
+        guard let expected = expectedSequenceNumber else { return false }
+        var bestDelta: Int?
+        var bestSlotIndex: Int?
+
+        for idx in 0..<capacity where slots[idx].isOccupied {
+            let d = EEGBLEPacketDecoder.signedSequenceDelta(slots[idx].sequenceNumber, expected)
+            if d >= 0 {
+                if let currentBest = bestDelta {
+                    if d < currentBest {
+                        bestDelta = d
+                        bestSlotIndex = idx
+                    }
+                } else {
+                    bestDelta = d
+                    bestSlotIndex = idx
+                }
+            } else {
+                slots[idx].isOccupied = false
+            }
+        }
+
+        guard let chosenIdx = bestSlotIndex else { return false }
+        let entry = slots[chosenIdx]
+        slots[chosenIdx].isOccupied = false
+        ready.append((entry.sequenceNumber, entry.channels))
+        expectedSequenceNumber = entry.sequenceNumber &+ 1
+        return true
+    }
+}
+
+/// Synchronizes jittery/reordered BLE EEG packets into a monotonic 256 Hz sample stream, classifying short gaps (`<= 16` samples)
+/// for monotone Hermite interpolation (`isSynthetic = true`) and large burst gaps (`> 16` samples) for clock jump + filter re-priming.
+public struct EEGBLEStreamSynchronizer: Sendable {
+    public let sampleRate: Double
+    public let maxInterpolatedGapSamples: Int
+    public private(set) var packetDecoder: EEGBLEPacketDecoder
+    public private(set) var jitterBuffer: EEGBLEJitterReorderBuffer
+    public private(set) var cumulativeSampleIndex: UInt64 = 0
+    public private(set) var interpolatedSampleCount: Int = 0
+    public private(set) var uninterpolatedDropCount: Int = 0
+    public private(set) var largeGapDiscontinuityCount: Int = 0
+
+    private var lastEmittedSequenceNumber: UInt16?
+    private var lastMeasuredSample: EEGQuadSample?
+    private var secondLastMeasuredSample: EEGQuadSample?
+
+    public var duplicateOrLateDropCount: Int {
+        jitterBuffer.duplicateOrLateDropCount + packetDecoder.duplicateOrStaleDropCount
+    }
+
+    public var reorderedRecoveredCount: Int {
+        jitterBuffer.reorderedRecoveredCount
+    }
+
+    public var corruptedChecksumDropCount: Int {
+        packetDecoder.corruptedChecksumDropCount
+    }
+
+    public init(
+        sampleRate: Double = 256.0,
+        jitterBufferCapacity: Int = 64,
+        maxHoldSeconds: TimeInterval = 0.105,
+        maxInterpolatedGapSamples: Int = 16
+    ) {
+        let fs = max(64.0, sampleRate)
+        self.sampleRate = fs
+        self.maxInterpolatedGapSamples = max(1, maxInterpolatedGapSamples)
+        self.packetDecoder = EEGBLEPacketDecoder(sampleRate: fs)
+        self.jitterBuffer = EEGBLEJitterReorderBuffer(capacity: jitterBufferCapacity, maxHoldSeconds: maxHoldSeconds)
+    }
+
+    public mutating func ingestBLEPacket(
+        _ data: Data,
+        arrivalTimestamp: TimeInterval
+    ) -> [EEGBLESynchronizedSample] {
+        guard let parsed = packetDecoder.parsePacketFrame(data) else { return [] }
+        guard let seq = parsed.sequenceNumber else {
+            let t = Double(cumulativeSampleIndex) / sampleRate
+            let idx = cumulativeSampleIndex
+            cumulativeSampleIndex &+= 1
+            let quad = EEGQuadSample(
+                tp9: parsed.channels.0,
+                af7: parsed.channels.1,
+                af8: parsed.channels.2,
+                tp10: parsed.channels.3,
+                timestamp: t
+            )
+            return [
+                EEGBLESynchronizedSample(
+                    sample: quad,
+                    sampleIndex: idx,
+                    sequenceNumber: 0,
+                    isSynthetic: false,
+                    isPostDiscontinuity: false,
+                    gapLengthSamples: 0
+                )
+            ]
+        }
+
+        let ordered = jitterBuffer.insert(
+            sequenceNumber: seq,
+            arrivalTimestamp: arrivalTimestamp,
+            channels: parsed.channels
+        )
+        var emitted: [EEGBLESynchronizedSample] = []
+        emitted.reserveCapacity(ordered.count)
+        for item in ordered {
+            emitOrderedPacket(sequenceNumber: item.sequenceNumber, channels: item.channels, into: &emitted)
+        }
+        return emitted
+    }
+
+    public mutating func flush() -> [EEGBLESynchronizedSample] {
+        let remaining = jitterBuffer.flush()
+        var emitted: [EEGBLESynchronizedSample] = []
+        emitted.reserveCapacity(remaining.count)
+        for item in remaining {
+            emitOrderedPacket(sequenceNumber: item.sequenceNumber, channels: item.channels, into: &emitted)
+        }
+        return emitted
+    }
+
+    private mutating func emitOrderedPacket(
+        sequenceNumber: UInt16,
+        channels: (Float, Float, Float, Float),
+        into out: inout [EEGBLESynchronizedSample]
+    ) {
+        var isPostDiscontinuity = false
+        var gapLength = 0
+
+        if let prevSeq = lastEmittedSequenceNumber, let prevSample = lastMeasuredSample {
+            let diff = EEGBLEPacketDecoder.signedSequenceDelta(sequenceNumber, prevSeq)
+            if diff <= 0 {
+                return
+            }
+            if diff > 1 {
+                let missing = diff - 1
+                gapLength = missing
+                if missing <= maxInterpolatedGapSamples {
+                    interpolatedSampleCount += missing
+                    let nextEndpoint = EEGQuadSample(
+                        tp9: channels.0,
+                        af7: channels.1,
+                        af8: channels.2,
+                        tp10: channels.3,
+                        timestamp: 0.0
+                    )
+                    for step in 1...missing {
+                        let alpha = Float(step) / Float(diff)
+                        let sIdx = cumulativeSampleIndex
+                        let t = Double(sIdx) / sampleRate
+                        cumulativeSampleIndex &+= 1
+                        let interpQuad = EEGBLEPacketDecoder.monotoneHermiteInterpolateQuad(
+                            prev2: secondLastMeasuredSample,
+                            prev: prevSample,
+                            next: nextEndpoint,
+                            alpha: alpha,
+                            gapSteps: diff,
+                            timestamp: t
+                        )
+                        let synthSeq = prevSeq &+ UInt16(step)
+                        out.append(
+                            EEGBLESynchronizedSample(
+                                sample: interpQuad,
+                                sampleIndex: sIdx,
+                                sequenceNumber: synthSeq,
+                                isSynthetic: true,
+                                isPostDiscontinuity: false,
+                                gapLengthSamples: missing
+                            )
+                        )
+                    }
+                } else {
+                    uninterpolatedDropCount += missing
+                    largeGapDiscontinuityCount += 1
+                    cumulativeSampleIndex &+= UInt64(missing)
+                    isPostDiscontinuity = true
+                }
+            }
+        }
+
+        let currentIdx = cumulativeSampleIndex
+        let currentTimestamp = Double(currentIdx) / sampleRate
+        cumulativeSampleIndex &+= 1
+        let measuredSample = EEGQuadSample(
+            tp9: channels.0,
+            af7: channels.1,
+            af8: channels.2,
+            tp10: channels.3,
+            timestamp: currentTimestamp
+        )
+        out.append(
+            EEGBLESynchronizedSample(
+                sample: measuredSample,
+                sampleIndex: currentIdx,
+                sequenceNumber: sequenceNumber,
+                isSynthetic: false,
+                isPostDiscontinuity: isPostDiscontinuity,
+                gapLengthSamples: gapLength
+            )
+        )
+
+        secondLastMeasuredSample = lastMeasuredSample
+        lastMeasuredSample = measuredSample
+        lastEmittedSequenceNumber = sequenceNumber
+    }
+}
+
+/// Fixed-capacity 4-channel lockstep ring buffer where all 4 raw and cleaned channels (`TP9`, `AF7`, `AF8`, `TP10`)
+/// and validity flags share a single atomic write cursor, guaranteeing zero inter-channel index skew.
+public struct EEGQuadLockstepRingBuffer: Sendable {
+    public let capacity: Int
+    private var rawStorage: [EEGQuadSample]
+    private var cleanedStorage: [EEGQuadSample]
+    private var sampleIndices: [UInt64]
+    private var syntheticFlags: [Bool]
+    private var discontinuityFlags: [Bool]
+    public private(set) var writeCursor: Int = 0
+    public private(set) var count: Int = 0
+    public private(set) var totalWritten: UInt64 = 0
+
+    public init(capacity: Int = 768) {
+        let cap = max(16, capacity)
+        self.capacity = cap
+        let zeroSample = EEGQuadSample(tp9: 0.0, af7: 0.0, af8: 0.0, tp10: 0.0, timestamp: 0.0)
+        self.rawStorage = [EEGQuadSample](repeating: zeroSample, count: cap)
+        self.cleanedStorage = [EEGQuadSample](repeating: zeroSample, count: cap)
+        self.sampleIndices = [UInt64](repeating: 0, count: cap)
+        self.syntheticFlags = [Bool](repeating: false, count: cap)
+        self.discontinuityFlags = [Bool](repeating: false, count: cap)
+    }
+
+    /// Structural inter-channel skew across `TP9`, `AF7`, `AF8`, and `TP10` (always `0` by single-cursor lockstep invariant).
+    public var channelSkewSamples: Int { 0 }
+
+    public mutating func reset() {
+        writeCursor = 0
+        count = 0
+        totalWritten = 0
+    }
+
+    public mutating func push(
+        raw: EEGQuadSample,
+        cleaned: EEGQuadSample,
+        sampleIndex: UInt64 = 0,
+        isSynthetic: Bool = false,
+        isPostDiscontinuity: Bool = false
+    ) {
+        let idx = writeCursor
+        rawStorage[idx] = raw
+        cleanedStorage[idx] = cleaned
+        sampleIndices[idx] = sampleIndex == 0 ? totalWritten : sampleIndex
+        syntheticFlags[idx] = isSynthetic
+        discontinuityFlags[idx] = isPostDiscontinuity
+
+        writeCursor = (idx + 1) % capacity
+        if count < capacity {
+            count += 1
+        }
+        totalWritten &+= 1
+    }
+
+    public func chronologicalRawSamples(last maxCount: Int? = nil) -> [EEGQuadSample] {
+        let take = min(count, maxCount ?? count)
+        guard take > 0 else { return [] }
+        var out: [EEGQuadSample] = []
+        out.reserveCapacity(take)
+        let startOffset = count - take
+        let oldestIdx = count == capacity ? writeCursor : 0
+        for i in 0..<take {
+            let ringIdx = (oldestIdx + startOffset + i) % capacity
+            out.append(rawStorage[ringIdx])
+        }
+        return out
+    }
+
+    public func chronologicalCleanedSamples(last maxCount: Int? = nil) -> [EEGQuadSample] {
+        let take = min(count, maxCount ?? count)
+        guard take > 0 else { return [] }
+        var out: [EEGQuadSample] = []
+        out.reserveCapacity(take)
+        let startOffset = count - take
+        let oldestIdx = count == capacity ? writeCursor : 0
+        for i in 0..<take {
+            let ringIdx = (oldestIdx + startOffset + i) % capacity
+            out.append(cleanedStorage[ringIdx])
+        }
+        return out
+    }
+
+    public func chronologicalChannelSamples(
+        _ channel: EEGChannel,
+        cleaned: Bool = true,
+        last maxCount: Int? = nil
+    ) -> [Float] {
+        let take = min(count, maxCount ?? count)
+        guard take > 0 else { return [] }
+        var out: [Float] = []
+        out.reserveCapacity(take)
+        let startOffset = count - take
+        let oldestIdx = count == capacity ? writeCursor : 0
+        for i in 0..<take {
+            let ringIdx = (oldestIdx + startOffset + i) % capacity
+            let quad = cleaned ? cleanedStorage[ringIdx] : rawStorage[ringIdx]
+            out.append(quad[channel])
+        }
+        return out
+    }
+
+    public func chronologicalSampleIndices(last maxCount: Int? = nil) -> [UInt64] {
+        let take = min(count, maxCount ?? count)
+        guard take > 0 else { return [] }
+        var out: [UInt64] = []
+        out.reserveCapacity(take)
+        let startOffset = count - take
+        let oldestIdx = count == capacity ? writeCursor : 0
+        for i in 0..<take {
+            let ringIdx = (oldestIdx + startOffset + i) % capacity
+            out.append(sampleIndices[ringIdx])
+        }
+        return out
+    }
+
+    public func chronologicalSyntheticFlags(last maxCount: Int? = nil) -> [Bool] {
+        let take = min(count, maxCount ?? count)
+        guard take > 0 else { return [] }
+        var out: [Bool] = []
+        out.reserveCapacity(take)
+        let startOffset = count - take
+        let oldestIdx = count == capacity ? writeCursor : 0
+        for i in 0..<take {
+            let ringIdx = (oldestIdx + startOffset + i) % capacity
+            out.append(syntheticFlags[ringIdx])
+        }
+        return out
     }
 }
 
@@ -644,6 +1248,8 @@ public struct SyntheticCorticalEEGGenerator: Sendable {
 
 public struct EEGArtifactFilterBank: Sendable {
     public static let tapCount: Int = 4
+    /// Default post-discontinuity warmup suppression window (`24` samples = `93.75 ms` at `256 Hz`).
+    public static let defaultWarmupSuppressionSamples: Int = 24
 
     public let sampleRate: Double
     public let forgettingFactorLambda: Float
@@ -738,8 +1344,9 @@ public struct EEGArtifactFilterBank: Sendable {
     private var dcPrevY: [Double] = [Double](repeating: 0.0, count: 4)
     private var refDCPrevX: Double = 0.0
     private var refDCPrevY: Double = 0.0
+    private var hasPrimedInitialQuadDC: Bool = false
 
-    // Twin 50.0 Hz and 60.0 Hz biquad notches per channel + EOG low-pass (< 12 Hz)
+    // Twin 50.0 Hz and 60.0 Hz biquad notches per channel + EOG low-pass (< 11.5 Hz)
     private var notch50Channels: [BiquadSection]
     private var notch60Channels: [BiquadSection]
     private var refNotch50: BiquadSection
@@ -747,6 +1354,12 @@ public struct EEGArtifactFilterBank: Sendable {
     private var eogLowPassVertical: BiquadSection
     private var eogLowPassHorizontal: BiquadSection
     private var zeroPhaseHPF05: BiquadSection
+
+    public private(set) var latestSmoothedEOGVerticalUV: Float = 0.0
+    public private(set) var latestSmoothedEOGHorizontalUV: Float = 0.0
+    public private(set) var warmupSuppressionRemainingSamples: Int = 0
+    public private(set) var discontinuityReprimeCount: Int = 0
+    public private(set) var syntheticPredictOnlyStepCount: Int = 0
 
     // Single-channel M = 4 tap RLS state + Scalar Kalman Ocular State Estimator
     public private(set) var rlsWeights: [Double]
@@ -819,101 +1432,174 @@ public struct EEGArtifactFilterBank: Sendable {
         }
     }
 
+    /// Soft-reprimes the DC-blocker baseline, twin 50/60 Hz biquad notches, and EOG delay lines after a large packet gap
+    /// while preserving the learned RLS/Kalman spatial weights (`quadChannelRLSWeights`, `rlsWeights`, `kalmanStateGain`).
+    public mutating func reprimeAfterDiscontinuity(
+        with sample: EEGQuadSample,
+        isInitialPrime: Bool = false
+    ) {
+        dcPrevX[0] = Double(sample.tp9)
+        dcPrevX[1] = Double(sample.af7)
+        dcPrevX[2] = Double(sample.af8)
+        dcPrevX[3] = Double(sample.tp10)
+        for ch in 0..<4 {
+            dcPrevY[ch] = 0.0
+            notch50Channels[ch].reset()
+            notch60Channels[ch].reset()
+            eogVertDelay[ch] = 0.0
+            eogHorizDelay[ch] = 0.0
+        }
+        eogLowPassVertical.reset()
+        eogLowPassHorizontal.reset()
+        hasPrimedInitialQuadDC = true
+        if !isInitialPrime {
+            warmupSuppressionRemainingSamples = Self.defaultWarmupSuppressionSamples
+            discontinuityReprimeCount += 1
+        }
+    }
+
     /// Processes a single cortical EEG sample through matched 0.5 Hz DC-blocking HPF + 50/60 Hz twin notches
     /// and anti-windup 4-tap RLS + Kalman adaptive ocular blink cancellation (`> 18 dB` suppression, `< 5 deg` phase distortion).
-    public mutating func processSample(rawEEG: Float, eogReference: Float) -> Float {
+    public mutating func processSample(
+        rawEEG: Float,
+        eogReference: Float,
+        isSynthetic: Bool = false,
+        isPostDiscontinuity: Bool = false
+    ) -> Float {
         let rawD = Double(rawEEG)
+        let rawR = Double(eogReference)
+        if isPostDiscontinuity {
+            dcPrevX[1] = rawD
+            dcPrevY[1] = 0.0
+            refDCPrevX = rawR
+            refDCPrevY = 0.0
+            notch50Channels[1].reset()
+            notch60Channels[1].reset()
+            refNotch50.reset()
+            refNotch60.reset()
+            for k in 0..<Self.tapCount {
+                rlsDelayLine[k] = 0.0
+            }
+            warmupSuppressionRemainingSamples = Self.defaultWarmupSuppressionSamples
+            discontinuityReprimeCount += 1
+        }
+
         let dcD = dcBlockAlpha * (rawD - dcPrevX[1] + dcPrevY[1])
         dcPrevX[1] = rawD
         dcPrevY[1] = dcD
         let dFiltered = notch60Channels[1].process(notch50Channels[1].process(dcD))
 
-        let rawR = Double(eogReference)
         let dcR = dcBlockAlpha * (rawR - refDCPrevX + refDCPrevY)
         refDCPrevX = rawR
         refDCPrevY = dcR
         let rFiltered = refNotch60.process(refNotch50.process(dcR))
 
-        return stepSingleChannelRLSAndKalman(dFiltered: dFiltered, rFiltered: rFiltered)
+        let gateUpdate = isSynthetic || (warmupSuppressionRemainingSamples > 0)
+        if warmupSuppressionRemainingSamples > 0 {
+            warmupSuppressionRemainingSamples -= 1
+        }
+        return stepSingleChannelRLSAndKalman(
+            dFiltered: dFiltered,
+            rFiltered: rFiltered,
+            isSyntheticOrWarmup: gateUpdate
+        )
     }
 
-    private mutating func stepSingleChannelRLSAndKalman(dFiltered: Double, rFiltered: Double) -> Float {
+    private mutating func stepSingleChannelRLSAndKalman(
+        dFiltered: Double,
+        rFiltered: Double,
+        isSyntheticOrWarmup: Bool = false
+    ) -> Float {
         for k in stride(from: Self.tapCount - 1, through: 1, by: -1) {
             rlsDelayLine[k] = rlsDelayLine[k - 1]
         }
         rlsDelayLine[0] = rFiltered
 
-        var uEnergy = 0.0
-        for val in rlsDelayLine {
-            uEnergy += val * val
-        }
-
-        // Anti-windup forgetting factor prevents P[n] explosion during inter-blink silence
-        let lam = uEnergy > 16.0 ? Double(forgettingFactorLambda) : 1.0
-
-        var piVec = [Double](repeating: 0.0, count: Self.tapCount)
-        for i in 0..<Self.tapCount {
-            var acc = 0.0
-            for j in 0..<Self.tapCount {
-                acc += rlsCovarianceP[i][j] * rlsDelayLine[j]
+        let qProcess = 1e-5
+        if isSyntheticOrWarmup {
+            syntheticPredictOnlyStepCount += 1
+            for i in 0..<Self.tapCount {
+                rlsCovarianceP[i][i] = min(rlsCovarianceP[i][i] + 1e-7, 0.01)
             }
-            piVec[i] = acc
-        }
-
-        var uDotPi = 0.0
-        for i in 0..<Self.tapCount {
-            uDotPi += rlsDelayLine[i] * piVec[i]
-        }
-        let denom = max(1e-12, lam + uDotPi)
-        var gainK = [Double](repeating: 0.0, count: Self.tapCount)
-        for i in 0..<Self.tapCount {
-            gainK[i] = piVec[i] / denom
-        }
-
-        var priorPred = 0.0
-        for i in 0..<Self.tapCount {
-            priorPred += rlsWeights[i] * rlsDelayLine[i]
-        }
-        let priorError = dFiltered - priorPred
-
-        for i in 0..<Self.tapCount {
-            rlsWeights[i] += gainK[i] * priorError
-        }
-
-        let invLam = 1.0 / lam
-        var nextP = rlsCovarianceP
-        var traceP = 0.0
-        for i in 0..<Self.tapCount {
-            for j in 0..<Self.tapCount {
-                nextP[i][j] = (rlsCovarianceP[i][j] - gainK[i] * piVec[j]) * invLam
+            // Inflated measurement noise R (100x) during interpolated/warmup samples
+            let rMeasInflated = 6400.0
+            let pPred = kalmanVarianceP + qProcess
+            let kKalman = (pPred * rFiltered) / (rFiltered * pPred * rFiltered + rMeasInflated)
+            let kalmanInnov = dFiltered - kalmanStateGain * rFiltered
+            kalmanStateGain += kKalman * kalmanInnov
+            kalmanVarianceP = min(max((1.0 - kKalman * rFiltered) * pPred, 1e-6), 1.0)
+        } else {
+            var uEnergy = 0.0
+            for val in rlsDelayLine {
+                uEnergy += val * val
             }
-            traceP += nextP[i][i]
-        }
-        if traceP > 0.01 {
-            let scale = 0.01 / traceP
+
+            // Anti-windup forgetting factor prevents P[n] explosion during inter-blink silence
+            let lam = uEnergy > 16.0 ? Double(forgettingFactorLambda) : 1.0
+
+            var piVec = [Double](repeating: 0.0, count: Self.tapCount)
+            for i in 0..<Self.tapCount {
+                var acc = 0.0
+                for j in 0..<Self.tapCount {
+                    acc += rlsCovarianceP[i][j] * rlsDelayLine[j]
+                }
+                piVec[i] = acc
+            }
+
+            var uDotPi = 0.0
+            for i in 0..<Self.tapCount {
+                uDotPi += rlsDelayLine[i] * piVec[i]
+            }
+            let denom = max(1e-12, lam + max(0.0, uDotPi))
+            var gainK = [Double](repeating: 0.0, count: Self.tapCount)
+            for i in 0..<Self.tapCount {
+                gainK[i] = piVec[i] / denom
+            }
+
+            var priorPred = 0.0
+            for i in 0..<Self.tapCount {
+                priorPred += rlsWeights[i] * rlsDelayLine[i]
+            }
+            let priorError = dFiltered - priorPred
+
+            for i in 0..<Self.tapCount {
+                rlsWeights[i] += gainK[i] * priorError
+            }
+
+            let invLam = 1.0 / lam
+            var nextP = rlsCovarianceP
+            var traceP = 0.0
             for i in 0..<Self.tapCount {
                 for j in 0..<Self.tapCount {
-                    nextP[i][j] *= scale
+                    nextP[i][j] = (rlsCovarianceP[i][j] - gainK[i] * piVec[j]) * invLam
+                }
+                traceP += nextP[i][i]
+            }
+            if traceP > 0.01 {
+                let scale = 0.01 / traceP
+                for i in 0..<Self.tapCount {
+                    for j in 0..<Self.tapCount {
+                        nextP[i][j] *= scale
+                    }
                 }
             }
-        }
-        for i in 0..<Self.tapCount {
-            for j in (i + 1)..<Self.tapCount {
-                let sym = 0.5 * (nextP[i][j] + nextP[j][i])
-                nextP[i][j] = sym
-                nextP[j][i] = sym
+            for i in 0..<Self.tapCount {
+                for j in (i + 1)..<Self.tapCount {
+                    let sym = 0.5 * (nextP[i][j] + nextP[j][i])
+                    nextP[i][j] = sym
+                    nextP[j][i] = sym
+                }
             }
-        }
-        rlsCovarianceP = nextP
+            rlsCovarianceP = nextP
 
-        // Parallel 1D Kalman state update for rapid ocular dipole tracking
-        let qProcess = 1e-5
-        let rMeas = 64.0
-        let pPred = kalmanVarianceP + qProcess
-        let kKalman = (pPred * rFiltered) / (rFiltered * pPred * rFiltered + rMeas)
-        let kalmanInnov = dFiltered - kalmanStateGain * rFiltered
-        kalmanStateGain += kKalman * kalmanInnov
-        kalmanVarianceP = min(max((1.0 - kKalman * rFiltered) * pPred, 1e-6), 1.0)
+            // Parallel 1D Kalman state update for rapid ocular dipole tracking
+            let rMeas = 64.0
+            let pPred = kalmanVarianceP + qProcess
+            let kKalman = (pPred * rFiltered) / (rFiltered * pPred * rFiltered + rMeas)
+            let kalmanInnov = dFiltered - kalmanStateGain * rFiltered
+            kalmanStateGain += kKalman * kalmanInnov
+            kalmanVarianceP = min(max((1.0 - kKalman * rFiltered) * pPred, 1e-6), 1.0)
+        }
 
         var postPred = 0.0
         for i in 0..<Self.tapCount {
@@ -951,10 +1637,19 @@ public struct EEGArtifactFilterBank: Sendable {
     }
 
     /// Processes a 4-channel `EEGQuadSample` using the vertical/horizontal EOG reference vector
-    /// `r[n] = [v_AF7[n] + v_AF8[n], v_AF7[n] - v_AF8[n]]^T` low-pass filtered below 12 Hz.
+    /// `r[n] = [v_AF7[n] + v_AF8[n], v_AF7[n] - v_AF8[n]]^T` with `isSynthetic`-gated RLS weight updates
+    /// and soft filter re-priming on large-gap discontinuities.
     public mutating func processQuadSample(
-        _ sample: EEGQuadSample
+        _ sample: EEGQuadSample,
+        isSynthetic: Bool = false,
+        isPostDiscontinuity: Bool = false
     ) -> (cleaned: EEGQuadSample, eogVertical: Float, eogHorizontal: Float) {
+        if !hasPrimedInitialQuadDC {
+            reprimeAfterDiscontinuity(with: sample, isInitialPrime: true)
+        } else if isPostDiscontinuity {
+            reprimeAfterDiscontinuity(with: sample, isInitialPrime: false)
+        }
+
         let rawChannels = [
             Double(sample.tp9),
             Double(sample.af7),
@@ -976,6 +1671,8 @@ public struct EEGArtifactFilterBank: Sendable {
         let rawHoriz = (conditioned[1] - conditioned[0]) - (conditioned[2] - conditioned[3])
         let vEOG = rawVert
         let hEOG = rawHoriz
+        latestSmoothedEOGVerticalUV = Float(eogLowPassVertical.process(rawVert))
+        latestSmoothedEOGHorizontalUV = Float(eogLowPassHorizontal.process(rawHoriz))
 
         for k in stride(from: 3, through: 1, by: -1) {
             eogVertDelay[k] = eogVertDelay[k - 1]
@@ -987,45 +1684,82 @@ public struct EEGArtifactFilterBank: Sendable {
         let rVec = eogVertDelay + eogHorizDelay
         var rEnergy = 0.0
         for v in rVec { rEnergy += v * v }
-        let lam = rEnergy > 9.0 ? Double(forgettingFactorLambda) : 1.0
-        let invLam = 1.0 / lam
         let tapN = Self.dualEOGTapCount
+        let gateRLSUpdate = isSynthetic || (warmupSuppressionRemainingSamples > 0)
 
         var cleanedChannels = [Float](repeating: 0.0, count: 4)
-        for ch in 0..<4 {
-            var piVec = [Double](repeating: 0.0, count: tapN)
-            for i in 0..<tapN {
-                var acc = 0.0
-                for j in 0..<tapN {
-                    acc += quadChannelRLSCovariance[ch][i][j] * rVec[j]
+        if gateRLSUpdate {
+            syntheticPredictOnlyStepCount += 1
+            for ch in 0..<4 {
+                for i in 0..<tapN {
+                    quadChannelRLSCovariance[ch][i][i] = min(quadChannelRLSCovariance[ch][i][i] + 1e-8, 0.05)
                 }
-                piVec[i] = acc
+                var postPred = 0.0
+                for i in 0..<tapN { postPred += quadChannelRLSWeights[ch][i] * rVec[i] }
+                cleanedChannels[ch] = Float(conditioned[ch] - postPred)
             }
+        } else {
+            let lam = rEnergy > 9.0 ? Double(forgettingFactorLambda) : 1.0
+            let invLam = 1.0 / lam
 
-            var rDotPi = 0.0
-            for i in 0..<tapN { rDotPi += rVec[i] * piVec[i] }
-            let denom = max(1e-12, lam + rDotPi)
-            var gainK = [Double](repeating: 0.0, count: tapN)
-            for i in 0..<tapN { gainK[i] = piVec[i] / denom }
-
-            var priorPred = 0.0
-            for i in 0..<tapN { priorPred += quadChannelRLSWeights[ch][i] * rVec[i] }
-            let priorErr = conditioned[ch] - priorPred
-
-            for i in 0..<tapN {
-                quadChannelRLSWeights[ch][i] += gainK[i] * priorErr
-            }
-
-            for i in 0..<tapN {
-                for j in 0..<tapN {
-                    quadChannelRLSCovariance[ch][i][j] = (quadChannelRLSCovariance[ch][i][j] - gainK[i] * piVec[j]) * invLam
+            for ch in 0..<4 {
+                var piVec = [Double](repeating: 0.0, count: tapN)
+                for i in 0..<tapN {
+                    var acc = 0.0
+                    for j in 0..<tapN {
+                        acc += quadChannelRLSCovariance[ch][i][j] * rVec[j]
+                    }
+                    piVec[i] = acc
                 }
-                quadChannelRLSCovariance[ch][i][i] = min(max(quadChannelRLSCovariance[ch][i][i], 1e-6), 0.05)
-            }
 
-            var postPred = 0.0
-            for i in 0..<tapN { postPred += quadChannelRLSWeights[ch][i] * rVec[i] }
-            cleanedChannels[ch] = Float(conditioned[ch] - postPred)
+                var rDotPi = 0.0
+                for i in 0..<tapN { rDotPi += rVec[i] * piVec[i] }
+                let denom = max(1e-12, lam + max(0.0, rDotPi))
+                var gainK = [Double](repeating: 0.0, count: tapN)
+                for i in 0..<tapN { gainK[i] = piVec[i] / denom }
+
+                var priorPred = 0.0
+                for i in 0..<tapN { priorPred += quadChannelRLSWeights[ch][i] * rVec[i] }
+                let priorErr = conditioned[ch] - priorPred
+
+                for i in 0..<tapN {
+                    quadChannelRLSWeights[ch][i] += gainK[i] * priorErr
+                }
+
+                var nextP = quadChannelRLSCovariance[ch]
+                var traceP = 0.0
+                for i in 0..<tapN {
+                    for j in 0..<tapN {
+                        nextP[i][j] = (quadChannelRLSCovariance[ch][i][j] - gainK[i] * piVec[j]) * invLam
+                    }
+                    traceP += nextP[i][i]
+                }
+                if traceP > 0.05 {
+                    let scale = 0.05 / traceP
+                    for i in 0..<tapN {
+                        for j in 0..<tapN {
+                            nextP[i][j] *= scale
+                        }
+                    }
+                }
+                for i in 0..<tapN {
+                    nextP[i][i] = min(max(nextP[i][i], 1e-8), 0.05)
+                    for j in (i + 1)..<tapN {
+                        let sym = 0.5 * (nextP[i][j] + nextP[j][i])
+                        nextP[i][j] = sym
+                        nextP[j][i] = sym
+                    }
+                }
+                quadChannelRLSCovariance[ch] = nextP
+
+                var postPred = 0.0
+                for i in 0..<tapN { postPred += quadChannelRLSWeights[ch][i] * rVec[i] }
+                cleanedChannels[ch] = Float(conditioned[ch] - postPred)
+            }
+        }
+
+        if warmupSuppressionRemainingSamples > 0 {
+            warmupSuppressionRemainingSamples -= 1
         }
 
         let cleanedSample = EEGQuadSample(
@@ -1036,6 +1770,102 @@ public struct EEGArtifactFilterBank: Sendable {
             timestamp: sample.timestamp
         )
         return (cleanedSample, Float(vEOG), Float(hEOG))
+    }
+
+    /// Processes a synchronized BLE sample frame, applying `isSynthetic` RLS gating and `isPostDiscontinuity` soft re-priming.
+    public mutating func processSynchronizedSample(
+        _ syncSample: EEGBLESynchronizedSample
+    ) -> (cleaned: EEGQuadSample, eogVertical: Float, eogHorizontal: Float, isInWarmup: Bool) {
+        let willBeInWarmup = syncSample.isPostDiscontinuity || (warmupSuppressionRemainingSamples > 0)
+        let res = processQuadSample(
+            syncSample.sample,
+            isSynthetic: syncSample.isSynthetic,
+            isPostDiscontinuity: syncSample.isPostDiscontinuity
+        )
+        return (res.cleaned, res.eogVertical, res.eogHorizontal, willBeInWarmup)
+    }
+}
+
+/// Physiological ocular blink and unphysiological transient slew-spike detector gated by `isSynthetic` and post-gap warmup state.
+public struct EEGOcularBlinkAndSpikeDetector: Sendable {
+    public let blinkThresholdUV: Float
+    public let slewSpikeThresholdUV: Float
+    public let minMeasuredSamplesAboveThreshold: Int
+    public let refractorySamples: Int
+
+    public private(set) var detectedBlinkSampleIndices: [UInt64] = []
+    public private(set) var falseSpikeCount: Int = 0
+    private var previousCleanedSample: EEGQuadSample?
+    private var consecutiveAboveCount: Int = 0
+    private var refractoryRemaining: Int = 0
+
+    public init(
+        blinkThresholdUV: Float = 95.0,
+        slewSpikeThresholdUV: Float = 45.0,
+        minMeasuredSamplesAboveThreshold: Int = 4,
+        refractorySamples: Int = 51
+    ) {
+        self.blinkThresholdUV = max(25.0, blinkThresholdUV)
+        self.slewSpikeThresholdUV = max(15.0, slewSpikeThresholdUV)
+        self.minMeasuredSamplesAboveThreshold = max(2, minMeasuredSamplesAboveThreshold)
+        self.refractorySamples = max(8, refractorySamples)
+    }
+
+    public mutating func reset() {
+        detectedBlinkSampleIndices.removeAll(keepingCapacity: true)
+        falseSpikeCount = 0
+        previousCleanedSample = nil
+        consecutiveAboveCount = 0
+        refractoryRemaining = 0
+    }
+
+    @discardableResult
+    public mutating func observe(
+        sampleIndex: UInt64,
+        cleanedSample: EEGQuadSample,
+        eogVerticalUV: Float,
+        isSynthetic: Bool,
+        isInWarmup: Bool
+    ) -> Bool {
+        let allFinite = cleanedSample.tp9.isFinite
+            && cleanedSample.af7.isFinite
+            && cleanedSample.af8.isFinite
+            && cleanedSample.tp10.isFinite
+            && eogVerticalUV.isFinite
+
+        if let prev = previousCleanedSample {
+            if !allFinite {
+                falseSpikeCount += 1
+            } else if !isInWarmup {
+                let slewAF7 = abs(cleanedSample.af7 - prev.af7)
+                let slewAF8 = abs(cleanedSample.af8 - prev.af8)
+                let maxFrontalSlew = max(slewAF7, slewAF8)
+                if maxFrontalSlew > slewSpikeThresholdUV {
+                    falseSpikeCount += 1
+                }
+            }
+        }
+        previousCleanedSample = cleanedSample
+
+        if refractoryRemaining > 0 {
+            refractoryRemaining -= 1
+        }
+
+        var triggeredBlink = false
+        if isInWarmup || isSynthetic || !allFinite {
+            consecutiveAboveCount = max(0, consecutiveAboveCount - 1)
+        } else if eogVerticalUV > blinkThresholdUV {
+            consecutiveAboveCount += 1
+            if consecutiveAboveCount >= minMeasuredSamplesAboveThreshold && refractoryRemaining == 0 {
+                detectedBlinkSampleIndices.append(sampleIndex)
+                refractoryRemaining = refractorySamples
+                consecutiveAboveCount = 0
+                triggeredBlink = true
+            }
+        } else {
+            consecutiveAboveCount = 0
+        }
+        return triggeredBlink
     }
 }
 
@@ -1613,7 +2443,9 @@ public final class EEGBLEHardwareClient: NSObject, CBCentralManagerDelegate, CBP
     private var centralManager: CBCentralManager?
     private var connectedPeripheral: CBPeripheral?
     private var onSampleHandler: (@Sendable (EEGQuadSample) -> Void)?
+    private var onSynchronizedBatchHandler: (@Sendable ([EEGBLESynchronizedSample]) -> Void)?
     private var packetDecoder = EEGBLEPacketDecoder(sampleRate: 256.0)
+    private var streamSynchronizer = EEGBLEStreamSynchronizer(sampleRate: 256.0)
     public private(set) var isConnected: Bool = false
     public private(set) var discoveredPeripheralName: String?
 
@@ -1625,6 +2457,12 @@ public final class EEGBLEHardwareClient: NSObject, CBCentralManagerDelegate, CBP
     public func setSampleCallback(_ handler: (@Sendable (EEGQuadSample) -> Void)?) {
         lock.lock()
         onSampleHandler = handler
+        lock.unlock()
+    }
+
+    public func setSynchronizedBatchCallback(_ handler: (@Sendable ([EEGBLESynchronizedSample]) -> Void)?) {
+        lock.lock()
+        onSynchronizedBatchHandler = handler
         lock.unlock()
     }
 
@@ -1724,14 +2562,21 @@ public final class EEGBLEHardwareClient: NSObject, CBCentralManagerDelegate, CBP
     ) {
         _ = peripheral
         guard error == nil, let payload = characteristic.value else { return }
+        let arrivalTime = ProcessInfo.processInfo.systemUptime
 
         lock.lock()
-        let decodedSamples = packetDecoder.decodePacketWithSequenceInterpolation(payload)
-        let callback = onSampleHandler
+        let synchronizedSamples = streamSynchronizer.ingestBLEPacket(payload, arrivalTimestamp: arrivalTime)
+        let batchCallback = onSynchronizedBatchHandler
+        let singleCallback = onSampleHandler
         lock.unlock()
 
-        for sample in decodedSamples {
-            callback?(sample)
+        if !synchronizedSamples.isEmpty {
+            batchCallback?(synchronizedSamples)
+            if let singleCallback {
+                for item in synchronizedSamples {
+                    singleCallback(item.sample)
+                }
+            }
         }
     }
 
@@ -1758,6 +2603,9 @@ public final class EEGBrainComputerInterface {
     public var cleanedAF7Scope: [Float] = [Float](repeating: 0.0, count: 128)
     public var latestEOGVerticalUV: Float = 0.0
     public var latestEOGHorizontalUV: Float = 0.0
+
+    public private(set) var lockstepRingBuffer = EEGQuadLockstepRingBuffer(capacity: 768)
+    public private(set) var blinkAndSpikeDetector = EEGOcularBlinkAndSpikeDetector()
 
     private var corticalSimulator = SyntheticCorticalEEGGenerator()
     private var artifactFilterBank = EEGArtifactFilterBank()
@@ -1790,12 +2638,12 @@ public final class EEGBrainComputerInterface {
 
         seedInitialCorticalWindow()
         #if canImport(CoreBluetooth)
-        bleClient.setSampleCallback { [weak self] sample in
+        bleClient.setSynchronizedBatchCallback { [weak self] batch in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isBLEHardwareConnected = true
                 if !self.isUsingSyntheticSimulator {
-                    self.ingestIncomingQuadSample(sample)
+                    self.ingestSynchronizedSamples(batch)
                 }
             }
         }
@@ -1804,10 +2652,17 @@ public final class EEGBrainComputerInterface {
 
     private func seedInitialCorticalWindow() {
         let initialCount = 512
-        for _ in 0..<initialCount {
+        for idx in 0..<initialCount {
             let blinkAmp: Float = isPeriodicOcularBlinkEnabled ? 165.0 : 0.0
             let step = corticalSimulator.stepWithReference(injectBlinkAmplitude: blinkAmp)
             let cleaned = artifactFilterBank.processQuadSample(step.sample)
+            lockstepRingBuffer.push(
+                raw: step.sample,
+                cleaned: cleaned.cleaned,
+                sampleIndex: UInt64(idx),
+                isSynthetic: false,
+                isPostDiscontinuity: false
+            )
             rawSampleHistory.append(step.sample)
             cleanedSampleHistory.append(cleaned.cleaned)
         }
@@ -1847,13 +2702,58 @@ public final class EEGBrainComputerInterface {
         }
     }
 
+    public func ingestSynchronizedSamples(_ synchronizedBatch: [EEGBLESynchronizedSample]) {
+        for syncItem in synchronizedBatch {
+            let filtered = artifactFilterBank.processSynchronizedSample(syncItem)
+            latestEOGVerticalUV = filtered.eogVertical
+            latestEOGHorizontalUV = filtered.eogHorizontal
+
+            blinkAndSpikeDetector.observe(
+                sampleIndex: syncItem.sampleIndex,
+                cleanedSample: filtered.cleaned,
+                eogVerticalUV: filtered.eogVertical,
+                isSynthetic: syncItem.isSynthetic,
+                isInWarmup: filtered.isInWarmup
+            )
+
+            lockstepRingBuffer.push(
+                raw: syncItem.sample,
+                cleaned: filtered.cleaned,
+                sampleIndex: syncItem.sampleIndex,
+                isSynthetic: syncItem.isSynthetic,
+                isPostDiscontinuity: syncItem.isPostDiscontinuity
+            )
+            appendToBoundedHistory(raw: syncItem.sample, cleaned: filtered.cleaned)
+        }
+    }
+
     public func ingestIncomingQuadSample(_ rawSample: EEGQuadSample) {
         let filtered = artifactFilterBank.processQuadSample(rawSample)
         latestEOGVerticalUV = filtered.eogVertical
         latestEOGHorizontalUV = filtered.eogHorizontal
 
-        rawSampleHistory.append(rawSample)
-        cleanedSampleHistory.append(filtered.cleaned)
+        let nextIdx = lockstepRingBuffer.totalWritten
+        blinkAndSpikeDetector.observe(
+            sampleIndex: nextIdx,
+            cleanedSample: filtered.cleaned,
+            eogVerticalUV: filtered.eogVertical,
+            isSynthetic: false,
+            isInWarmup: artifactFilterBank.warmupSuppressionRemainingSamples > 0
+        )
+
+        lockstepRingBuffer.push(
+            raw: rawSample,
+            cleaned: filtered.cleaned,
+            sampleIndex: nextIdx,
+            isSynthetic: false,
+            isPostDiscontinuity: false
+        )
+        appendToBoundedHistory(raw: rawSample, cleaned: filtered.cleaned)
+    }
+
+    private func appendToBoundedHistory(raw: EEGQuadSample, cleaned: EEGQuadSample) {
+        rawSampleHistory.append(raw)
+        cleanedSampleHistory.append(cleaned)
 
         let maxWindow = 768 // 3.0 seconds at 256 Hz (3 overlapping 256-pt epochs)
         if rawSampleHistory.count > maxWindow {

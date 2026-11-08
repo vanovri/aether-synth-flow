@@ -268,6 +268,8 @@ public struct Phase9WaveguideAndCorticalEEGCardView: View {
                             let strideStep = max(1, n / 32)
                             let cellW = canvasSize.width / CGFloat(n / strideStep)
                             let cellH = canvasSize.height / CGFloat(n / strideStep)
+                            let pressureNoiseFloor: Float = 0.008
+                            let pressureDisplayGain: Float = 2.5
 
                             for gy in stride(from: 0, to: n, by: strideStep) {
                                 for gx in stride(from: 0, to: n, by: strideStep) {
@@ -282,8 +284,9 @@ public struct Phase9WaveguideAndCorticalEEGCardView: View {
                                     )
                                     if obs == 2 {
                                         context.fill(Path(cRect), with: .color(.white.opacity(0.55)))
-                                    } else if abs(p) > 0.008 {
-                                        let norm = Double(min(max(abs(p) * 2.5, 0.0), 1.0))
+                                    } else if abs(p) > pressureNoiseFloor {
+                                        let scaledMag = abs(p) * pressureDisplayGain
+                                        let norm = Double(min(max(scaledMag, 0.0), 1.0))
                                         let col = p >= 0 ? accent.opacity(norm) : Color.cyan.opacity(norm)
                                         context.fill(Path(cRect), with: .color(col))
                                     }
@@ -513,10 +516,14 @@ public struct Phase10QuantumAndCapstoneCardView: View {
                 }
 
                 if let report = coordinator.latestCapstoneReport {
+                    let statusBadge = report.allInvariantsPassed ? "PASS" : "FAIL"
+                    let statusColor: Color = report.allInvariantsPassed ? .green : .orange
+                    let p50Text = String(format: "%.0fµs", report.p50Microseconds)
+                    let p99Text = String(format: "%.0fµs", report.p99Microseconds)
                     HStack {
-                        Text("12/12 PASS · p50 \(String(format: "%.0fµs", report.p50Microseconds)) · p99 \(String(format: "%.0fµs", report.p99Microseconds))")
+                        Text("\(report.passedStageCount)/\(report.totalStageCount) \(statusBadge) · p50 \(p50Text) · p99 \(p99Text)")
                             .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .foregroundStyle(.green)
+                            .foregroundStyle(statusColor)
                         Spacer()
                         Text("SHA-256 \(report.reportSHA256Hex.prefix(16))…")
                             .font(.system(size: 9, weight: .medium, design: .monospaced))

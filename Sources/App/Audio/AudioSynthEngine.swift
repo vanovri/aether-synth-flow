@@ -45,8 +45,11 @@ public struct SynthParameters: Sendable, Equatable {
     public var fdtdStiffness: Float            // [0.0 ... 1.0] 2D FDTD biharmonic stiffness kappa
     public var fdtdWaveSpeed: Float            // [120.0 ... 680.0] 2D FDTD acoustic wave speed c (m/s)
     public var fdtdDampingSigma: Float         // [0.05 ... 12.0] 2D FDTD visco-thermal damping sigma_0
+    public var fdtdNonlinearTension: Float     // [0.0 ... 0.35] 2D FDTD Berger cubic nonlinear tension gamma
     public var fdtdMicLeftXY: SIMD2<Float>     // [0.08 ... 0.92]^2 virtual left microphone probe (x_L, y_L)
     public var fdtdMicRightXY: SIMD2<Float>    // [0.08 ... 0.92]^2 virtual right microphone probe (x_R, y_R)
+    public var tensorBondDimensionTarget: Int  // [2 ... 16] Active slice index on pre-allocated chi_max=16 MPS buffer
+    public var mpsBondSliceBank: PreallocatedMPSBondSliceBank // Pre-allocated chi_max=16 inline SIMD4 bond buffer
     public var isMuted: Bool
 
     public var fdtdWaveguideMix: Float {
@@ -93,8 +96,11 @@ public struct SynthParameters: Sendable, Equatable {
         fdtdStiffness: Float = 0.22,
         fdtdWaveSpeed: Float = 343.0,
         fdtdDampingSigma: Float = 1.4,
+        fdtdNonlinearTension: Float = 0.08,
         fdtdMicLeftXY: SIMD2<Float> = SIMD2<Float>(0.30, 0.44),
         fdtdMicRightXY: SIMD2<Float> = SIMD2<Float>(0.70, 0.56),
+        tensorBondDimensionTarget: Int = 16,
+        mpsBondSliceBank: PreallocatedMPSBondSliceBank = PreallocatedMPSBondSliceBank(),
         isMuted: Bool = false
     ) {
         self.carrierFrequencyHz = min(max(carrierFrequencyHz, 60.0), 880.0)
@@ -130,8 +136,14 @@ public struct SynthParameters: Sendable, Equatable {
         self.fdtdStiffness = min(max(fdtdStiffness, 0.0), 1.0)
         self.fdtdWaveSpeed = min(max(fdtdWaveSpeed, 120.0), 680.0)
         self.fdtdDampingSigma = min(max(fdtdDampingSigma, 0.05), 12.0)
+        self.fdtdNonlinearTension = min(max(fdtdNonlinearTension, 0.0), 0.35)
         self.fdtdMicLeftXY = simd_clamp(fdtdMicLeftXY, SIMD2<Float>(repeating: 0.08), SIMD2<Float>(repeating: 0.92))
         self.fdtdMicRightXY = simd_clamp(fdtdMicRightXY, SIMD2<Float>(repeating: 0.08), SIMD2<Float>(repeating: 0.92))
+        let clampedChi = min(max(tensorBondDimensionTarget, 2), PreallocatedMPSBondSliceBank.chiMax)
+        self.tensorBondDimensionTarget = clampedChi
+        var sliceBank = mpsBondSliceBank
+        sliceBank.selectActiveBondSlice(clampedChi)
+        self.mpsBondSliceBank = sliceBank
         self.isMuted = isMuted
     }
 
@@ -282,6 +294,10 @@ public struct ProceduralSynthKernel: Sendable {
     private var smoothWFSDelaySamples: Double = 0.0
     private var smoothWFSGain: Float = 1.0
 
+    // Phase 10 Pre-Allocated chi_max = 16 MPS Bond Slice Buffer (O(1) Active Slice Indexing Without Array Allocation)
+    public private(set) var activeMPSBondSliceIndex: Int = PreallocatedMPSBondSliceBank.chiMax
+    public private(set) var preallocatedMPSBondBuffer = PreallocatedMPSBondSliceBank()
+
     public init(sampleRate: Double, snapInitialParameters: SynthParameters? = nil) {
         let safeRate = max(8_000.0, sampleRate)
         self.sampleRate = safeRate
@@ -414,6 +430,15 @@ public struct ProceduralSynthKernel: Sendable {
             return AudioTelemetrySnapshot(isRendering: !target.isMuted)
         }
 
+        // O(1) active slice index update on pre-allocated chi_max=16 MPS bond buffer (zero Array allocation)
+        let clampedChi = min(max(target.tensorBondDimensionTarget, 2), PreallocatedMPSBondSliceBank.chiMax)
+        activeMPSBondSliceIndex = clampedChi
+        preallocatedMPSBondBuffer.slice0 = target.mpsBondSliceBank.slice0
+        preallocatedMPSBondBuffer.slice1 = target.mpsBondSliceBank.slice1
+        preallocatedMPSBondBuffer.slice2 = target.mpsBondSliceBank.slice2
+        preallocatedMPSBondBuffer.slice3 = target.mpsBondSliceBank.slice3
+        preallocatedMPSBondBuffer.selectActiveBondSlice(clampedChi)
+
         let baseSnapshot: AudioTelemetrySnapshot
         if target.isHRTFSpatializerEnabled {
             baseSnapshot = renderHRTFSpatialStereoBlock(
@@ -463,7 +488,10 @@ public struct ProceduralSynthKernel: Sendable {
                         excitation: excite,
                         waveSpeed: target.fdtdWaveSpeed + smoothCutoffHz * 0.02,
                         stiffnessKappa: target.fdtdStiffness,
-                        dampingSigma: target.fdtdDampingSigma
+                        dampingSigma: target.fdtdDampingSigma,
+                        nonlinearGamma: target.fdtdNonlinearTension,
+                        micLeftXY: fdtdResonator.leftMicNormalized,
+                        micRightXY: fdtdResonator.rightMicNormalized
                     )
                     l = l * (1.0 - 0.35 * smoothFDTDMix) + fdtdPair.0 * smoothFDTDMix
                     r = r * (1.0 - 0.35 * smoothFDTDMix) + fdtdPair.1 * smoothFDTDMix
@@ -693,6 +721,9 @@ public struct ProceduralSynthKernel: Sendable {
         target: SynthParameters
     ) -> AudioTelemetrySnapshot {
         let slewCoeff = Float(min(1.0, 35.0 * invSampleRate))
+        // Gesture-driven parameters (pinch / wrist / head pose) use tau = 1/300 s (~3.3 ms, 90% in ~7.7 ms)
+        // so spatial manipulation stays inside the 12 ms interaction budget; gain/mix/carrier keep tau ~28.6 ms.
+        let gestureSlewCoeff = Float(min(1.0, 300.0 * invSampleRate))
         let targetGain: Float = target.isMuted ? 0.0 : target.masterGain
         let clampedPLL = min(max(pllSampleRateScale, 0.9990), 1.0010)
         let effectiveInvSampleRate = invSampleRate * clampedPLL
@@ -707,17 +738,17 @@ public struct ProceduralSynthKernel: Sendable {
 
         for i in 0..<frameCount {
             smoothCarrierHz += slewCoeff * (target.carrierFrequencyHz - smoothCarrierHz)
-            smoothBeatHz += slewCoeff * (target.binauralBeatHz - smoothBeatHz)
+            smoothBeatHz += gestureSlewCoeff * (target.binauralBeatHz - smoothBeatHz)
             smoothBinauralMix += slewCoeff * (target.binauralMix - smoothBinauralMix)
             smoothPinkMix += slewCoeff * (target.pinkNoiseMix - smoothPinkMix)
             smoothPadMix += slewCoeff * (target.padMix - smoothPadMix)
-            smoothCutoffHz += slewCoeff * (target.filterCutoffHz - smoothCutoffHz)
-            smoothResonance += slewCoeff * (target.filterResonance - smoothResonance)
-            smoothDetuneCents += slewCoeff * (target.padDetuneCents - smoothDetuneCents)
+            smoothCutoffHz += gestureSlewCoeff * (target.filterCutoffHz - smoothCutoffHz)
+            smoothResonance += gestureSlewCoeff * (target.filterResonance - smoothResonance)
+            smoothDetuneCents += gestureSlewCoeff * (target.padDetuneCents - smoothDetuneCents)
             smoothMasterGain += slewCoeff * (targetGain - smoothMasterGain)
-            smoothBloom += slewCoeff * (target.bloomBoost - smoothBloom)
-            smoothSpatialPan += slewCoeff * (target.spatialPanOffset - smoothSpatialPan)
-            smoothElevationTilt += slewCoeff * (target.headElevationTilt - smoothElevationTilt)
+            smoothBloom += gestureSlewCoeff * (target.bloomBoost - smoothBloom)
+            smoothSpatialPan += gestureSlewCoeff * (target.spatialPanOffset - smoothSpatialPan)
+            smoothElevationTilt += gestureSlewCoeff * (target.headElevationTilt - smoothElevationTilt)
 
             let carrier = Double(smoothCarrierHz)
             let halfBeat = Double(smoothBeatHz) * 0.5
@@ -872,6 +903,9 @@ public struct ProceduralSynthKernel: Sendable {
         target: SynthParameters
     ) -> AudioTelemetrySnapshot {
         let slewCoeff = Float(min(1.0, 35.0 * invSampleRate))
+        // Gesture-driven parameters (pinch / wrist / head pose) use tau = 1/300 s (~3.3 ms, 90% in ~7.7 ms)
+        // so spatial manipulation stays inside the 12 ms interaction budget; gain/mix/carrier keep tau ~28.6 ms.
+        let gestureSlewCoeff = Float(min(1.0, 300.0 * invSampleRate))
         let targetGain: Float = target.isMuted ? 0.0 : target.masterGain
         let clampedPLL = min(max(pllSampleRateScale, 0.9990), 1.0010)
         let effectiveInvSampleRate = invSampleRate * clampedPLL
@@ -923,17 +957,17 @@ public struct ProceduralSynthKernel: Sendable {
 
             for i in 0..<chunk {
                 smoothCarrierHz += slewCoeff * (target.carrierFrequencyHz - smoothCarrierHz)
-                smoothBeatHz += slewCoeff * (target.binauralBeatHz - smoothBeatHz)
+                smoothBeatHz += gestureSlewCoeff * (target.binauralBeatHz - smoothBeatHz)
                 smoothBinauralMix += slewCoeff * (target.binauralMix - smoothBinauralMix)
                 smoothPinkMix += slewCoeff * (target.pinkNoiseMix - smoothPinkMix)
                 smoothPadMix += slewCoeff * (target.padMix - smoothPadMix)
-                smoothCutoffHz += slewCoeff * (target.filterCutoffHz - smoothCutoffHz)
-                smoothResonance += slewCoeff * (target.filterResonance - smoothResonance)
-                smoothDetuneCents += slewCoeff * (target.padDetuneCents - smoothDetuneCents)
+                smoothCutoffHz += gestureSlewCoeff * (target.filterCutoffHz - smoothCutoffHz)
+                smoothResonance += gestureSlewCoeff * (target.filterResonance - smoothResonance)
+                smoothDetuneCents += gestureSlewCoeff * (target.padDetuneCents - smoothDetuneCents)
                 smoothMasterGain += slewCoeff * (targetGain - smoothMasterGain)
-                smoothBloom += slewCoeff * (target.bloomBoost - smoothBloom)
-                smoothSpatialPan += slewCoeff * (target.spatialPanOffset - smoothSpatialPan)
-                smoothElevationTilt += slewCoeff * (target.headElevationTilt - smoothElevationTilt)
+                smoothBloom += gestureSlewCoeff * (target.bloomBoost - smoothBloom)
+                smoothSpatialPan += gestureSlewCoeff * (target.spatialPanOffset - smoothSpatialPan)
+                smoothElevationTilt += gestureSlewCoeff * (target.headElevationTilt - smoothElevationTilt)
 
                 let carrier = Double(smoothCarrierHz)
                 let halfBeat = Double(smoothBeatHz) * 0.5
@@ -1126,14 +1160,16 @@ public struct ProceduralSynthKernel: Sendable {
 public final class RealtimeAudioBridge: @unchecked Sendable {
     public static let scopeWindowLength: Int = 256
 
-    private let paramLock: UnsafeMutablePointer<os_unfair_lock_s>
-    private let telemetryLock: UnsafeMutablePointer<os_unfair_lock_s>
+    private let paramLock: UnsafeMutablePointer<os_unfair_lock>
+    private let telemetryLock: UnsafeMutablePointer<os_unfair_lock>
     private var sharedParameters: SynthParameters
     private var sharedOrchestraSync: RealtimeOrchestraSyncControl = RealtimeOrchestraSyncControl()
     private var sharedTelemetry: AudioTelemetrySnapshot
+    private var cachedTelemetryFallback: AudioTelemetrySnapshot
 
     private let scopeRingBuffer: UnsafeMutablePointer<Float>
     private var scopeWriteHead: Int = 0
+    private var cachedScopeWindowFallback: [Float]
 
     private var audioThreadCachedParameters: SynthParameters
     private var dspKernel: ProceduralSynthKernel
@@ -1155,17 +1191,19 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
         self.neuralRingBuffer = neuralRingBuffer
         self.drirConvolverBridge = drirConvolverBridge
 
-        self.paramLock = UnsafeMutablePointer<os_unfair_lock_s>.allocate(capacity: 1)
-        self.paramLock.initialize(to: os_unfair_lock_s())
+        self.paramLock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+        self.paramLock.initialize(to: os_unfair_lock())
 
-        self.telemetryLock = UnsafeMutablePointer<os_unfair_lock_s>.allocate(capacity: 1)
-        self.telemetryLock.initialize(to: os_unfair_lock_s())
+        self.telemetryLock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+        self.telemetryLock.initialize(to: os_unfair_lock())
 
         self.scopeRingBuffer = UnsafeMutablePointer<Float>.allocate(capacity: Self.scopeWindowLength)
         self.scopeRingBuffer.initialize(repeating: 0, count: Self.scopeWindowLength)
+        self.cachedScopeWindowFallback = [Float](repeating: 0, count: Self.scopeWindowLength)
 
         self.sharedParameters = initialParameters
         self.sharedTelemetry = AudioTelemetrySnapshot()
+        self.cachedTelemetryFallback = AudioTelemetrySnapshot()
         self.audioThreadCachedParameters = initialParameters
         self.dspKernel = ProceduralSynthKernel(sampleRate: sampleRate, snapInitialParameters: nil)
 
@@ -1201,20 +1239,51 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
     }
 
     public func readTelemetry() -> AudioTelemetrySnapshot {
-        os_unfair_lock_lock(telemetryLock)
+        if os_unfair_lock_trylock(telemetryLock) {
+            let copy = sharedTelemetry
+            cachedTelemetryFallback = copy
+            os_unfair_lock_unlock(telemetryLock)
+            return copy
+        }
+        return cachedTelemetryFallback
+    }
+
+    public func tryReadTelemetry() -> AudioTelemetrySnapshot? {
+        guard os_unfair_lock_trylock(telemetryLock) else {
+            return nil
+        }
         let copy = sharedTelemetry
+        cachedTelemetryFallback = copy
         os_unfair_lock_unlock(telemetryLock)
         return copy
     }
 
     public func copyRecentMonoWindow() -> [Float] {
+        if os_unfair_lock_trylock(telemetryLock) {
+            var result = [Float](repeating: 0, count: Self.scopeWindowLength)
+            let head = scopeWriteHead
+            for i in 0..<Self.scopeWindowLength {
+                let ringIdx = (head + i) & (Self.scopeWindowLength - 1)
+                result[i] = scopeRingBuffer[ringIdx]
+            }
+            cachedScopeWindowFallback = result
+            os_unfair_lock_unlock(telemetryLock)
+            return result
+        }
+        return cachedScopeWindowFallback
+    }
+
+    public func tryCopyRecentMonoWindow() -> [Float]? {
+        guard os_unfair_lock_trylock(telemetryLock) else {
+            return nil
+        }
         var result = [Float](repeating: 0, count: Self.scopeWindowLength)
-        os_unfair_lock_lock(telemetryLock)
         let head = scopeWriteHead
         for i in 0..<Self.scopeWindowLength {
             let ringIdx = (head + i) & (Self.scopeWindowLength - 1)
             result[i] = scopeRingBuffer[ringIdx]
         }
+        cachedScopeWindowFallback = result
         os_unfair_lock_unlock(telemetryLock)
         return result
     }
@@ -1222,6 +1291,7 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
     public func resetTelemetry() {
         os_unfair_lock_lock(telemetryLock)
         sharedTelemetry = AudioTelemetrySnapshot(isRendering: false)
+        cachedTelemetryFallback = AudioTelemetrySnapshot(isRendering: false)
         for i in 0..<Self.scopeWindowLength {
             scopeRingBuffer[i] = 0
         }
@@ -1327,11 +1397,162 @@ public final class RealtimeAudioBridge: @unchecked Sendable {
     }
 }
 
+// MARK: - Non-Isolated Lock-Protected Fast-Path Slot for Zero-Hop Parameter & Telemetry Exchange
+
+public final class RealtimeBridgeSlot: @unchecked Sendable {
+    private let lock: UnsafeMutablePointer<os_unfair_lock>
+    private var bridge: RealtimeAudioBridge?
+    private var stagedParameters: SynthParameters = SynthParameters()
+    private var cachedParametersSnapshot: SynthParameters = SynthParameters()
+    private var cachedTelemetrySnapshot: AudioTelemetrySnapshot = AudioTelemetrySnapshot(isRendering: false)
+    private var cachedScopeWindowSnapshot: (samples: [Float], sampleRate: Double) = (
+        [Float](repeating: 0, count: RealtimeAudioBridge.scopeWindowLength),
+        48_000.0
+    )
+    private var isRunning: Bool = false
+
+    public init() {
+        self.lock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+        self.lock.initialize(to: os_unfair_lock())
+    }
+
+    deinit {
+        lock.deinitialize(count: 1)
+        lock.deallocate()
+    }
+
+    public func installBridge(_ newBridge: RealtimeAudioBridge?) {
+        os_unfair_lock_lock(lock)
+        bridge = newBridge
+        if let newBridge {
+            var next = stagedParameters
+            if !isRunning {
+                next.isMuted = true
+            }
+            cachedParametersSnapshot = next
+            newBridge.writeParameters(next)
+        }
+        os_unfair_lock_unlock(lock)
+    }
+
+    public func setRunning(_ running: Bool, parameters: SynthParameters) {
+        os_unfair_lock_lock(lock)
+        isRunning = running
+        var next = parameters
+        next.isMuted = !running
+        stagedParameters = next
+        cachedParametersSnapshot = next
+        let currentBridge = bridge
+        os_unfair_lock_unlock(lock)
+        currentBridge?.writeParameters(next)
+    }
+
+    public func writeParameters(_ parameters: SynthParameters) {
+        os_unfair_lock_lock(lock)
+        var next = parameters
+        if !isRunning {
+            next.isMuted = true
+        }
+        stagedParameters = next
+        cachedParametersSnapshot = next
+        let currentBridge = bridge
+        os_unfair_lock_unlock(lock)
+        currentBridge?.writeParameters(next)
+    }
+
+    public func readParametersWaitFree() -> SynthParameters {
+        guard os_unfair_lock_trylock(lock) else {
+            return cachedParametersSnapshot
+        }
+        let snapshot = stagedParameters
+        cachedParametersSnapshot = snapshot
+        os_unfair_lock_unlock(lock)
+        return snapshot
+    }
+
+    public func readTelemetry() -> AudioTelemetrySnapshot {
+        guard os_unfair_lock_trylock(lock) else {
+            return cachedTelemetrySnapshot
+        }
+        let running = isRunning
+        let currentBridge = bridge
+        let fallback = cachedTelemetrySnapshot
+        os_unfair_lock_unlock(lock)
+        guard running, let currentBridge else {
+            return AudioTelemetrySnapshot(isRendering: false)
+        }
+        if let latest = currentBridge.tryReadTelemetry() {
+            if os_unfair_lock_trylock(lock) {
+                cachedTelemetrySnapshot = latest
+                os_unfair_lock_unlock(lock)
+            }
+            return latest
+        }
+        return fallback
+    }
+
+    public func readScopeWindow() -> (samples: [Float], sampleRate: Double) {
+        guard os_unfair_lock_trylock(lock) else {
+            return cachedScopeWindowSnapshot
+        }
+        let running = isRunning
+        let currentBridge = bridge
+        let fallback = cachedScopeWindowSnapshot
+        os_unfair_lock_unlock(lock)
+        guard running, let currentBridge else {
+            return ([Float](repeating: 0, count: RealtimeAudioBridge.scopeWindowLength), 48_000.0)
+        }
+        if let window = currentBridge.tryCopyRecentMonoWindow() {
+            let nextSnap = (samples: window, sampleRate: currentBridge.sampleRate)
+            if os_unfair_lock_trylock(lock) {
+                cachedScopeWindowSnapshot = nextSnap
+                os_unfair_lock_unlock(lock)
+            }
+            return nextSnap
+        }
+        return fallback
+    }
+
+    public func tryCopyRecentMonoWindow(into destination: UnsafeMutablePointer<Float>, count: Int) -> Int {
+        guard count > 0 else { return 0 }
+        let copyCount = min(count, RealtimeAudioBridge.scopeWindowLength)
+        guard os_unfair_lock_trylock(lock) else {
+            for i in 0..<copyCount {
+                destination[i] = 0.0
+            }
+            return copyCount
+        }
+        let running = isRunning
+        let currentBridge = bridge
+        if !running || currentBridge == nil {
+            let startOffset = max(0, cachedScopeWindowSnapshot.samples.count - copyCount)
+            for i in 0..<copyCount {
+                destination[i] = cachedScopeWindowSnapshot.samples[startOffset + i]
+            }
+            os_unfair_lock_unlock(lock)
+            return copyCount
+        }
+        os_unfair_lock_unlock(lock)
+        if let window = currentBridge?.tryCopyRecentMonoWindow() {
+            let startOffset = max(0, window.count - copyCount)
+            for i in 0..<copyCount {
+                destination[i] = window[startOffset + i]
+            }
+            return copyCount
+        }
+        for i in 0..<copyCount {
+            destination[i] = 0.0
+        }
+        return copyCount
+    }
+}
+
 // MARK: - Thread-Safe Actor Managing AVAudioEngine & Procedural Source Node
 
 public actor AudioSynthEngine {
     public nonisolated let neuralRingBuffer = NeuralAudioRingBuffer()
     public nonisolated let drirConvolverBridge = RayTracedDRIRConvolverBridge()
+    private nonisolated let bridgeSlot = RealtimeBridgeSlot()
 
     private let engine = AVAudioEngine()
     private var sourceNode: AVAudioSourceNode?
@@ -1346,13 +1567,29 @@ public actor AudioSynthEngine {
         drirConvolverBridge.pushStereoDRIR(leftTaps: leftTaps, rightTaps: rightTaps)
     }
 
+    /// Synchronous lock-protected parameter update (< 50 ns) for 90Hz spatial gestures and @MainActor HUD/MenuBar sliders,
+    /// avoiding unstructured Task allocation and actor-hop ordering races under Swift 6 strict concurrency.
+    public nonisolated func updateParametersImmediate(_ parameters: SynthParameters) {
+        bridgeSlot.writeParameters(parameters)
+    }
+
+    public nonisolated func snapshotTelemetryImmediate() -> AudioTelemetrySnapshot {
+        bridgeSlot.readTelemetry()
+    }
+
+    public nonisolated func snapshotScopeWindowImmediate() -> (samples: [Float], sampleRate: Double) {
+        bridgeSlot.readScopeWindow()
+    }
+
     public func configureIfNeeded() throws {
         guard sourceNode == nil else { return }
 
         #if os(iOS) || os(visionOS)
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.playback, mode: .default, options: [])
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
+        // ~5.8 ms IO quantum (256 frames @ 44.1 kHz); without this visionOS keeps its larger default buffer,
+        // which alone can exceed the 12 ms gesture-to-audio budget.
         try session.setPreferredIOBufferDuration(0.0058)
         #endif
         try session.setActive(true)
@@ -1391,12 +1628,14 @@ public actor AudioSynthEngine {
 
         self.bridge = audioBridge
         self.sourceNode = node
+        bridgeSlot.installBridge(audioBridge)
     }
 
     public func start() throws {
         try configureIfNeeded()
         currentParameters.isMuted = false
-        bridge?.writeParameters(currentParameters)
+        isRunningEngine = true
+        bridgeSlot.setRunning(true, parameters: currentParameters)
 
         if !engine.isRunning {
             #if os(iOS) || os(visionOS)
@@ -1404,24 +1643,23 @@ public actor AudioSynthEngine {
             #endif
             try engine.start()
         }
-        isRunningEngine = true
     }
 
     public func pause() {
         currentParameters.isMuted = true
-        bridge?.writeParameters(currentParameters)
         isRunningEngine = false
+        bridgeSlot.setRunning(false, parameters: currentParameters)
     }
 
     public func stopCompletely() {
         bloomDecayTask?.cancel()
         currentParameters.isMuted = true
-        bridge?.writeParameters(currentParameters)
+        isRunningEngine = false
+        bridgeSlot.setRunning(false, parameters: currentParameters)
         if engine.isRunning {
             engine.stop()
         }
         bridge?.resetTelemetry()
-        isRunningEngine = false
     }
 
     public func updateParameters(_ parameters: SynthParameters) {
@@ -1430,7 +1668,7 @@ public actor AudioSynthEngine {
             next.isMuted = true
         }
         currentParameters = next
-        bridge?.writeParameters(next)
+        bridgeSlot.writeParameters(next)
     }
 
     public func updateHeadTrackingOffsets(
@@ -1443,7 +1681,7 @@ public actor AudioSynthEngine {
         if let headQuaternion {
             currentParameters.headQuaternion = headQuaternion
         }
-        bridge?.writeParameters(currentParameters)
+        bridgeSlot.writeParameters(currentParameters)
     }
 
     public func updateHRTFPose(
@@ -1462,12 +1700,12 @@ public actor AudioSynthEngine {
         if let isSpatializerEnabled {
             currentParameters.isHRTFSpatializerEnabled = isSpatializerEnabled
         }
-        bridge?.writeParameters(currentParameters)
+        bridgeSlot.writeParameters(currentParameters)
     }
 
     public func updateOrbitalSatellites(_ bank: OrbitalSatelliteBank) {
         currentParameters.orbitalSatellites = bank
-        bridge?.writeParameters(currentParameters)
+        bridgeSlot.writeParameters(currentParameters)
     }
 
     public func updateOrchestraSync(_ control: RealtimeOrchestraSyncControl) {
@@ -1491,13 +1729,13 @@ public actor AudioSynthEngine {
         next.rayTracedAcousticsEnabled = currentParameters.rayTracedAcousticsEnabled
         next.isMuted = !isRunningEngine
         currentParameters = next
-        bridge?.writeParameters(next)
+        bridgeSlot.writeParameters(next)
     }
 
     public func triggerHarmonicBloom(intensity: Float = 0.85) {
         bloomDecayTask?.cancel()
         currentParameters.bloomBoost = min(max(intensity, 0.0), 1.0)
-        bridge?.writeParameters(currentParameters)
+        bridgeSlot.writeParameters(currentParameters)
 
         bloomDecayTask = Task {
             let steps = 16
@@ -1512,21 +1750,15 @@ public actor AudioSynthEngine {
 
     private func decayBloomStep(to value: Float) {
         currentParameters.bloomBoost = value
-        bridge?.writeParameters(currentParameters)
+        bridgeSlot.writeParameters(currentParameters)
     }
 
     public func snapshotTelemetry() -> AudioTelemetrySnapshot {
-        guard isRunningEngine, let bridge else {
-            return AudioTelemetrySnapshot(isRendering: false)
-        }
-        return bridge.readTelemetry()
+        bridgeSlot.readTelemetry()
     }
 
     public func snapshotScopeWindow() -> (samples: [Float], sampleRate: Double) {
-        guard isRunningEngine, let bridge else {
-            return ([Float](repeating: 0, count: RealtimeAudioBridge.scopeWindowLength), 48_000.0)
-        }
-        return (bridge.copyRecentMonoWindow(), bridge.sampleRate)
+        bridgeSlot.readScopeWindow()
     }
 
     #if os(macOS)
@@ -1565,14 +1797,16 @@ public actor AudioSynthEngine {
             engine.detach(existingNode)
             sourceNode = nil
             bridge = nil
+            bridgeSlot.installBridge(nil)
         }
 
         try configureIfNeeded()
-        bridge?.writeParameters(currentParameters)
+        bridgeSlot.writeParameters(currentParameters)
 
         if wasRunning || isRunningEngine {
             try engine.start()
             isRunningEngine = true
+            bridgeSlot.setRunning(true, parameters: currentParameters)
         }
     }
     #endif

@@ -415,7 +415,7 @@ public final class CoreAudioDeviceManager {
         var unmanagedString: Unmanaged<CFString>?
         var byteSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &byteSize, &unmanagedString)
-        guard status == noErr, let cfStr = unmanagedString?.takeUnretainedValue() else {
+        guard status == noErr, let cfStr = unmanagedString?.takeRetainedValue() else {
             return nil
         }
         return cfStr as String

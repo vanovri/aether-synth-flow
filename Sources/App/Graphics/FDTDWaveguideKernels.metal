@@ -252,32 +252,46 @@ namespace aether_fdtd_core {
     }
 
     // Polynomial cubic Perfectly Matched Layer sponge damping profile: sigma_pml(d) = sigma_max * (d / L_pml)^3
+    // Clamped to <= 0.96 so the leapfrog retardation factor (1 - sigmaTotalDt) remains strictly non-oscillatory in 2D/3D corners.
     inline float cubicPMLProfile(int x, int y, int z, int w, int h, int d, int pmlWidth, float sigmaMaxDt) {
         if (pmlWidth <= 0 || sigmaMaxDt <= 0.0f) {
             return 0.0f;
         }
+        float safeMaxDt = min(sigmaMaxDt, 0.48f);
         float total = 0.0f;
         int distX = min(x, w - 1 - x);
         if (distX < pmlWidth) {
             float ux = float(pmlWidth - distX) / float(pmlWidth);
-            total += sigmaMaxDt * (ux * ux * ux);
+            total += safeMaxDt * (ux * ux * ux);
         }
         int distY = min(y, h - 1 - y);
         if (distY < pmlWidth) {
             float uy = float(pmlWidth - distY) / float(pmlWidth);
-            total += sigmaMaxDt * (uy * uy * uy);
+            total += safeMaxDt * (uy * uy * uy);
         }
         if (d > 1) {
             int distZ = min(z, d - 1 - z);
             if (distZ < pmlWidth) {
                 float uz = float(pmlWidth - distZ) / float(pmlWidth);
-                total += sigmaMaxDt * (uz * uz * uz);
+                total += safeMaxDt * (uz * uz * uz);
             }
         }
-        return total;
+        return min(total, 0.96f);
     }
 
-    // Von Neumann CFL Stability Enforcer: lambda^2 + 4 * mu^2 <= 1/D - 2 * sigma_1 * dt / h^2
+    // Spectral radius of compact Laplacian stencil: 16/3 in 2D (9-pt ISO), 92/15 in 3D (27-pt Patra-Karttunen).
+    inline float maxCompactEigenvalue(int dimension) {
+        if (dimension >= 3) {
+            return 92.0f / 15.0f;
+        } else if (dimension == 2) {
+            return 16.0f / 3.0f;
+        }
+        return 4.0f;
+    }
+
+    // Von Neumann CFL Stability Enforcer:
+    // Enforces BOTH standard Courant S <= 1/sqrt(D) (lambda^2 + 4*mu^2 <= 1/D - v)
+    // AND compact-stencil discrete spectral radius (lambda^2 + E_max*mu^2 <= 4/E_max - 2*v).
     inline void enforceCFLBound(
         int dimension,
         float rawLambdaSq,
@@ -288,12 +302,18 @@ namespace aether_fdtd_core {
         thread float& safeViscous
     ) {
         float invD = 1.0f / float(max(1, dimension));
-        safeViscous = clamp(rawViscous, 0.0f, invD * 0.45f);
-        float cflCeiling = max(0.005f, (invD - safeViscous) * 0.96f);
+        float eMax = maxCompactEigenvalue(dimension);
+        float maxVisc = min(invD * 0.42f, (2.0f / eMax) * 0.96f);
+        safeViscous = clamp(rawViscous, 0.0f, maxVisc);
+
+        float stdCeiling = max(0.005f, (invD - safeViscous) * 0.96f);
+        float compactCeiling = max(0.005f, (4.0f / eMax - 2.0f * safeViscous) * 0.96f);
+        float cflCeiling = min(stdCeiling, compactCeiling);
+        float biharmWeight = max(4.0f, eMax);
 
         float clampedL = max(0.0f, rawLambdaSq);
         float clampedM = max(0.0f, rawMuSq);
-        float lhs = clampedL + 4.0f * clampedM;
+        float lhs = clampedL + biharmWeight * clampedM;
         if (lhs > cflCeiling) {
             float scale = cflCeiling / max(lhs, 1.0e-9f);
             clampedL *= scale;
@@ -301,6 +321,14 @@ namespace aether_fdtd_core {
         }
         safeLambdaSq = clampedL;
         safeMuSq = clampedM;
+    }
+
+    inline float maxStableLocalLambdaSq(int dimension, float safeViscous, float safeMuSq) {
+        float invD = 1.0f / float(max(1, dimension));
+        float eMax = maxCompactEigenvalue(dimension);
+        float stdMax = (invD - safeViscous) * 0.96f - 4.0f * safeMuSq;
+        float compactMax = (4.0f / eMax - 2.0f * safeViscous) * 0.96f - eMax * safeMuSq;
+        return max(0.0f, min(stdMax, compactMax));
     }
 }
 
@@ -385,19 +413,36 @@ kernel void aetherStepFDTDWavefield(
 
     // Local refractive metamaterial speed + Berger cubic nonlinear gradient tension
     float speedFactor = clamp(relativeSpeedSq[idx], 0.12f, 1.35f);
-    float gradX = 0.5f * (
-        aether_fdtd_core::fetchCell2D(pCurr, obstacleMask, min(x + 1, w - 1), y, w, h, uniforms.boundaryMode, p0)
-        - aether_fdtd_core::fetchCell2D(pCurr, obstacleMask, max(x - 1, 0), y, w, h, uniforms.boundaryMode, p0)
-    );
-    float gradY = 0.5f * (
-        aether_fdtd_core::fetchCell2D(pCurr, obstacleMask, x, min(y + 1, h - 1), w, h, uniforms.boundaryMode, p0)
-        - aether_fdtd_core::fetchCell2D(pCurr, obstacleMask, x, max(y - 1, 0), w, h, uniforms.boundaryMode, p0)
-    );
-    float gradNormSq = min(gradX * gradX + gradY * gradY, 2.0f);
+    float gradX = 0.0f;
+    float gradY = 0.0f;
+    float gradZ = 0.0f;
+    if (is3D) {
+        gradX = 0.5f * (
+            aether_fdtd_core::fetchCell3D(pCurr, obstacleMask, min(x + 1, w - 1), y, z, w, h, d, uniforms.boundaryMode, p0)
+            - aether_fdtd_core::fetchCell3D(pCurr, obstacleMask, max(x - 1, 0), y, z, w, h, d, uniforms.boundaryMode, p0)
+        );
+        gradY = 0.5f * (
+            aether_fdtd_core::fetchCell3D(pCurr, obstacleMask, x, min(y + 1, h - 1), z, w, h, d, uniforms.boundaryMode, p0)
+            - aether_fdtd_core::fetchCell3D(pCurr, obstacleMask, x, max(y - 1, 0), z, w, h, d, uniforms.boundaryMode, p0)
+        );
+        gradZ = 0.5f * (
+            aether_fdtd_core::fetchCell3D(pCurr, obstacleMask, x, y, min(z + 1, d - 1), w, h, d, uniforms.boundaryMode, p0)
+            - aether_fdtd_core::fetchCell3D(pCurr, obstacleMask, x, y, max(z - 1, 0), w, h, d, uniforms.boundaryMode, p0)
+        );
+    } else {
+        gradX = 0.5f * (
+            aether_fdtd_core::fetchCell2D(pCurr, obstacleMask, min(x + 1, w - 1), y, w, h, uniforms.boundaryMode, p0)
+            - aether_fdtd_core::fetchCell2D(pCurr, obstacleMask, max(x - 1, 0), y, w, h, uniforms.boundaryMode, p0)
+        );
+        gradY = 0.5f * (
+            aether_fdtd_core::fetchCell2D(pCurr, obstacleMask, x, min(y + 1, h - 1), w, h, uniforms.boundaryMode, p0)
+            - aether_fdtd_core::fetchCell2D(pCurr, obstacleMask, x, max(y - 1, 0), w, h, uniforms.boundaryMode, p0)
+        );
+    }
+    float gradNormSq = min(gradX * gradX + gradY * gradY + gradZ * gradZ, 2.0f);
     float nlTension = 1.0f + max(0.0f, uniforms.nonlinearGamma) * gradNormSq;
 
-    float invD = 1.0f / float(dim);
-    float maxLocalLambdaSq = max(0.0f, (invD - safeViscous) * 0.96f - 4.0f * safeMuSq);
+    float maxLocalLambdaSq = aether_fdtd_core::maxStableLocalLambdaSq(dim, safeViscous, safeMuSq);
     float effLambdaSq = min(safeLambdaSq * speedFactor * nlTension, maxLocalLambdaSq);
 
     // Spatial Gaussian acoustic excitation f_exc(x, t)
@@ -481,7 +526,7 @@ kernel void aetherStepFDTDWaveguide2D(
 
     float lens = clamp(relativeWaveSpeedSq[idx], 0.12f, 1.35f);
     float nl = 1.0f + max(0.0f, uniforms.nonlinearTension) * min(p0 * p0, 1.0f);
-    float effL = min(safeL * lens * nl, max(0.0f, (0.5f - safeV) * 0.96f - 4.0f * safeM));
+    float effL = min(safeL * lens * nl, aether_fdtd_core::maxStableLocalLambdaSq(2, safeV, safeM));
     float pml = (uniforms.enablePML != 0u)
         ? aether_fdtd_core::cubicPMLProfile(x, y, 0, w, h, 1, int(uniforms.pmlThickness), uniforms.pmlMaxSigma)
         : 0.0f;

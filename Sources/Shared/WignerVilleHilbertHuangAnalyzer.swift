@@ -2,7 +2,7 @@
 
 import Foundation
 
-// MARK: - 1. Smoothed Pseudo Wigner-Ville Distribution (SPWVD) Result & Analyzer
+// MARK: - 1. Smoothed Pseudo Wigner-Ville Distribution (SPWVD) Result, Realtime Workspace & Analyzer
 
 public struct SPWVDResult: Sendable, Equatable {
     public let timeSteps: Int
@@ -28,20 +28,803 @@ public struct SPWVDResult: Sendable, Equatable {
         instantaneousFreqRidgeHz: [Float],
         renyiEntropyBits: Float,
         corticalSpindlePowerRatio: Float = 0.0,
-        crossTermSuppressionDB: Float = 14.2
+        crossTermSuppressionDB: Float = 0.0
     ) {
         self.timeSteps = timeSteps
         self.freqBins = freqBins
         self.tfrMatrix = tfrMatrix
         self.instantaneousFreqRidgeHz = instantaneousFreqRidgeHz
         self.renyiEntropyBits = renyiEntropyBits
-        self.corticalSpindlePowerRatio = corticalSpindlePowerRatio.isFinite ? min(max(corticalSpindlePowerRatio, 0.0), 1.0) : 0.0
-        self.crossTermSuppressionDB = crossTermSuppressionDB
+        let clampedSpindle = min(max(corticalSpindlePowerRatio, 0.0), 1.0)
+        self.corticalSpindlePowerRatio = corticalSpindlePowerRatio.isFinite ? clampedSpindle : 0.0
+        self.crossTermSuppressionDB = crossTermSuppressionDB.isFinite ? max(0.0, crossTermSuppressionDB) : 0.0
+    }
+}
+
+public typealias SPWVDRealtimeWorkspace = RealtimeSPWVDEngine
+
+/// Preallocated, zero-allocation real-time Smoothed Pseudo Wigner-Ville Distribution (SPWVD) processor.
+/// All scratch storage, FFT bit-reversal/twiddle tables, Marple Hilbert spectral mask, separable Gaussian
+/// Doppler-time smoothing window `g[u]`, and boundary-adaptive Hann lag window table `h[L_t, tau]` are
+/// allocated once in `init` and released in `deinit`. Audio/BCI render callbacks invoke
+/// `pushSample(_:)` / `analyzeRingBufferInPlace()` or `processRealtimeBlock(_:count:)` without heap allocations,
+/// Array Copy-on-Write, locks, or trigonometric calls on the real-time thread.
+public final class RealtimeSPWVDEngine: @unchecked Sendable {
+
+    public struct WorkspaceAddressFingerprint: Sendable, Equatable {
+        public let ringBufferAddress: UInt
+        public let linearizedInputAddress: UInt
+        public let fftRealAddress: UInt
+        public let fftImagAddress: UInt
+        public let analyticRealAddress: UInt
+        public let analyticImagAddress: UInt
+        public let gKernelAddress: UInt
+        public let lagWindowTableAddress: UInt
+        public let cosTableAddress: UInt
+        public let sinTableAddress: UInt
+        public let rSmoothRealAddress: UInt
+        public let rSmoothImagAddress: UInt
+        public let sliceBufferAddress: UInt
+        public let tfrOutputAddress: UInt
+        public let ridgeOutputAddress: UInt
+    }
+
+    /// Gaussian truncation radius in standard deviations (`2.5 * sigma` captures >98.7% of Gaussian mass).
+    public static let gaussianTruncationStds: Double = 2.5
+    /// Minimum positive Gaussian sigma in samples when time smoothing is enabled.
+    public static let minimumPositiveSigmaSamples: Double = 0.35
+    /// Maximum reported cross-term negativity suppression in decibels (60 dB = 10^6 power ratio floor).
+    public static let maximumSuppressionDB: Double = 60.0
+    /// Lower bound of thalamic sleep/cortical spindle frequency band in Hz (sigma band: 11–16 Hz).
+    public static let spindleBandLowHz: Double = 11.0
+    /// Upper bound of thalamic sleep/cortical spindle frequency band in Hz (sigma band: 11–16 Hz).
+    public static let spindleBandHighHz: Double = 16.0
+
+    public let blockSize: Int
+    public let freqBins: Int
+    public let sampleRate: Double
+    public let timeSigmaSamples: Double
+    public let maxLagSamples: Int
+    public let halfTimeWindowSamples: Int
+    public let fftLength: Int
+    public let useRectangularLagWindow: Bool
+
+    private let lagStride: Int
+    private let gKernelCount: Int
+
+    private let ringBufferPtr: UnsafeMutablePointer<Float>
+    private let linearizedInputPtr: UnsafeMutablePointer<Float>
+    private let fftRealPtr: UnsafeMutablePointer<Double>
+    private let fftImagPtr: UnsafeMutablePointer<Double>
+    private let fftBitRevPtr: UnsafeMutablePointer<Int>
+    private let fftTwiddleRePtr: UnsafeMutablePointer<Double>
+    private let fftTwiddleImPtr: UnsafeMutablePointer<Double>
+    private let hilbertGainPtr: UnsafeMutablePointer<Double>
+    private let analyticRePtr: UnsafeMutablePointer<Double>
+    private let analyticImPtr: UnsafeMutablePointer<Double>
+    private let gKernelPtr: UnsafeMutablePointer<Double>
+    private let lagWindowTablePtr: UnsafeMutablePointer<Double>
+    private let cosTablePtr: UnsafeMutablePointer<Double>
+    private let sinTablePtr: UnsafeMutablePointer<Double>
+    private let rSmoothRePtr: UnsafeMutablePointer<Double>
+    private let rSmoothImPtr: UnsafeMutablePointer<Double>
+    private let rRawRePtr: UnsafeMutablePointer<Double>
+    private let rRawImPtr: UnsafeMutablePointer<Double>
+    private let sliceBufferPtr: UnsafeMutablePointer<Double>
+    private let tfrBufferPtr: UnsafeMutablePointer<Float>
+    private let ridgeBufferPtr: UnsafeMutablePointer<Float>
+
+    private var ringWriteIndex: Int = 0
+    private var ingestedSampleCount: Int = 0
+
+    public private(set) var latestRenyiEntropyBits: Float = 0.0
+    public private(set) var latestCorticalSpindlePowerRatio: Float = 0.0
+    public private(set) var latestCrossTermSuppressionDB: Float = 0.0
+    public private(set) var processedBlockCount: UInt64 = 0
+
+    public init(
+        blockSize: Int = SPWVDAnalyzer.canonicalBlockSize,
+        sampleRate: Double = 256.0,
+        freqBins: Int = 64,
+        timeSigmaSamples: Double = SPWVDAnalyzer.defaultTimeSigmaSamples,
+        maxLagSamples: Int? = nil,
+        useRectangularLagWindow: Bool = false
+    ) {
+        let resolvedN = max(4, blockSize)
+        let resolvedBins = max(8, freqBins)
+        let resolvedFs = max(1.0, sampleRate)
+
+        let resolvedSigma: Double
+        let resolvedHalfTimeWin: Int
+        if timeSigmaSamples <= 0.0 {
+            resolvedSigma = 0.0
+            resolvedHalfTimeWin = 0
+        } else {
+            let clampedSigma = max(Self.minimumPositiveSigmaSamples, timeSigmaSamples)
+            resolvedSigma = clampedSigma
+            let rawHalfWin = Int(ceil(Self.gaussianTruncationStds * clampedSigma))
+            let maxAllowedHalfWin = max(1, resolvedN / 4)
+            resolvedHalfTimeWin = min(max(1, rawHalfWin), maxAllowedHalfWin)
+        }
+
+        let defaultLag = min(max(4, resolvedN / 4), resolvedBins - 1)
+        let requestedLag = maxLagSamples ?? defaultLag
+        let maxLagUpper = min(max(2, resolvedN / 2 - 1), resolvedBins - 1)
+        let resolvedMaxLag = min(max(2, requestedLag), maxLagUpper)
+
+        let resolvedFFTLength = Self.nextPowerOfTwo(max(8, 2 * resolvedN))
+        let resolvedLagStride = resolvedMaxLag + 1
+        let resolvedGCount = 2 * resolvedHalfTimeWin + 1
+
+        self.blockSize = resolvedN
+        self.freqBins = resolvedBins
+        self.sampleRate = resolvedFs
+        self.timeSigmaSamples = resolvedSigma
+        self.maxLagSamples = resolvedMaxLag
+        self.halfTimeWindowSamples = resolvedHalfTimeWin
+        self.fftLength = resolvedFFTLength
+        self.useRectangularLagWindow = useRectangularLagWindow
+        self.lagStride = resolvedLagStride
+        self.gKernelCount = resolvedGCount
+
+        self.ringBufferPtr = UnsafeMutablePointer<Float>.allocate(capacity: resolvedN)
+        self.ringBufferPtr.initialize(repeating: 0.0, count: resolvedN)
+
+        self.linearizedInputPtr = UnsafeMutablePointer<Float>.allocate(capacity: resolvedN)
+        self.linearizedInputPtr.initialize(repeating: 0.0, count: resolvedN)
+
+        self.fftRealPtr = UnsafeMutablePointer<Double>.allocate(capacity: resolvedFFTLength)
+        self.fftRealPtr.initialize(repeating: 0.0, count: resolvedFFTLength)
+
+        self.fftImagPtr = UnsafeMutablePointer<Double>.allocate(capacity: resolvedFFTLength)
+        self.fftImagPtr.initialize(repeating: 0.0, count: resolvedFFTLength)
+
+        self.fftBitRevPtr = UnsafeMutablePointer<Int>.allocate(capacity: resolvedFFTLength)
+        self.fftBitRevPtr.initialize(repeating: 0, count: resolvedFFTLength)
+
+        self.fftTwiddleRePtr = UnsafeMutablePointer<Double>.allocate(capacity: resolvedFFTLength)
+        self.fftTwiddleRePtr.initialize(repeating: 0.0, count: resolvedFFTLength)
+
+        self.fftTwiddleImPtr = UnsafeMutablePointer<Double>.allocate(capacity: resolvedFFTLength)
+        self.fftTwiddleImPtr.initialize(repeating: 0.0, count: resolvedFFTLength)
+
+        self.hilbertGainPtr = UnsafeMutablePointer<Double>.allocate(capacity: resolvedFFTLength)
+        self.hilbertGainPtr.initialize(repeating: 0.0, count: resolvedFFTLength)
+
+        self.analyticRePtr = UnsafeMutablePointer<Double>.allocate(capacity: resolvedN)
+        self.analyticRePtr.initialize(repeating: 0.0, count: resolvedN)
+
+        self.analyticImPtr = UnsafeMutablePointer<Double>.allocate(capacity: resolvedN)
+        self.analyticImPtr.initialize(repeating: 0.0, count: resolvedN)
+
+        self.gKernelPtr = UnsafeMutablePointer<Double>.allocate(capacity: resolvedGCount)
+        self.gKernelPtr.initialize(repeating: 0.0, count: resolvedGCount)
+
+        let lagTableCap = resolvedLagStride * resolvedLagStride
+        self.lagWindowTablePtr = UnsafeMutablePointer<Double>.allocate(capacity: lagTableCap)
+        self.lagWindowTablePtr.initialize(repeating: 0.0, count: lagTableCap)
+
+        let trigTableCap = resolvedBins * resolvedLagStride
+        self.cosTablePtr = UnsafeMutablePointer<Double>.allocate(capacity: trigTableCap)
+        self.cosTablePtr.initialize(repeating: 0.0, count: trigTableCap)
+
+        self.sinTablePtr = UnsafeMutablePointer<Double>.allocate(capacity: trigTableCap)
+        self.sinTablePtr.initialize(repeating: 0.0, count: trigTableCap)
+
+        self.rSmoothRePtr = UnsafeMutablePointer<Double>.allocate(capacity: resolvedLagStride)
+        self.rSmoothRePtr.initialize(repeating: 0.0, count: resolvedLagStride)
+
+        self.rSmoothImPtr = UnsafeMutablePointer<Double>.allocate(capacity: resolvedLagStride)
+        self.rSmoothImPtr.initialize(repeating: 0.0, count: resolvedLagStride)
+
+        self.rRawRePtr = UnsafeMutablePointer<Double>.allocate(capacity: resolvedLagStride)
+        self.rRawRePtr.initialize(repeating: 0.0, count: resolvedLagStride)
+
+        self.rRawImPtr = UnsafeMutablePointer<Double>.allocate(capacity: resolvedLagStride)
+        self.rRawImPtr.initialize(repeating: 0.0, count: resolvedLagStride)
+
+        self.sliceBufferPtr = UnsafeMutablePointer<Double>.allocate(capacity: resolvedBins)
+        self.sliceBufferPtr.initialize(repeating: 0.0, count: resolvedBins)
+
+        let tfrCap = resolvedN * resolvedBins
+        self.tfrBufferPtr = UnsafeMutablePointer<Float>.allocate(capacity: tfrCap)
+        self.tfrBufferPtr.initialize(repeating: 0.0, count: tfrCap)
+
+        self.ridgeBufferPtr = UnsafeMutablePointer<Float>.allocate(capacity: resolvedN)
+        self.ridgeBufferPtr.initialize(repeating: 0.0, count: resolvedN)
+
+        Self.precomputeFFTTables(
+            fftLength: resolvedFFTLength,
+            bitRevPtr: self.fftBitRevPtr,
+            twiddleRePtr: self.fftTwiddleRePtr,
+            twiddleImPtr: self.fftTwiddleImPtr,
+            hilbertGainPtr: self.hilbertGainPtr
+        )
+        Self.precomputeSmoothingAndBasisTables(
+            freqBins: resolvedBins,
+            halfTimeWin: resolvedHalfTimeWin,
+            sigma: resolvedSigma,
+            maxLag: resolvedMaxLag,
+            lagStride: resolvedLagStride,
+            useRectangularLag: useRectangularLagWindow,
+            gKernelPtr: self.gKernelPtr,
+            lagWindowTablePtr: self.lagWindowTablePtr,
+            cosTablePtr: self.cosTablePtr,
+            sinTablePtr: self.sinTablePtr
+        )
+    }
+
+    deinit {
+        let lagTableCap = lagStride * lagStride
+        let trigTableCap = freqBins * lagStride
+        let tfrCap = blockSize * freqBins
+
+        ringBufferPtr.deinitialize(count: blockSize)
+        ringBufferPtr.deallocate()
+
+        linearizedInputPtr.deinitialize(count: blockSize)
+        linearizedInputPtr.deallocate()
+
+        fftRealPtr.deinitialize(count: fftLength)
+        fftRealPtr.deallocate()
+
+        fftImagPtr.deinitialize(count: fftLength)
+        fftImagPtr.deallocate()
+
+        fftBitRevPtr.deinitialize(count: fftLength)
+        fftBitRevPtr.deallocate()
+
+        fftTwiddleRePtr.deinitialize(count: fftLength)
+        fftTwiddleRePtr.deallocate()
+
+        fftTwiddleImPtr.deinitialize(count: fftLength)
+        fftTwiddleImPtr.deallocate()
+
+        hilbertGainPtr.deinitialize(count: fftLength)
+        hilbertGainPtr.deallocate()
+
+        analyticRePtr.deinitialize(count: blockSize)
+        analyticRePtr.deallocate()
+
+        analyticImPtr.deinitialize(count: blockSize)
+        analyticImPtr.deallocate()
+
+        gKernelPtr.deinitialize(count: gKernelCount)
+        gKernelPtr.deallocate()
+
+        lagWindowTablePtr.deinitialize(count: lagTableCap)
+        lagWindowTablePtr.deallocate()
+
+        cosTablePtr.deinitialize(count: trigTableCap)
+        cosTablePtr.deallocate()
+
+        sinTablePtr.deinitialize(count: trigTableCap)
+        sinTablePtr.deallocate()
+
+        rSmoothRePtr.deinitialize(count: lagStride)
+        rSmoothRePtr.deallocate()
+
+        rSmoothImPtr.deinitialize(count: lagStride)
+        rSmoothImPtr.deallocate()
+
+        rRawRePtr.deinitialize(count: lagStride)
+        rRawRePtr.deallocate()
+
+        rRawImPtr.deinitialize(count: lagStride)
+        rRawImPtr.deallocate()
+
+        sliceBufferPtr.deinitialize(count: freqBins)
+        sliceBufferPtr.deallocate()
+
+        tfrBufferPtr.deinitialize(count: tfrCap)
+        tfrBufferPtr.deallocate()
+
+        ridgeBufferPtr.deinitialize(count: blockSize)
+        ridgeBufferPtr.deallocate()
+    }
+
+    public var workspaceAddressFingerprint: WorkspaceAddressFingerprint {
+        WorkspaceAddressFingerprint(
+            ringBufferAddress: UInt(bitPattern: ringBufferPtr),
+            linearizedInputAddress: UInt(bitPattern: linearizedInputPtr),
+            fftRealAddress: UInt(bitPattern: fftRealPtr),
+            fftImagAddress: UInt(bitPattern: fftImagPtr),
+            analyticRealAddress: UInt(bitPattern: analyticRePtr),
+            analyticImagAddress: UInt(bitPattern: analyticImPtr),
+            gKernelAddress: UInt(bitPattern: gKernelPtr),
+            lagWindowTableAddress: UInt(bitPattern: lagWindowTablePtr),
+            cosTableAddress: UInt(bitPattern: cosTablePtr),
+            sinTableAddress: UInt(bitPattern: sinTablePtr),
+            rSmoothRealAddress: UInt(bitPattern: rSmoothRePtr),
+            rSmoothImagAddress: UInt(bitPattern: rSmoothImPtr),
+            sliceBufferAddress: UInt(bitPattern: sliceBufferPtr),
+            tfrOutputAddress: UInt(bitPattern: tfrBufferPtr),
+            ridgeOutputAddress: UInt(bitPattern: ridgeBufferPtr)
+        )
+    }
+
+    public var tfrFlatBuffer: UnsafeBufferPointer<Float> {
+        UnsafeBufferPointer(start: tfrBufferPtr, count: blockSize * freqBins)
+    }
+
+    public var ridgeHzBuffer: UnsafeBufferPointer<Float> {
+        UnsafeBufferPointer(start: ridgeBufferPtr, count: blockSize)
+    }
+
+    public var analyticRealBuffer: UnsafeBufferPointer<Double> {
+        UnsafeBufferPointer(start: analyticRePtr, count: blockSize)
+    }
+
+    public var analyticImagBuffer: UnsafeBufferPointer<Double> {
+        UnsafeBufferPointer(start: analyticImPtr, count: blockSize)
+    }
+
+    @inline(__always)
+    public func tfrValue(timeIndex: Int, freqBin: Int) -> Float {
+        guard timeIndex >= 0 && timeIndex < blockSize && freqBin >= 0 && freqBin < freqBins else {
+            return 0.0
+        }
+        return tfrBufferPtr[timeIndex * freqBins + freqBin]
+    }
+
+    /// Real-time safe single-sample ring-buffer ingestion (`O(1)`, zero heap allocation).
+    @inline(__always)
+    public func pushSample(_ sample: Float) {
+        let sanitized: Float = sample.isFinite ? sample : 0.0
+        ringBufferPtr[ringWriteIndex] = sanitized
+        ringWriteIndex += 1
+        if ringWriteIndex >= blockSize {
+            ringWriteIndex = 0
+        }
+        if ingestedSampleCount < blockSize {
+            ingestedSampleCount += 1
+        }
+    }
+
+    /// Real-time safe chunk ingestion into the preallocated ring buffer (`O(count)`, zero heap allocation).
+    @inline(__always)
+    public func pushSamples(_ samples: UnsafePointer<Float>, count: Int) {
+        guard count > 0 else { return }
+        for idx in 0..<count {
+            pushSample(samples[idx])
+        }
+    }
+
+    /// Unrolls the internal circular sample history in chronological order and runs the zero-allocation SPWVD kernel.
+    @discardableResult
+    public func analyzeRingBufferInPlace() -> Bool {
+        let n = blockSize
+        var readIdx = ringWriteIndex
+        for idx in 0..<n {
+            linearizedInputPtr[idx] = ringBufferPtr[readIdx]
+            readIdx += 1
+            if readIdx >= n {
+                readIdx = 0
+            }
+        }
+        return processRealtimeBlock(linearizedInputPtr, count: n)
+    }
+
+    /// Convenience wrapper for `UnsafeBufferPointer<Float>` on the real-time path (zero heap allocation).
+    @discardableResult
+    @inline(__always)
+    public func processRealtimeBlock(_ samples: UnsafeBufferPointer<Float>) -> Bool {
+        guard let base = samples.baseAddress else { return false }
+        return processRealtimeBlock(base, count: samples.count)
+    }
+
+    /// Zero-allocation real-time SPWVD evaluation on `samples[0..<count]`.
+    /// Populates `tfrFlatBuffer`, `ridgeHzBuffer`, `latestRenyiEntropyBits`, `latestCorticalSpindlePowerRatio`,
+    /// and `latestCrossTermSuppressionDB` completely in-place.
+    @discardableResult
+    public func processRealtimeBlock(_ samples: UnsafePointer<Float>, count: Int) -> Bool {
+        let n = blockSize
+        guard count >= n else { return false }
+
+        let baseOffset = count - n
+        var sumSample: Double = 0.0
+        for idx in 0..<n {
+            let raw = samples[baseOffset + idx]
+            let clean: Double = raw.isFinite ? Double(raw) : 0.0
+            fftRealPtr[idx] = clean
+            sumSample += clean
+        }
+
+        // Remove DC mean prior to zero-padded analytic projection to prevent 0 Hz cross-terms
+        let meanVal = sumSample / Double(n)
+        for idx in 0..<n {
+            fftRealPtr[idx] -= meanVal
+            fftImagPtr[idx] = 0.0
+        }
+        for idx in n..<fftLength {
+            fftRealPtr[idx] = 0.0
+            fftImagPtr[idx] = 0.0
+        }
+
+        // Zero-padded Marple FFT analytic signal projection (no circular wrap-around)
+        computeAnalyticSignalFromPreloadedFFTBuffer()
+
+        let bins = freqBins
+        let invBins = 1.0 / Double(bins)
+        let fs = sampleRate
+        let halfFs = 0.5 * fs
+        let freqScaleHz = fs / Double(2 * bins)
+        let maxLag = maxLagSamples
+        let halfU = halfTimeWindowSamples
+        let gCount = gKernelCount
+        let strideLag = lagStride
+
+        var sumSignedP: Double = 0.0
+        var sumSignedP3: Double = 0.0
+        var sumPositiveP: Double = 0.0
+        var sumPositiveP3: Double = 0.0
+        var spindleBandEnergy: Double = 0.0
+
+        var rawTotalEnergySq: Double = 0.0
+        var rawNegativeEnergySq: Double = 0.0
+        var smoothTotalEnergySq: Double = 0.0
+        var smoothNegativeEnergySq: Double = 0.0
+
+        for timeIdx in 0..<n {
+            let distFromEnd = n - 1 - timeIdx
+            let edgeBound = timeIdx < distFromEnd ? timeIdx : distFromEnd
+            let localMaxLag = maxLag < edgeBound ? maxLag : edgeBound
+            let lagRowBase = localMaxLag * strideLag
+
+            for tau in 0...localMaxLag {
+                // Unsmoothed pseudo-WVD reference autocorrelation at u = 0
+                let centerPlus = timeIdx + tau
+                let centerMinus = timeIdx - tau
+                let zpRe = analyticRePtr[centerPlus]
+                let zpIm = analyticImPtr[centerPlus]
+                let zmRe = analyticRePtr[centerMinus]
+                let zmIm = analyticImPtr[centerMinus]
+                rRawRePtr[tau] = zpRe * zmRe + zpIm * zmIm
+                rRawImPtr[tau] = zpIm * zmRe - zpRe * zmIm
+
+                // Separable Doppler-time smoothed autocorrelation across u in -halfU...halfU
+                var accRe: Double = 0.0
+                var accIm: Double = 0.0
+                var weightNorm: Double = 0.0
+
+                for gIdx in 0..<gCount {
+                    let u = gIdx - halfU
+                    let m = timeIdx - u
+                    let iPlus = m + tau
+                    let iMinus = m - tau
+                    if iPlus >= 0 && iPlus < n && iMinus >= 0 && iMinus < n {
+                        let gw = gKernelPtr[gIdx]
+                        let aRe = analyticRePtr[iPlus]
+                        let aIm = analyticImPtr[iPlus]
+                        let bRe = analyticRePtr[iMinus]
+                        let bIm = analyticImPtr[iMinus]
+                        let prodRe = aRe * bRe + aIm * bIm
+                        let prodIm = aIm * bRe - aRe * bIm
+                        accRe += gw * prodRe
+                        accIm += gw * prodIm
+                        weightNorm += gw
+                    }
+                }
+
+                if weightNorm > 1e-12 {
+                    let hWeight = lagWindowTablePtr[lagRowBase + tau]
+                    let scale = hWeight / weightNorm
+                    rSmoothRePtr[tau] = accRe * scale
+                    rSmoothImPtr[tau] = accIm * scale
+                } else {
+                    rSmoothRePtr[tau] = 0.0
+                    rSmoothImPtr[tau] = 0.0
+                }
+            }
+
+            var peakBin: Int = 0
+            var peakVal: Double = -Double.greatestFiniteMagnitude
+            let tfrRowBase = timeIdx * bins
+
+            for k in 0..<bins {
+                var valSmooth = rSmoothRePtr[0]
+                var valRaw = rRawRePtr[0]
+                let trigRowBase = k * strideLag
+
+                if localMaxLag >= 1 {
+                    for tau in 1...localMaxLag {
+                        let cVal = cosTablePtr[trigRowBase + tau]
+                        let sVal = sinTablePtr[trigRowBase + tau]
+                        let smoothTerm = rSmoothRePtr[tau] * cVal + rSmoothImPtr[tau] * sVal
+                        let rawTerm = rRawRePtr[tau] * cVal + rRawImPtr[tau] * sVal
+                        valSmooth += 2.0 * smoothTerm
+                        valRaw += 2.0 * rawTerm
+                    }
+                }
+
+                // Normalize by 1 / freqBins so discrete time marginal sum_k W[n, k] == R_smooth[n, 0]
+                let scaledSmooth = valSmooth * invBins
+                let scaledRaw = valRaw * invBins
+
+                sliceBufferPtr[k] = scaledSmooth
+                tfrBufferPtr[tfrRowBase + k] = Float(scaledSmooth)
+
+                if scaledSmooth > peakVal {
+                    peakVal = scaledSmooth
+                    peakBin = k
+                }
+
+                sumSignedP += scaledSmooth
+                let scaledSmoothSq = scaledSmooth * scaledSmooth
+                sumSignedP3 += scaledSmoothSq * scaledSmooth
+
+                let posP = scaledSmooth > 0.0 ? scaledSmooth : 0.0
+                sumPositiveP += posP
+                sumPositiveP3 += posP * posP * posP
+
+                let binFreqHz = Double(k) * freqScaleHz
+                if binFreqHz >= Self.spindleBandLowHz && binFreqHz <= Self.spindleBandHighHz {
+                    spindleBandEnergy += posP
+                }
+
+                smoothTotalEnergySq += scaledSmoothSq
+                if scaledSmooth < 0.0 {
+                    smoothNegativeEnergySq += scaledSmoothSq
+                }
+
+                let scaledRawSq = scaledRaw * scaledRaw
+                rawTotalEnergySq += scaledRawSq
+                if scaledRaw < 0.0 {
+                    rawNegativeEnergySq += scaledRawSq
+                }
+            }
+
+            // Sub-bin parabolic ridge interpolation
+            var refinedBin = Double(peakBin)
+            if peakBin > 0 && peakBin + 1 < bins {
+                let yL = sliceBufferPtr[peakBin - 1]
+                let yC = sliceBufferPtr[peakBin]
+                let yR = sliceBufferPtr[peakBin + 1]
+                let denom = yL - 2.0 * yC + yR
+                if abs(denom) > 1e-12 && yC >= yL && yC >= yR {
+                    let rawDelta = 0.5 * (yL - yR) / denom
+                    let clampedDelta = min(max(rawDelta, -0.5), 0.5)
+                    refinedBin += clampedDelta
+                }
+            }
+            let rawFreqHz = refinedBin * freqScaleHz
+            let clampedFreqHz = min(max(rawFreqHz, 0.0), halfFs)
+            ridgeBufferPtr[timeIdx] = Float(clampedFreqHz)
+        }
+
+        // Normalized Order-3 Rényi entropy R_3 = -0.5 * log2( sum(P^3) / (sum(P))^3 )
+        // Uses signed quasi-probability integral when valid, with positive-part fallback for degenerate blocks.
+        let renyiBits: Float
+        let signedDenom = sumSignedP * sumSignedP * sumSignedP
+        let signedRatio = signedDenom > 1e-30 ? (sumSignedP3 / signedDenom) : 0.0
+        if sumSignedP > 1e-15 && signedRatio > 1e-30 && signedRatio <= 1.0 && signedRatio.isFinite {
+            renyiBits = Float(max(0.0, -0.5 * log2(signedRatio)))
+        } else if sumPositiveP > 1e-15 && sumPositiveP3 > 1e-30 {
+            let posDenom = sumPositiveP * sumPositiveP * sumPositiveP
+            let posRatio = min(max(sumPositiveP3 / posDenom, 1e-30), 1.0)
+            renyiBits = Float(max(0.0, -0.5 * log2(posRatio)))
+        } else {
+            renyiBits = 0.0
+        }
+
+        let spindleRatio: Float
+        if sumPositiveP > 1e-15 {
+            let rawRatio = spindleBandEnergy / sumPositiveP
+            spindleRatio = Float(min(max(rawRatio, 0.0), 1.0))
+        } else {
+            spindleRatio = 0.0
+        }
+
+        // Cross-term oscillatory negativity suppression (dB) relative to unsmoothed pseudo-WVD
+        let suppressionDB: Float
+        let isUnsmoothedMode = useRectangularLagWindow && timeSigmaSamples <= 0.0
+        let rawNegRatio = rawTotalEnergySq > 1e-30 ? (rawNegativeEnergySq / rawTotalEnergySq) : 0.0
+        let smoothNegRatio = smoothTotalEnergySq > 1e-30 ? (smoothNegativeEnergySq / smoothTotalEnergySq) : 0.0
+        if isUnsmoothedMode || rawNegRatio <= 1e-12 {
+            suppressionDB = 0.0
+        } else if smoothNegRatio <= rawNegRatio * 1e-6 {
+            suppressionDB = Float(Self.maximumSuppressionDB)
+        } else {
+            let dbVal = 10.0 * log10(rawNegRatio / smoothNegRatio)
+            let clampedDB = min(Self.maximumSuppressionDB, max(0.0, dbVal))
+            suppressionDB = Float(clampedDB)
+        }
+
+        latestRenyiEntropyBits = renyiBits
+        latestCorticalSpindlePowerRatio = spindleRatio
+        latestCrossTermSuppressionDB = suppressionDB
+        processedBlockCount &+= 1
+        return true
+    }
+
+    /// Materializes a Sendable `SPWVDResult` copy from the current workspace state (for UI / non-RT callers).
+    public func snapshotResult() -> SPWVDResult {
+        var matrix: [[Float]] = []
+        matrix.reserveCapacity(blockSize)
+        for timeIdx in 0..<blockSize {
+            let rowStart = tfrBufferPtr.advanced(by: timeIdx * freqBins)
+            let rowArray = Array(UnsafeBufferPointer(start: rowStart, count: freqBins))
+            matrix.append(rowArray)
+        }
+        let ridgeArray = Array(UnsafeBufferPointer(start: ridgeBufferPtr, count: blockSize))
+        return SPWVDResult(
+            timeSteps: blockSize,
+            freqBins: freqBins,
+            tfrMatrix: matrix,
+            instantaneousFreqRidgeHz: ridgeArray,
+            renyiEntropyBits: latestRenyiEntropyBits,
+            corticalSpindlePowerRatio: latestCorticalSpindlePowerRatio,
+            crossTermSuppressionDB: latestCrossTermSuppressionDB
+        )
+    }
+
+    private func computeAnalyticSignalFromPreloadedFFTBuffer() {
+        runPrecomputedRadix2FFTInPlace(inverse: false)
+        for k in 0..<fftLength {
+            let gain = hilbertGainPtr[k]
+            fftRealPtr[k] *= gain
+            fftImagPtr[k] *= gain
+        }
+        runPrecomputedRadix2FFTInPlace(inverse: true)
+        for idx in 0..<blockSize {
+            analyticRePtr[idx] = fftRealPtr[idx]
+            analyticImPtr[idx] = fftImagPtr[idx]
+        }
+    }
+
+    private func runPrecomputedRadix2FFTInPlace(inverse: Bool) {
+        let m = fftLength
+        for i in 0..<m {
+            let rev = fftBitRevPtr[i]
+            if i < rev {
+                let tmpRe = fftRealPtr[i]
+                let tmpIm = fftImagPtr[i]
+                fftRealPtr[i] = fftRealPtr[rev]
+                fftImagPtr[i] = fftImagPtr[rev]
+                fftRealPtr[rev] = tmpRe
+                fftImagPtr[rev] = tmpIm
+            }
+        }
+
+        let imagSign: Double = inverse ? -1.0 : 1.0
+        var half = 1
+        while half < m {
+            let step = half << 1
+            var start = 0
+            while start < m {
+                for k in 0..<half {
+                    let twIdx = half + k
+                    let wRe = fftTwiddleRePtr[twIdx]
+                    let wIm = imagSign * fftTwiddleImPtr[twIdx]
+                    let i0 = start + k
+                    let i1 = i0 + half
+                    let uRe = fftRealPtr[i0]
+                    let uIm = fftImagPtr[i0]
+                    let x1Re = fftRealPtr[i1]
+                    let x1Im = fftImagPtr[i1]
+                    let vRe = x1Re * wRe - x1Im * wIm
+                    let vIm = x1Re * wIm + x1Im * wRe
+                    fftRealPtr[i0] = uRe + vRe
+                    fftImagPtr[i0] = uIm + vIm
+                    fftRealPtr[i1] = uRe - vRe
+                    fftImagPtr[i1] = uIm - vIm
+                }
+                start += step
+            }
+            half <<= 1
+        }
+    }
+
+    internal static func nextPowerOfTwo(_ value: Int) -> Int {
+        var p = 1
+        while p < value {
+            p <<= 1
+        }
+        return p
+    }
+
+    private static func precomputeFFTTables(
+        fftLength: Int,
+        bitRevPtr: UnsafeMutablePointer<Int>,
+        twiddleRePtr: UnsafeMutablePointer<Double>,
+        twiddleImPtr: UnsafeMutablePointer<Double>,
+        hilbertGainPtr: UnsafeMutablePointer<Double>
+    ) {
+        bitRevPtr[0] = 0
+        var j = 0
+        for i in 1..<fftLength {
+            var bit = fftLength >> 1
+            while (j & bit) != 0 {
+                j ^= bit
+                bit >>= 1
+            }
+            j ^= bit
+            bitRevPtr[i] = j
+        }
+
+        var half = 1
+        while half < fftLength {
+            let step = half << 1
+            let angleScale = -2.0 * Double.pi / Double(step)
+            for k in 0..<half {
+                let angle = angleScale * Double(k)
+                twiddleRePtr[half + k] = cos(angle)
+                twiddleImPtr[half + k] = sin(angle)
+            }
+            half <<= 1
+        }
+
+        let invM = 1.0 / Double(fftLength)
+        let halfM = fftLength / 2
+        hilbertGainPtr[0] = invM
+        for k in 1..<halfM {
+            hilbertGainPtr[k] = 2.0 * invM
+        }
+        hilbertGainPtr[halfM] = invM
+        for k in (halfM + 1)..<fftLength {
+            hilbertGainPtr[k] = 0.0
+        }
+    }
+
+    private static func precomputeSmoothingAndBasisTables(
+        freqBins: Int,
+        halfTimeWin: Int,
+        sigma: Double,
+        maxLag: Int,
+        lagStride: Int,
+        useRectangularLag: Bool,
+        gKernelPtr: UnsafeMutablePointer<Double>,
+        lagWindowTablePtr: UnsafeMutablePointer<Double>,
+        cosTablePtr: UnsafeMutablePointer<Double>,
+        sinTablePtr: UnsafeMutablePointer<Double>
+    ) {
+        let gCount = 2 * halfTimeWin + 1
+        if halfTimeWin == 0 || sigma <= 0.0 {
+            gKernelPtr[0] = 1.0
+        } else {
+            var gSum: Double = 0.0
+            let invTwoSigmaSq = 0.5 / (sigma * sigma)
+            for idx in 0..<gCount {
+                let u = Double(idx - halfTimeWin)
+                let w = exp(-(u * u) * invTwoSigmaSq)
+                gKernelPtr[idx] = w
+                gSum += w
+            }
+            let norm = max(1e-12, gSum)
+            for idx in 0..<gCount {
+                gKernelPtr[idx] /= norm
+            }
+        }
+
+        for localMaxLag in 0...maxLag {
+            let rowBase = localMaxLag * lagStride
+            let denom = Double(localMaxLag + 1)
+            for tau in 0...localMaxLag {
+                if useRectangularLag {
+                    lagWindowTablePtr[rowBase + tau] = 1.0
+                } else {
+                    let phase = Double.pi * Double(tau) / denom
+                    lagWindowTablePtr[rowBase + tau] = 0.5 * (1.0 + cos(phase))
+                }
+            }
+        }
+
+        let twoPiOverBins = 2.0 * Double.pi / Double(freqBins)
+        for k in 0..<freqBins {
+            let rowBase = k * lagStride
+            for tau in 0...maxLag {
+                let angle = twoPiOverBins * Double(k * tau)
+                cosTablePtr[rowBase + tau] = cos(angle)
+                sinTablePtr[rowBase + tau] = sin(angle)
+            }
+        }
     }
 }
 
 public enum SPWVDAnalyzer: Sendable {
     public static let canonicalBlockSize: Int = 128
+    /// Default Gaussian time-smoothing standard deviation in samples (`sigma = 6.0` yields >=20 dB cross-term suppression).
+    public static let defaultTimeSigmaSamples: Double = 6.0
 
     public struct ComplexSample: Sendable, Equatable {
         public var real: Double
@@ -76,17 +859,34 @@ public enum SPWVDAnalyzer: Sendable {
         }
     }
 
-    /// Computes the discrete analytic signal `z[n] = x[n] + j * Hilbert(x[n])` via complex DFT / Radix-2 FFT.
-    public static func computeAnalyticSignal(_ signal: [Float]) -> [ComplexSample] {
+    /// Computes the discrete analytic signal `z[n] = x[n] + j * Hilbert(x[n])` via zero-padded Radix-2 FFT
+    /// (preventing circular convolution wrap-around at block boundaries) or exact circular DFT when `zeroPadded == false`.
+    public static func computeAnalyticSignal(
+        _ signal: [Float],
+        zeroPadded: Bool = true
+    ) -> [ComplexSample] {
         let n = signal.count
         guard n > 0 else { return [] }
         guard n >= 2 else {
-            return [ComplexSample(real: Double(signal[0]), imag: 0.0)]
+            let s0 = signal[0].isFinite ? Double(signal[0]) : 0.0
+            return [ComplexSample(real: s0, imag: 0.0)]
         }
 
         let x = signal.map { $0.isFinite ? Double($0) : 0.0 }
 
-        // Power-of-two fast path via iterative Cooley-Tukey Radix-2 FFT; exact DFT fallback otherwise
+        if zeroPadded {
+            let m = RealtimeSPWVDEngine.nextPowerOfTwo(max(4, 2 * n))
+            var spectrum = [ComplexSample](repeating: ComplexSample(real: 0.0, imag: 0.0), count: m)
+            for idx in 0..<n {
+                spectrum[idx].real = x[idx]
+            }
+            radix2FFT(&spectrum, inverse: false)
+            applyHilbertFrequencyMask(&spectrum)
+            radix2FFT(&spectrum, inverse: true)
+            return Array(spectrum.prefix(n))
+        }
+
+        // Unpadded circular Hilbert transform path
         if (n & (n - 1)) == 0 {
             var spectrum = x.map { ComplexSample(real: $0, imag: 0.0) }
             radix2FFT(&spectrum, inverse: false)
@@ -149,8 +949,9 @@ public enum SPWVDAnalyzer: Sendable {
         signal: [Float],
         sampleRate: Double = 256.0,
         freqBins: Int = 64,
-        timeSigmaSamples: Double = 2.0,
-        maxLagSamples: Int? = nil
+        timeSigmaSamples: Double = defaultTimeSigmaSamples,
+        maxLagSamples: Int? = nil,
+        useRectangularLagWindow: Bool = false
     ) -> SPWVDResult {
         let n = signal.count
         let bins = max(8, freqBins)
@@ -163,160 +964,24 @@ public enum SPWVDAnalyzer: Sendable {
                 freqBins: bins,
                 tfrMatrix: emptyMatrix,
                 instantaneousFreqRidgeHz: [Float](repeating: 0.0, count: max(0, n)),
-                renyiEntropyBits: 0.0
+                renyiEntropyBits: 0.0,
+                corticalSpindlePowerRatio: 0.0,
+                crossTermSuppressionDB: 0.0
             )
         }
 
-        // Remove DC mean prior to analytic projection to prevent 0 Hz cross-terms
-        let meanVal = signal.reduce(Float(0.0), +) / Float(n)
-        let centered = signal.map { ($0.isFinite ? $0 : 0.0) - meanVal }
-        let z = computeAnalyticSignal(centered)
-
-        // Normalized Gaussian time-smoothing kernel g[u] for u in -U...U
-        let sigma = max(0.35, timeSigmaSamples)
-        let halfTimeWin = min(max(1, Int(ceil(2.5 * sigma))), max(1, n / 4))
-        var gKernel = [Double](repeating: 0.0, count: 2 * halfTimeWin + 1)
-        var gSum = 0.0
-        for idx in 0..<gKernel.count {
-            let u = Double(idx - halfTimeWin)
-            let w = exp(-0.5 * (u * u) / (sigma * sigma))
-            gKernel[idx] = w
-            gSum += w
-        }
-        for idx in 0..<gKernel.count {
-            gKernel[idx] /= max(1e-12, gSum)
-        }
-
-        // Symmetric Hann lag window h[tau] for tau in 0...L
-        let defaultLag = min(max(4, n / 4), bins - 1)
-        let maxLag = min(max(2, maxLagSamples ?? defaultLag), max(2, n / 2 - 1))
-        let hLag = (0...maxLag).map { tau -> Double in
-            0.5 * (1.0 + cos(Double.pi * Double(tau) / Double(maxLag + 1)))
-        }
-
-        // Precompute cosine/sine WVD Fourier basis over [0, fs/2):
-        // Since bilinear lag product z[n+tau]*z*[n-tau] oscillates at 2*f*tau,
-        // mapping bin k -> f_k = k * fs / (2 * bins) yields exp(-j * 2 * pi * k * tau / bins).
-        let twoPiOverBins = 2.0 * Double.pi / Double(bins)
-        var cosTable = [[Double]](repeating: [Double](repeating: 0.0, count: maxLag + 1), count: bins)
-        var sinTable = [[Double]](repeating: [Double](repeating: 0.0, count: maxLag + 1), count: bins)
-        for k in 0..<bins {
-            for tau in 0...maxLag {
-                let angle = twoPiOverBins * Double(k * tau)
-                cosTable[k][tau] = cos(angle)
-                sinTable[k][tau] = sin(angle)
-            }
-        }
-
-        var tfrMatrix = [[Float]](repeating: [Float](repeating: 0.0, count: bins), count: n)
-        var ridgeHz = [Float](repeating: 0.0, count: n)
-
-        var sumPositiveP = 0.0
-        var sumPositiveP3 = 0.0
-        var spindleBandEnergy = 0.0
-
-        for timeIdx in 0..<n {
-            let localMaxLag = min(maxLag, min(timeIdx, n - 1 - timeIdx))
-
-            // Evaluate time-smoothed Hermitian autocorrelation R_smooth[timeIdx, tau] for tau >= 0
-            var rSmoothRe = [Double](repeating: 0.0, count: localMaxLag + 1)
-            var rSmoothIm = [Double](repeating: 0.0, count: localMaxLag + 1)
-
-            for tau in 0...localMaxLag {
-                var accRe = 0.0
-                var accIm = 0.0
-                var weightNorm = 0.0
-
-                for gIdx in 0..<gKernel.count {
-                    let u = gIdx - halfTimeWin
-                    let m = timeIdx - u
-                    let iPlus = m + tau
-                    let iMinus = m - tau
-                    if iPlus >= 0 && iPlus < n && iMinus >= 0 && iMinus < n {
-                        let gw = gKernel[gIdx]
-                        let prod = z[iPlus] * z[iMinus].conjugate
-                        accRe += gw * prod.real
-                        accIm += gw * prod.imag
-                        weightNorm += gw
-                    }
-                }
-
-                if weightNorm > 1e-12 {
-                    let scale = hLag[tau] / weightNorm
-                    rSmoothRe[tau] = accRe * scale
-                    rSmoothIm[tau] = accIm * scale
-                }
-            }
-
-            // Real-valued Hermitian lag transform:
-            // W_z[n, k] = R[n, 0] + 2 * sum_{tau=1..L} Re(R[n, tau] * exp(-j * 2*pi*k*tau / bins))
-            var peakBin = 0
-            var peakVal = -Double.greatestFiniteMagnitude
-            var slice = [Double](repeating: 0.0, count: bins)
-
-            for k in 0..<bins {
-                var val = rSmoothRe[0]
-                if localMaxLag >= 1 {
-                    for tau in 1...localMaxLag {
-                        val += 2.0 * (rSmoothRe[tau] * cosTable[k][tau] + rSmoothIm[tau] * sinTable[k][tau])
-                    }
-                }
-                slice[k] = val
-                tfrMatrix[timeIdx][k] = Float(val)
-
-                if val > peakVal {
-                    peakVal = val
-                    peakBin = k
-                }
-
-                let posP = max(0.0, val)
-                sumPositiveP += posP
-                sumPositiveP3 += posP * posP * posP
-
-                let binFreqHz = (Double(k) / Double(2 * bins)) * fs
-                if binFreqHz >= 11.0 && binFreqHz <= 16.0 {
-                    spindleBandEnergy += posP
-                }
-            }
-
-            // Sub-bin parabolic ridge refinement
-            var refinedBin = Double(peakBin)
-            if peakBin > 0 && peakBin + 1 < bins {
-                let yL = slice[peakBin - 1]
-                let yC = slice[peakBin]
-                let yR = slice[peakBin + 1]
-                let denom = yL - 2.0 * yC + yR
-                if abs(denom) > 1e-12 && yC >= yL && yC >= yR {
-                    let delta = min(max(0.5 * (yL - yR) / denom, -0.5), 0.5)
-                    refinedBin += delta
-                }
-            }
-            let freqHz = (refinedBin / Double(2 * bins)) * fs
-            ridgeHz[timeIdx] = Float(min(max(freqHz, 0.0), 0.5 * fs))
-        }
-
-        // Order-3 Rényi Entropy: R_3 = -0.5 * log2( sum(P^3) / (sum(P))^3 )
-        let renyiBits: Float
-        if sumPositiveP > 1e-15 && sumPositiveP3 > 1e-30 {
-            let denom = sumPositiveP * sumPositiveP * sumPositiveP
-            let ratio = min(max(sumPositiveP3 / denom, 1e-30), 1.0)
-            renyiBits = Float(max(0.0, -0.5 * log2(ratio)))
-        } else {
-            renyiBits = 0.0
-        }
-
-        let spindleRatio = sumPositiveP > 1e-15
-            ? Float(min(max(spindleBandEnergy / sumPositiveP, 0.0), 1.0))
-            : 0.0
-
-        return SPWVDResult(
-            timeSteps: n,
+        let engine = RealtimeSPWVDEngine(
+            blockSize: n,
+            sampleRate: fs,
             freqBins: bins,
-            tfrMatrix: tfrMatrix,
-            instantaneousFreqRidgeHz: ridgeHz,
-            renyiEntropyBits: renyiBits,
-            corticalSpindlePowerRatio: spindleRatio
+            timeSigmaSamples: timeSigmaSamples,
+            maxLagSamples: maxLagSamples,
+            useRectangularLagWindow: useRectangularLagWindow
         )
+        signal.withUnsafeBufferPointer { buf in
+            _ = engine.processRealtimeBlock(buf)
+        }
+        return engine.snapshotResult()
     }
 
     private static func applyHilbertFrequencyMask(_ spectrum: inout [ComplexSample]) {
@@ -446,6 +1111,7 @@ public enum HilbertHuangSifter: Sendable {
     /// `residual` via Empirical Mode Decomposition with Thomas-algorithm O(N) natural cubic spline envelopes.
     /// Guarantees `sum(imfs) + residual == signal` within `< 1e-5` floating-point precision, and evaluates
     /// per-IMF Hilbert instantaneous phase `phi_k[n]`, unwrapped frequency `omega_k[n]`, and energy `A_k^2[n]`.
+    /// Note: Variable-knot EMD sifting is an offline/background telemetry transform; use `RealtimeSPWVDEngine` on real-time audio threads.
     public static func sift(
         signal: [Float],
         sampleRate: Double = 256.0,
@@ -466,7 +1132,7 @@ public enum HilbertHuangSifter: Sendable {
         }
 
         let siftLimit = max(1, maxSiftIterations)
-        let cauchyTol = min(max(1e-5, cauchyConvergenceThreshold), 0.05)
+        let cauchyTol = min(max(1e-6, cauchyConvergenceThreshold), 0.5)
         var runningResidual = sanitized.map(Double.init)
         var extractedIMFs: [[Float]] = []
         extractedIMFs.reserveCapacity(maxIMFs)
@@ -522,7 +1188,7 @@ public enum HilbertHuangSifter: Sendable {
 
                 protoIMF = nextProto
                 let cauchySD = diffSq / max(1e-15, prevSq)
-                if cauchySD < min(0.02, cauchyTol) && satisfiesIMFZeroCrossingCondition(protoIMF) {
+                if cauchySD < cauchyTol && satisfiesIMFZeroCrossingCondition(protoIMF) {
                     break
                 }
             }

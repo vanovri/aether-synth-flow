@@ -66,7 +66,11 @@ public struct VolumetricOrbitalRealityView: View {
     @State private var torusKnotEntity: ModelEntity?
     @State private var satelliteEntities: [UUID: ModelEntity] = [:]
     @State private var audioControllers: [UUID: AudioPlaybackController] = [:]
+    @State private var audioLoadTasks: [UUID: Task<Void, Never>] = [:]
     @State private var sceneUpdateSubscription: EventSubscription?
+    @State private var cachedCoreMesh: MeshResource?
+    @State private var cachedKnotMesh: MeshResource?
+    @State private var cachedSatelliteMesh: MeshResource?
 
     @State private var draggedSatelliteID: UUID?
     @State private var previousDragWorldPos: SIMD3<Float>?
@@ -94,6 +98,7 @@ public struct VolumetricOrbitalRealityView: View {
             rebuildHabitSatellites(using: resolvedHabitDTOs())
 
             // 90Hz SceneEvents.Update subscription driven by SpectralFFTAnalyzer sub/low/high bands
+            sceneUpdateSubscription?.cancel()
             sceneUpdateSubscription = content.subscribe(to: SceneEvents.Update.self) { event in
                 let dt = Float(min(max(event.deltaTime, 1.0 / 240.0), 0.050))
                 stepOrbitalPhysicsAndSpectralCore(dt: dt)
@@ -104,6 +109,9 @@ public struct VolumetricOrbitalRealityView: View {
                 rebuildHabitSatellites(using: resolvedHabitDTOs())
             }
             syncSpatialAudioPlaybackStates()
+        }
+        .onDisappear {
+            tearDownVolumetricScene()
         }
         .gesture(spatialSatelliteTapGesture)
         .gesture(spatialSatelliteDragAndFlingGesture)
@@ -155,7 +163,7 @@ public struct VolumetricOrbitalRealityView: View {
     }
 
     private var spatialSatelliteDragAndFlingGesture: some Gesture {
-        DragGesture(minimumDistance: 1.0)
+        DragGesture(minimumDistance: 0)
             .targetedToAnyEntity()
             .onChanged { value in
                 let entity = value.entity
@@ -184,14 +192,17 @@ public struct VolumetricOrbitalRealityView: View {
                 entity.components.set(sat)
                 entity.position = localPos
 
-                // Continuously modulate binaural beat & Cytomic SVF cutoff from radial 3D placement
+                // Continuously modulate binaural beat, Cytomic SVF cutoff & neural latent guidance from radial/vertical 3D placement
                 let normR = (clampedRadius - 0.11) / (0.36 - 0.11)
+                let normElev = min(max((localPos.y + 0.25) / 0.50, 0.0), 1.0)
                 var next = coordinator.synthParameters
                 next.binauralBeatHz = 2.0 + normR * 34.0
                 next.filterCutoffHz = 180.0 * powf(55.0, normR)
+                next.latentGuidanceScale = 1.0 + normR * 3.0
+                next.latentTemperature = 0.20 + normElev * 1.40
                 coordinator.synthParameters = next
                 if coordinator.isSynthPlaying || coordinator.isTimerRunning {
-                    Task { await coordinator.audioEngine.updateParameters(next) }
+                    coordinator.audioEngine.updateParametersImmediate(next)
                 }
             }
             .onEnded { value in
@@ -306,14 +317,21 @@ public struct VolumetricOrbitalRealityView: View {
     private func rebuildProceduralCoreAndKnotIfNeeded() {
         guard coreSunEntity == nil else { return }
 
-        let coreMeshData = ProceduralMeshGenerator.generateGeodesicIcosahedron(
-            radius: 0.078,
-            subdivisions: 3
-        )
-        let coreResource = (try? makeRealityKitMeshResource(
-            from: coreMeshData,
-            meshName: "GeodesicHarmonicCore"
-        )) ?? .generateSphere(radius: 0.078)
+        let coreResource: MeshResource
+        if let existingCoreMesh = cachedCoreMesh {
+            coreResource = existingCoreMesh
+        } else {
+            let coreMeshData = ProceduralMeshGenerator.generateGeodesicIcosahedron(
+                radius: 0.078,
+                subdivisions: 3
+            )
+            let generated = (try? makeRealityKitMeshResource(
+                from: coreMeshData,
+                meshName: "GeodesicHarmonicCore"
+            )) ?? .generateSphere(radius: 0.078)
+            cachedCoreMesh = generated
+            coreResource = generated
+        }
 
         var coreMaterial = PhysicallyBasedMaterial()
         coreMaterial.baseColor = .init(tint: UIColor(red: 0.16, green: 0.86, blue: 0.99, alpha: 1.0))
@@ -336,18 +354,27 @@ public struct VolumetricOrbitalRealityView: View {
         rootAnchorEntity.addChild(coreEntity)
         self.coreSunEntity = coreEntity
 
-        let knotMeshData = ProceduralMeshGenerator.generateKeplerianTorusKnot(
-            p: 2,
-            q: 3,
-            majorRadius: 0.135,
-            tubeRadius: 0.013,
-            tubularSegments: 128,
-            radialSegments: 18
-        )
-        if let knotResource = try? makeRealityKitMeshResource(
-            from: knotMeshData,
-            meshName: "KeplerianTorusKnotHalo"
-        ) {
+        let knotResource: MeshResource?
+        if let existingKnotMesh = cachedKnotMesh {
+            knotResource = existingKnotMesh
+        } else {
+            let knotMeshData = ProceduralMeshGenerator.generateKeplerianTorusKnot(
+                p: 2,
+                q: 3,
+                majorRadius: 0.135,
+                tubeRadius: 0.013,
+                tubularSegments: 128,
+                radialSegments: 18
+            )
+            let generated = try? makeRealityKitMeshResource(
+                from: knotMeshData,
+                meshName: "KeplerianTorusKnotHalo"
+            )
+            cachedKnotMesh = generated
+            knotResource = generated
+        }
+
+        if let knotResource {
             var knotMaterial = PhysicallyBasedMaterial()
             knotMaterial.baseColor = .init(tint: UIColor(red: 0.62, green: 0.42, blue: 0.98, alpha: 1.0))
             knotMaterial.metallic = .init(floatLiteral: 0.94)
@@ -366,24 +393,37 @@ public struct VolumetricOrbitalRealityView: View {
     }
 
     private func rebuildHabitSatellites(using nodes: [HabitNodeDTO]) {
+        for (_, task) in audioLoadTasks {
+            task.cancel()
+        }
+        audioLoadTasks.removeAll()
+
         for (_, controller) in audioControllers {
             controller.stop()
         }
         audioControllers.removeAll()
 
         for (_, existing) in satelliteEntities {
+            existing.stopAllAudio()
             existing.removeFromParent()
         }
         satelliteEntities.removeAll()
 
-        let baseSatelliteMeshData = ProceduralMeshGenerator.generateGeodesicIcosahedron(
-            radius: 0.028,
-            subdivisions: 2
-        )
-        let sharedSatelliteMesh = (try? makeRealityKitMeshResource(
-            from: baseSatelliteMeshData,
-            meshName: "HabitSatelliteGeodesic"
-        )) ?? .generateSphere(radius: 0.028)
+        let sharedSatelliteMesh: MeshResource
+        if let existingSatMesh = cachedSatelliteMesh {
+            sharedSatelliteMesh = existingSatMesh
+        } else {
+            let baseSatelliteMeshData = ProceduralMeshGenerator.generateGeodesicIcosahedron(
+                radius: 0.028,
+                subdivisions: 2
+            )
+            let generated = (try? makeRealityKitMeshResource(
+                from: baseSatelliteMeshData,
+                meshName: "HabitSatelliteGeodesic"
+            )) ?? .generateSphere(radius: 0.028)
+            cachedSatelliteMesh = generated
+            sharedSatelliteMesh = generated
+        }
 
         let justIntonationRatios: [Float] = [1.0, 1.25, 1.5, 1.875, 2.0, 2.5]
         let total = max(1, nodes.count)
@@ -461,21 +501,63 @@ public struct VolumetricOrbitalRealityView: View {
         habitID: UUID,
         frequencyHz: Double
     ) {
-        Task { @MainActor in
-            guard let wavURL = Self.writeSeamlessHarmonicOvertoneWAV(
-                habitID: habitID,
-                frequencyHz: frequencyHz
-            ) else { return }
+        audioLoadTasks[habitID]?.cancel()
+        audioLoadTasks[habitID] = Task { @MainActor [weak entity] in
+            guard !Task.isCancelled,
+                  let wavURL = Self.writeSeamlessHarmonicOvertoneWAV(
+                      habitID: habitID,
+                      frequencyHz: frequencyHz
+                  ) else { return }
 
             let config = AudioFileResource.Configuration(shouldLoop: true)
-            if let resource = try? await AudioFileResource(contentsOf: wavURL, configuration: config) {
-                let controller = entity.prepareAudio(resource)
-                audioControllers[habitID] = controller
-                if coordinator.isTimerRunning || coordinator.isSynthPlaying {
-                    controller.play()
-                }
+            guard let resource = try? await AudioFileResource(contentsOf: wavURL, configuration: config),
+                  !Task.isCancelled,
+                  let entity,
+                  entity.parent != nil,
+                  satelliteEntities[habitID] === entity else {
+                return
+            }
+
+            let controller = entity.prepareAudio(resource)
+            audioControllers[habitID] = controller
+            if coordinator.isTimerRunning || coordinator.isSynthPlaying {
+                controller.play()
             }
         }
+    }
+
+    private func tearDownVolumetricScene() {
+        sceneUpdateSubscription?.cancel()
+        sceneUpdateSubscription = nil
+
+        for (_, task) in audioLoadTasks {
+            task.cancel()
+        }
+        audioLoadTasks.removeAll()
+
+        for (_, controller) in audioControllers {
+            controller.stop()
+        }
+        audioControllers.removeAll()
+
+        for (_, entity) in satelliteEntities {
+            entity.stopAllAudio()
+            entity.removeFromParent()
+        }
+        satelliteEntities.removeAll()
+
+        coreSunEntity?.stopAllAudio()
+        coreSunEntity?.removeFromParent()
+        coreSunEntity = nil
+
+        torusKnotEntity?.removeFromParent()
+        torusKnotEntity = nil
+
+        rootAnchorEntity.children.removeAll()
+        draggedSatelliteID = nil
+        previousDragWorldPos = nil
+        estimatedDragVelocity = .zero
+        lastBuiltHabitSignature = ""
     }
 
     private func syncSpatialAudioPlaybackStates() {
@@ -607,7 +689,14 @@ public struct VolumetricOrbitalRealityView: View {
     }
 
     private func habitSignature(for list: [HabitNode]) -> String {
-        list.map { "\($0.habitID.uuidString):\($0.revision)" }.joined(separator: "|")
+        list.map {
+            String(
+                format: "%@:%@:%.3f",
+                $0.habitID.uuidString,
+                $0.title,
+                $0.accentHue
+            )
+        }.joined(separator: "|")
     }
 }
 #endif

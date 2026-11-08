@@ -162,12 +162,20 @@ public final class AetherAppCoordinator {
     private let liveActivityController = FocusLiveActivityController()
     #endif
 
+    // Phase 9/10 Closed-Loop Cortical Entrainment & Biharmonic Coupling Constants
+    public static let goldenRatioPhi: Float = 1.6180339887
+    public static let iafBeatSlewAlpha: Float = 0.15
+    public static let baselinePlateStiffnessKappa: Float = 0.14
+    public static let pacToStiffnessGain: Float = 2.4
+    public static let stiffnessSlewAlpha: Float = 0.18
+
     private var eegGenerator = SyntheticCorticalEEGGenerator()
     private var eegFilterBank = EEGArtifactFilterBank()
     private var pidController = EntrainmentPIDController()
     private var physiologySimulator = SyntheticPhysiologySimulator(initialStressLevel: 0.58)
     private var lastBioEntrainmentTickDate: Date = .distantPast
     private var lastOrchestraTickDate: Date = .distantPast
+    private var lastPhase9FrameTickDate: Date = .distantPast
     private var previousEvaluatedMetrics: HRVAnalysisMetricsDTO?
     private var previousEvaluatedFeatures: BiometricFeatureVector?
     private var previousPredictionOutput: BrainwavePredictionOutput?
@@ -441,18 +449,24 @@ public final class AetherAppCoordinator {
         }
 
         // Phase 9: Step 128x128 Visual FDTD Waveguide Tank & 4-Channel Cortical EEG BCI
-        eegBCI.stepRealtimeFrame(dtSeconds: 0.033, activeBinauralBeatHz: synthParameters.binauralBeatHz)
+        let nowPhase9 = Date.now
+        let rawPhase9Dt = nowPhase9.timeIntervalSince(lastPhase9FrameTickDate)
+        let phase9Dt = (rawPhase9Dt > 0.0 && rawPhase9Dt < 0.25) ? min(max(rawPhase9Dt, 0.008), 0.10) : (1.0 / 30.0)
+        lastPhase9FrameTickDate = nowPhase9
+        eegBCI.stepRealtimeFrame(dtSeconds: phase9Dt, activeBinauralBeatHz: synthParameters.binauralBeatHz)
+        latestEEGMetrics = eegBCI.latestMetrics
         if isSynthPlaying || isTimerRunning || synthParameters.fdtdResonatorMix > 0.001 {
             waveTankController.stepVisualFrame(substeps: 2)
         }
         if isCorticalIAFLockEnabled {
             let iaf = eegBCI.latestMetrics.individualAlphaFrequencyHz
-            let targetBeat = useGoldenRatioIAFSubharmonic ? (iaf / 1.6180339887) : iaf
+            let targetBeat = useGoldenRatioIAFSubharmonic ? (iaf / Self.goldenRatioPhi) : iaf
             let clampedTargetBeat = min(max(targetBeat, 0.5), 40.0)
-            let nextBeat = synthParameters.binauralBeatHz + 0.15 * (clampedTargetBeat - synthParameters.binauralBeatHz)
+            let nextBeat = synthParameters.binauralBeatHz + Self.iafBeatSlewAlpha * (clampedTargetBeat - synthParameters.binauralBeatHz)
             let pacMI = eegBCI.latestMetrics.thetaGammaPACModulationIndex
-            let targetKappa = min(max(0.14 + pacMI * 2.4, 0.05), 0.92)
-            let nextKappa = synthParameters.fdtdStiffness + 0.18 * (targetKappa - synthParameters.fdtdStiffness)
+            let rawKappa = Self.baselinePlateStiffnessKappa + pacMI * Self.pacToStiffnessGain
+            let targetKappa = min(max(rawKappa, 0.05), 0.92)
+            let nextKappa = synthParameters.fdtdStiffness + Self.stiffnessSlewAlpha * (targetKappa - synthParameters.fdtdStiffness)
 
             if abs(nextBeat - synthParameters.binauralBeatHz) > 0.015 || abs(nextKappa - synthParameters.fdtdStiffness) > 0.004 {
                 synthParameters.binauralBeatHz = nextBeat
@@ -565,9 +579,17 @@ public final class AetherAppCoordinator {
         var next = synthParameters
         if modulation.leftPinchEngaged || isSimulated {
             next.binauralBeatHz = modulation.binauralBeatHz
+            next.latentTemperature = modulation.latentTemperature
         }
         if modulation.rightPinchEngaged || isSimulated {
             next.filterCutoffHz = modulation.filterCutoffHz
+            next.latentGuidanceScale = modulation.latentGuidanceScale
+        }
+        if modulation.leftPinchEngaged && modulation.rightPinchEngaged {
+            let clampedChi = min(max(modulation.tensorBondDimensionTarget, 2), PreallocatedMPSBondSliceBank.chiMax)
+            selectedMPSBondDimension = clampedChi
+            next.tensorBondDimensionTarget = clampedChi
+            next.mpsBondSliceBank.selectActiveBondSlice(clampedChi)
         }
         next.filterResonance = modulation.filterResonance
         next.padDetuneCents = modulation.padDetuneCents
@@ -575,12 +597,12 @@ public final class AetherAppCoordinator {
         next.spatialPanOffset = modulation.spatialPanOffset
         next.headElevationTilt = modulation.headElevationTilt
         next.headQuaternion = modulation.headQuaternion
+        next.hrtfAzimuthDeg = modulation.gazeAzimuthDeg
+        next.hrtfElevationDeg = modulation.gazeElevationDeg
 
         synthParameters = next
         if isSynthPlaying || isTimerRunning {
-            Task {
-                await audioEngine.updateParameters(next)
-            }
+            audioEngine.updateParametersImmediate(next)
         }
     }
 
@@ -989,6 +1011,7 @@ public final class AetherAppCoordinator {
             selectedPresetID = nil
             activePresetName = "Custom Patch"
         }
+        audioEngine.updateParametersImmediate(updated)
         Task { await audioEngine.updateParameters(updated) }
     }
 
@@ -1291,10 +1314,11 @@ public final class AetherAppCoordinator {
         hapticDirector.playSegmentSnap()
         if enabled {
             let iaf = eegBCI.latestMetrics.individualAlphaFrequencyHz
-            let targetBeat = useGoldenRatioIAFSubharmonic ? (iaf / 1.6180339887) : iaf
+            let targetBeat = useGoldenRatioIAFSubharmonic ? (iaf / Self.goldenRatioPhi) : iaf
             synthParameters.binauralBeatHz = min(max(targetBeat, 0.5), 40.0)
             let pacMI = eegBCI.latestMetrics.thetaGammaPACModulationIndex
-            synthParameters.fdtdStiffness = min(max(0.14 + pacMI * 2.4, 0.05), 0.92)
+            let rawKappa = Self.baselinePlateStiffnessKappa + pacMI * Self.pacToStiffnessGain
+            synthParameters.fdtdStiffness = min(max(rawKappa, 0.05), 0.92)
             Task { await audioEngine.updateParameters(synthParameters) }
             presentTransientBanner(String(
                 format: "Cortical IAF Lock active · Target %.2f Hz · PAC MI %.3f",
@@ -1311,7 +1335,7 @@ public final class AetherAppCoordinator {
         hapticDirector.playParameterDetentTick(intensity: 0.45)
         if isCorticalIAFLockEnabled {
             let iaf = eegBCI.latestMetrics.individualAlphaFrequencyHz
-            let targetBeat = enabled ? (iaf / 1.6180339887) : iaf
+            let targetBeat = enabled ? (iaf / Self.goldenRatioPhi) : iaf
             synthParameters.binauralBeatHz = min(max(targetBeat, 0.5), 40.0)
             Task { await audioEngine.updateParameters(synthParameters) }
         }
@@ -1437,50 +1461,107 @@ public final class AetherAppCoordinator {
     }
 
     public func refreshCorticalEEGAndTFR() async {
-        var cleanedAF7: [Float] = []
-        var cleanedAF8: [Float] = []
-        cleanedAF7.reserveCapacity(128)
-        cleanedAF8.reserveCapacity(128)
-        eegGenerator.entrain(toBinauralBeatHz: synthParameters.binauralBeatHz, dtSeconds: 0.5)
-        for i in 0..<128 {
-            let raw = eegGenerator.nextSample(injectBlinkAmplitude: i == 32 ? 120.0 : 0.0)
-            let filtered = eegFilterBank.processQuadSample(raw)
-            cleanedAF7.append(filtered.cleaned.af7)
-            cleanedAF8.append(filtered.cleaned.af8)
-        }
-        let metrics = CorticalSpectralAnalyzer.analyze(
-            channelSamples: cleanedAF7,
-            frontalLeft: cleanedAF7,
-            frontalRight: cleanedAF8,
-            sampleRate: 256.0
-        )
+        eegBCI.stepRealtimeFrame(dtSeconds: 0.125, activeBinauralBeatHz: synthParameters.binauralBeatHz)
+        let metrics = eegBCI.latestMetrics
         latestEEGMetrics = metrics
-        if isClosedLoopIAFLockEnabled {
+        if isClosedLoopIAFLockEnabled || isCorticalIAFLockEnabled {
             var updated = synthParameters
-            updated.binauralBeatHz = metrics.individualAlphaFrequencyHz
+            let iaf = metrics.individualAlphaFrequencyHz
+            let targetBeat = useGoldenRatioIAFSubharmonic ? (iaf / Self.goldenRatioPhi) : iaf
+            updated.binauralBeatHz = min(max(targetBeat, 0.5), 40.0)
             pushSynthParameters(updated, clearingPresetSelection: false)
         }
-        let subWindow = Array(cleanedAF7.suffix(64))
-        latestSPWVDResult = SPWVDAnalyzer.analyze(signal: subWindow, sampleRate: 256.0, freqBins: 32)
-        latestHHTResult = HilbertHuangSifter.sift(signal: subWindow, sampleRate: 256.0, maxIMFs: 4)
+        let canonicalCount = SPWVDAnalyzer.canonicalBlockSize
+        let scopeWindow = Array(eegBCI.cleanedAF7Scope.suffix(canonicalCount))
+        latestSPWVDResult = SPWVDAnalyzer.analyze(signal: scopeWindow, sampleRate: 256.0, freqBins: 32)
+        latestHHTResult = HilbertHuangSifter.sift(signal: scopeWindow, sampleRate: 256.0, maxIMFs: 4)
     }
 
     public func refreshQuantumMPSAndDMRG(bondDim: Int? = nil) async {
         if let bondDim {
             selectedMPSBondDimension = min(max(bondDim, 2), 16)
         }
-        let bell = MatrixProductStateEngine.makeMaximallyEntangledBellState(schmidtRank: 8)
+        let eeg = eegBCI.latestMetrics
+        let eegBands4 = SIMD4<Float>(
+            eeg.relativeTheta,
+            eeg.relativeAlpha,
+            eeg.relativeBeta,
+            eeg.relativeGamma
+        )
+        let hrvRMSSD = Float(min(max((latestHRVMetrics?.rmssdMilliseconds ?? 54.0) / 100.0, 0.05), 1.0))
+        let hrvSDNN = Float(min(max((latestHRVMetrics?.sdnnMilliseconds ?? 62.0) / 120.0, 0.05), 1.0))
+        let hrvLFHF = Float(min(max((latestHRVMetrics?.lfHfRatio ?? 1.15) / 4.0, 0.05), 1.0))
+        let hrvRSA = Float(min(max(latestHRVMetrics?.rsaCoherenceScore ?? 0.76, 0.05), 1.0))
+        let hrvMetrics4 = SIMD4<Float>(hrvRMSSD, hrvSDNN, hrvLFHF, hrvRSA)
+
+        let spwvdEntropyNorm = min(max((latestSPWVDResult?.renyiEntropyBits ?? 3.6) / 8.0, 0.05), 1.0)
+        let spwvdRidgeNorm = min(max((latestSPWVDResult?.dominantRidgeHz.last ?? eeg.individualAlphaFrequencyHz) / 48.0, 0.05), 1.0)
+        let hhtFreqNorm = min(max((latestHHTResult?.imfAnalytics.first?.meanFrequencyHz ?? eeg.individualAlphaFrequencyHz) / 48.0, 0.05), 1.0)
+        let pacNorm = min(max(eeg.thetaGammaPACModulationIndex * 4.0 + 0.15, 0.05), 1.0)
+        let spwvdState4 = SIMD4<Float>(spwvdEntropyNorm, spwvdRidgeNorm, hhtFreqNorm, pacNorm)
+
+        let carrierNorm = min(max(synthParameters.carrierFrequencyHz / 800.0, 0.05), 1.0)
+        let beatNorm = min(max(synthParameters.binauralBeatHz / 40.0, 0.05), 1.0)
+        let fmNorm = min(max(synthParameters.fmModulationIndex / 8.0, 0.05), 1.0)
+        let cutoffNorm = min(max(synthParameters.filterCutoffHz / 8_000.0, 0.05), 1.0)
+        let oscState4 = SIMD4<Float>(carrierNorm, beatNorm, fmNorm, cutoffNorm)
+
+        let azimNorm = min(max(synthParameters.hrtfAzimuthDeg / 360.0 + 0.5, 0.05), 1.0)
+        let distNorm = min(max(synthParameters.hrtfDistanceMeters / 4.0, 0.05), 1.0)
+        let stiffNorm = min(max(synthParameters.fdtdStiffnessKappa, 0.05), 1.0)
+        let tankRMSNorm = min(max(waveTankController.latestRMSPressure * 4.0 + 0.1, 0.05), 1.0)
+        let wavefieldState4 = SIMD4<Float>(azimNorm, distNorm, stiffNorm, tankRMSNorm)
+
+        let focusCap = Float(min(max(latestKalmanEstimate.focusCapacity, 0.05), 1.0))
+        let fatigue = Float(min(max(latestKalmanEstimate.cognitiveFatigue, 0.05), 1.0))
+        let circSin = Float(sin(latestKalmanEstimate.circadianPhaseRadians) * 0.45 + 0.5)
+        let circCos = Float(cos(latestKalmanEstimate.circadianPhaseRadians) * 0.45 + 0.5)
+        let circadianState4 = SIMD4<Float>(focusCap, fatigue, circSin, circCos)
+
+        let couplingStrength = min(max(0.40 + eeg.thetaGammaPACModulationIndex * 2.2, 0.25), 0.90)
+        let liveBioAcousticState = MatrixProductStateEngine.encodeBioAcousticStateTensor(
+            eegCorticalBands4: eegBands4,
+            hrvVagalMetrics4: hrvMetrics4,
+            spwvdEntropyState4: spwvdState4,
+            binauralOscillatorState4: oscState4,
+            hrtfFDTDWavefield4: wavefieldState4,
+            circadianKalmanPhase4: circadianState4,
+            entanglementCoupling: couplingStrength
+        )
+
         let sweeps = DMRGVariationalOptimizer.runSweeps(
-            initialState: bell,
+            initialState: liveBioAcousticState.map(Double.init),
             sweeps: 4,
             maxBondDim: selectedMPSBondDimension
         )
         dmrgSweepSnapshots = sweeps
         latestMPSTelemetry = sweeps.last
-        let mpsEngine = MatrixProductStateEngine(stateVector: bell, maxBondDim: selectedMPSBondDimension)
-        latestOptimalBioAcousticControl = DMRGVariationalOptimizer.extractOptimalBioAcousticControl(from: mpsEngine)
+
+        var mpsEngine = MatrixProductStateEngine(stateVector: liveBioAcousticState, maxBondDim: selectedMPSBondDimension)
+        let optimizer = DMRGVariationalOptimizer(
+            anisotropyDelta: 1.0,
+            maxBondDim: selectedMPSBondDimension,
+            lanczosIterations: 8
+        )
+        let convergedSnap = optimizer.runSweeps(mps: &mpsEngine, sweepCount: 2)
+        let baseControl = DMRGVariationalOptimizer.extractOptimalBioAcousticControl(from: mpsEngine)
+        latestOptimalBioAcousticControl = OptimalBioAcousticControl(
+            recommendedBinauralBeatHz: baseControl.recommendedBinauralBeatHz,
+            recommendedCarrierHz: baseControl.recommendedCarrierHz,
+            recommendedTZFMIndex: baseControl.recommendedTZFMIndex,
+            recommendedHRTFOrbitSpeed: baseControl.recommendedHRTFOrbitSpeed,
+            recommendedFDTDWaveguideStiffness: baseControl.recommendedFDTDWaveguideStiffness,
+            centralEntanglementEntropy: convergedSnap.centralEntanglementEntropy,
+            renyi2Purity: Float(convergedSnap.renyi2Purity),
+            groundStateEnergy: Float(convergedSnap.groundStateEnergy)
+        )
         if let last = sweeps.last {
             var updated = synthParameters
+            updated.tensorBondDimensionTarget = selectedMPSBondDimension
+            updated.mpsBondSliceBank = PreallocatedMPSBondSliceBank(
+                singularValues: last.schmidtSingularValues,
+                activeBondDimensionSlice: selectedMPSBondDimension
+            )
             updated.padDetuneCents = last.mappedHarmonicTension * 24.0
             updated.fmHarmonicRatio = last.mappedSpectralInharmonicity
             synthParameters = updated
@@ -1500,8 +1581,10 @@ public final class AetherAppCoordinator {
             exportCapstoneMarkdownDocument = CapstoneReportMarkdownDocument(report: report)
             exportCapstoneJSONDocument = CapstoneReportJSONDocument(report: report)
             hapticDirector.playSessionCompletionSymphony()
+            let digestValid = report.verifyCryptographicDigest()
+            let statusWord = (report.allInvariantsPassed && digestValid) ? "Passed" : "Warning"
             presentTransientBanner(
-                "12-Stage Capstone Audit Passed · SHA-256 \(report.reportSHA256Hex.prefix(12))…"
+                "12-Stage Capstone Audit \(statusWord) (\(report.passedStageCount)/\(report.totalStageCount)) · SHA-256 \(report.reportSHA256Hex.prefix(12))…"
             )
         } catch {
             presentTransientBanner("Capstone audit error: \(error.localizedDescription)")

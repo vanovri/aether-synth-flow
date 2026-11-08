@@ -75,6 +75,7 @@ private struct GPUCompositorUniforms {
 
 public final class AetherCompositorRenderer: @unchecked Sendable {
     public static let particleCount: Int = 16_384
+    public static let maxFramesInFlight: Int = 3
     private static let auroraDomeVertexCount: Int = 32 * 16 * 6
 
     private let layerRenderer: LayerRenderer
@@ -86,6 +87,7 @@ public final class AetherCompositorRenderer: @unchecked Sendable {
     private let auroraDomeRenderPipeline: MTLRenderPipelineState
     private let depthStencilState: MTLDepthStencilState
     private let particleBuffers: [MTLBuffer]
+    private let inFlightSemaphore = DispatchSemaphore(value: AetherCompositorRenderer.maxFramesInFlight)
 
     private let arSession = ARKitSession()
     private let worldTracking = WorldTrackingProvider()
@@ -145,22 +147,25 @@ public final class AetherCompositorRenderer: @unchecked Sendable {
         }
 
         let depthDesc = MTLDepthStencilDescriptor()
-        // Reverse-Z depth compare (.greaterEqual) matching drawable.computeProjection(viewIndex:)
+        // Reverse-Z depth testing (.greaterEqual against clearDepth = 0.0) ensures visionOS 2 reprojection
+        // receives accurate nearest-surface per-pixel depth while preserving additive blending.
         depthDesc.depthCompareFunction = .greaterEqual
-        depthDesc.isDepthWriteEnabled = false
+        depthDesc.isDepthWriteEnabled = true
         guard let depthState = device.makeDepthStencilState(descriptor: depthDesc) else {
             return nil
         }
         self.depthStencilState = depthState
 
         let byteLength = MemoryLayout<GPUParticleRecord>.stride * Self.particleCount
-        guard let pingBuffer = device.makeBuffer(length: byteLength, options: .storageModeShared),
-              let pongBuffer = device.makeBuffer(length: byteLength, options: .storageModeShared) else {
+        guard let slot0 = device.makeBuffer(length: byteLength, options: .storageModeShared),
+              let slot1 = device.makeBuffer(length: byteLength, options: .storageModeShared),
+              let slot2 = device.makeBuffer(length: byteLength, options: .storageModeShared) else {
             return nil
         }
-        Self.seedInitialParticles(into: pingBuffer)
-        memcpy(pongBuffer.contents(), pingBuffer.contents(), byteLength)
-        self.particleBuffers = [pingBuffer, pongBuffer]
+        Self.seedInitialParticles(into: slot0)
+        memcpy(slot1.contents(), slot0.contents(), byteLength)
+        memcpy(slot2.contents(), slot0.contents(), byteLength)
+        self.particleBuffers = [slot0, slot1, slot2]
     }
 
     public func startRenderLoop() {
@@ -170,8 +175,11 @@ public final class AetherCompositorRenderer: @unchecked Sendable {
             }
         }
 
-        let renderThread = Thread { [weak self] in
-            self?.runDedicatedRenderThread()
+        // Strong capture is intentional: nothing else owns the renderer after the CompositorLayer closure
+        // returns, so a weak capture lets it deallocate before the thread starts (black immersive space).
+        // The loop exits on `.invalidated`, which releases the renderer deterministically.
+        let renderThread = Thread {
+            self.runDedicatedRenderThread()
         }
         renderThread.name = "com.aethersynth.vision.compositor-render-thread"
         renderThread.qualityOfService = .userInteractive
@@ -220,13 +228,8 @@ public final class AetherCompositorRenderer: @unchecked Sendable {
             return
         }
 
-        // 1. Frame Update Phase
+        // 1. Frame Update Phase (input-independent work only; hand/pinch state is sampled after optimalInputTime)
         frame.startUpdate()
-        let telemetry = sharedState.snapshot()
-        let nowMediaTime = CACurrentMediaTime()
-        let dt = Float(min(max(nowMediaTime - previousMediaTime, 1.0 / 240.0), 0.050))
-        let elapsed = Float(nowMediaTime - startMediaTime)
-        previousMediaTime = nowMediaTime
         frame.endUpdate()
 
         // 2. Optimal Input Latency Wait
@@ -235,7 +238,7 @@ public final class AetherCompositorRenderer: @unchecked Sendable {
         }
         LayerRenderer.Clock().wait(until: timing.optimalInputTime)
 
-        // 3. Submission Phase & 6-DoF DeviceAnchor Query
+        // 3. Submission Phase & Triple-Buffered In-Flight Slot Acquisition
         frame.startSubmission()
         defer { frame.endSubmission() }
 
@@ -244,7 +247,30 @@ public final class AetherCompositorRenderer: @unchecked Sendable {
             return
         }
 
+        guard inFlightSemaphore.wait(timeout: .now() + .milliseconds(12)) == .success else {
+            return
+        }
+        let semaphore = inFlightSemaphore
+        var didScheduleCompletionSignal = false
+        defer {
+            if !didScheduleCompletionSignal {
+                semaphore.signal()
+            }
+        }
+
+        guard layerRenderer.state == .running else {
+            return
+        }
+
         let presentationTimestamp = Self.timeInterval(from: drawable.frameTiming.presentationTime)
+
+        // Latest hand/pinch/FFT telemetry, sampled as late as possible (after optimalInputTime).
+        let telemetry = sharedState.snapshot()
+        // Simulation step follows photon (presentation) time, not CPU wake-up time, to avoid particle judder
+        // when the compositor shifts cadence (90 / 96 / 100 Hz) or CPU scheduling jitters.
+        let dt = Float(min(max(presentationTimestamp - previousMediaTime, 1.0 / 240.0), 0.050))
+        let elapsed = Float(presentationTimestamp - startMediaTime)
+        previousMediaTime = presentationTimestamp
         let deviceAnchor: DeviceAnchor? = WorldTrackingProvider.isSupported
             ? worldTracking.queryDeviceAnchor(atTimestamp: presentationTimestamp)
             : nil
@@ -375,10 +401,12 @@ public final class AetherCompositorRenderer: @unchecked Sendable {
             frameCounter: frameCounter
         )
 
-        // 4. Double-Buffered Metal Compute Pass (16,384 Curl-Noise + FFT Shockwave Particles)
-        let srcBuffer = particleBuffers[pingPongIndex]
-        let dstBuffer = particleBuffers[1 - pingPongIndex]
-        pingPongIndex = 1 - pingPongIndex
+        // 4. Triple-Buffered Metal Compute Pass (16,384 Curl-Noise + FFT Shockwave Particles)
+        let ringCount = particleBuffers.count
+        let srcBuffer = particleBuffers[pingPongIndex % ringCount]
+        let dstIndex = (pingPongIndex + 1) % ringCount
+        let dstBuffer = particleBuffers[dstIndex]
+        pingPongIndex = dstIndex
 
         if let computeEncoder = commandBuffer.makeComputeCommandEncoder() {
             computeEncoder.label = "AetherCurlNoiseParticleComputePass"
@@ -406,7 +434,7 @@ public final class AetherCompositorRenderer: @unchecked Sendable {
 
             passDesc.depthAttachment.texture = drawable.depthTextures[0]
             passDesc.depthAttachment.loadAction = .clear
-            passDesc.depthAttachment.storeAction = .dontCare
+            passDesc.depthAttachment.storeAction = .store
             passDesc.depthAttachment.clearDepth = 0.0
 
             passDesc.renderTargetArrayLength = viewCount
@@ -462,7 +490,7 @@ public final class AetherCompositorRenderer: @unchecked Sendable {
                 passDesc.depthAttachment.texture = drawable.depthTextures[texIndex]
                 passDesc.depthAttachment.slice = texMap.sliceIndex
                 passDesc.depthAttachment.loadAction = isFirstUse ? .clear : .load
-                passDesc.depthAttachment.storeAction = .dontCare
+                passDesc.depthAttachment.storeAction = .store
                 passDesc.depthAttachment.clearDepth = 0.0
 
                 if texIndex < drawable.rasterizationRateMaps.count {
@@ -502,6 +530,14 @@ public final class AetherCompositorRenderer: @unchecked Sendable {
             }
         }
 
+        guard layerRenderer.state == .running else {
+            return
+        }
+
+        commandBuffer.addCompletedHandler { _ in
+            semaphore.signal()
+        }
+        didScheduleCompletionSignal = true
         drawable.encodePresent(commandBuffer: commandBuffer)
         commandBuffer.commit()
     }

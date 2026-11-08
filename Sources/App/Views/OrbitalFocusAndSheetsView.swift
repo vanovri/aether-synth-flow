@@ -2136,10 +2136,13 @@ public struct SynthLabPanelView: View {
                             .font(.system(size: 14, weight: .bold, design: .rounded))
                             .foregroundStyle(.white)
                     }
+                    let gridN = tank.gridSize
+                    let resN = RealtimeFDTDResonatorKernel.gridDimension
+                    let pmlCells = tank.pmlThickness
                     Text(
                         tankCtrl.isUsingMetalCompute
-                            ? "128×128 Metal Compute + 24×24 48kHz SIMD4 Resonator · Cubic PML (>35 dB)"
-                            : "128×128 SIMD9 Stencil + 24×24 48kHz Resonator · Biharmonic Plate Stiffness κ"
+                            ? "\(gridN)×\(gridN) Metal Compute + \(resN)×\(resN) 48kHz SIMD4 Resonator · \(pmlCells)-Cell Cubic PML (>35 dB)"
+                            : "\(gridN)×\(gridN) SIMD9 Stencil + \(resN)×\(resN) 48kHz Resonator · \(pmlCells)-Cell PML · Biharmonic κ"
                     )
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.65))
@@ -2391,10 +2394,12 @@ public struct SynthLabPanelView: View {
                             .font(.system(size: 14, weight: .bold, design: .rounded))
                             .foregroundStyle(.white)
                     }
+                    let rlsTaps = EEGArtifactFilterBank.tapCount
+                    let fsHz = CorticalSpectralAnalyzer.fftWindowLength
                     Text(
                         bci.isBLEHardwareConnected
-                            ? "CoreBluetooth 256Hz GATT Stream · 4-Tap RLS (λ=0.992) + Kalman EOG Subtractor"
-                            : "Jansen-Rit RK4 Cortical Column Simulator · 4-Tap RLS + Kalman Ocular Canceler"
+                            ? "CoreBluetooth \(fsHz)Hz GATT Stream · \(rlsTaps)-Tap RLS + Kalman EOG Subtractor"
+                            : "Jansen-Rit RK4 (\(fsHz)Hz) Simulator · \(rlsTaps)-Tap RLS + Kalman Ocular Canceler"
                     )
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.65))

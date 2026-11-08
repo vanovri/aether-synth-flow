@@ -808,6 +808,10 @@ struct AetherSynthTests {
         #expect(abs(maxOut.filterResonance - 0.92) < 1e-3)
         #expect(abs(maxOut.bloomBoost - 1.0) < 1e-4)
         #expect(maxOut.orbitalRadiusScale > 1.35)
+        #expect(maxOut.estimatedEndToEndLatencyMs < 12.0)
+        #expect(maxOut.tensorBondDimensionTarget == 16)
+        #expect(maxOut.latentGuidanceScale >= 1.0 && maxOut.latentGuidanceScale <= 4.0)
+        #expect(maxOut.latentTemperature >= 0.15 && maxOut.latentTemperature <= 1.85)
     }
 
     // MARK: - 9. ProceduralMeshGenerator Geodesic Icosahedron & Torus-Knot Topological Invariants
@@ -2636,6 +2640,66 @@ struct AetherSynthTests {
         #expect(report.totalStageCount == 12)
         #expect(report.cryptographicSHA256Digest.count == 64)
         #expect(report.subsystemInventory.count >= 10)
+    }
+
+    // MARK: - 35. Sub-12ms Spatial Gesture Slew, OneEuroScalarFilter, Wait-Free Bridge & Pre-Allocated MPS Slice Bank
+
+    @Test("OneEuroScalarFilter, 300/s gesture slew (<12ms), wait-free os_unfair_lock_trylock bridge & chi_max=16 MPS slice bank")
+    func verifySub12msSpatialGestureSlewAndOneEuroFilter() {
+        var filter = OneEuroScalarFilter(minCutoffHz: 4.5, betaSpeedGain: 18.0, derivativeCutoffHz: 20.0)
+        let dt90Hz: Float = 1.0 / 90.0
+        _ = filter.filter(0.0, dtSeconds: dt90Hz)
+        let fastStep = filter.filter(1.0, dtSeconds: dt90Hz)
+        // High-velocity step boosts adaptive cutoff above 1600 Hz, passing > 99% on the first 90Hz tick
+        #expect(fastStep > 0.98)
+
+        // Verify 48 kHz gestureSlewCoeff = 300 / 48000 reaches > 90% of a step within 384 frames (8.0 ms < 12.0 ms)
+        let sampleRate: Double = 48_000.0
+        let gestureSlewCoeff = Float(min(1.0, 300.0 / sampleRate))
+        var smoothedCutoff: Float = 200.0
+        let targetCutoff: Float = 8_000.0
+        let framesIn8ms = 384 // 8.0 ms @ 48 kHz
+        for _ in 0..<framesIn8ms {
+            smoothedCutoff += gestureSlewCoeff * (targetCutoff - smoothedCutoff)
+        }
+        let normalizedProgress = (smoothedCutoff - 200.0) / (targetCutoff - 200.0)
+        #expect(normalizedProgress > 0.90)
+
+        // Fix 2: Heap-allocated os_unfair_lock + wait-free os_unfair_lock_trylock fallback on RealtimeBridgeSlot
+        let bridgeSlot = RealtimeBridgeSlot()
+        var custom = SynthParameters()
+        custom.binauralBeatHz = 18.5
+        custom.filterCutoffHz = 4_200.0
+        custom.latentGuidanceScale = 3.4
+        custom.tensorBondDimensionTarget = 12
+        bridgeSlot.writeParameters(custom)
+        let waitFreeParams = bridgeSlot.readParametersWaitFree()
+        #expect(abs(waitFreeParams.filterCutoffHz - 4_200.0) < 1.0e-4)
+        #expect(waitFreeParams.tensorBondDimensionTarget == 12)
+
+        var scratchWindow = [Float](repeating: 0.0, count: 64)
+        let copiedCount = scratchWindow.withUnsafeMutableBufferPointer { buf in
+            bridgeSlot.tryCopyRecentMonoWindow(into: buf.baseAddress!, count: 64)
+        }
+        #expect(copiedCount == 64)
+
+        // Fix 3: Pre-allocated chi_max=16 MPS bond slice bank switches active slice index (2...16) with zero Array allocations
+        let bellState = MatrixProductStateEngine.makeMaximallyEntangledBellState(schmidtRank: 8)
+        var mps = MatrixProductStateEngine.decompose(stateVector: bellState, maxBondDim: 16)
+        #expect(PreallocatedMPSBondSliceBank.chiMax == 16)
+        for targetChi in [2, 4, 8, 12, 16] {
+            mps.setActiveBondDimensionSlice(targetChi)
+            #expect(mps.preallocatedBondSliceBank.activeBondDimensionSlice == targetChi)
+            let metrics = mps.preallocatedBondSliceBank.evaluateActiveSliceMetrics()
+            #expect(metrics.entropyNats.isFinite && metrics.entropyNats >= 0.0)
+            #expect(metrics.purity > 0.0 && metrics.purity <= 1.0001)
+            #expect(metrics.schmidtRank >= 1.0 && metrics.schmidtRank <= Float(targetChi) + 0.01)
+        }
+
+        let engine = AudioSynthEngine()
+        engine.updateParametersImmediate(custom)
+        let idleSnap = engine.snapshotTelemetryImmediate()
+        #expect(idleSnap.isRendering == false)
     }
 }
 

@@ -55,6 +55,8 @@ public final class MacStudioWorkspaceModel {
 
     private var timerTask: Task<Void, Never>?
     private var sessionStartDate: Date?
+    private var lastTimerTickUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
+    private var hasBootstrapped: Bool = false
 
     public init(modelContainer: ModelContainer) {
         self.databaseActor = TelemetryDatabaseActor(modelContainer: modelContainer)
@@ -64,6 +66,7 @@ public final class MacStudioWorkspaceModel {
             : "Standard Launch Mode"
         configureBridges()
         syncFloatingHUDState()
+        startTelemetryAndSpectrumLoop()
     }
 
     public var focusProgress: Double {
@@ -77,8 +80,12 @@ public final class MacStudioWorkspaceModel {
     }
 
     public func bootstrapStudio() async {
+        guard !hasBootstrapped else { return }
+        hasBootstrapped = true
         try? await databaseActor.bootstrapDefaultsIfNeeded()
-        startTelemetryAndSpectrumLoop()
+        if timerTask == nil {
+            startTelemetryAndSpectrumLoop()
+        }
     }
 
     private func configureBridges() {
@@ -131,9 +138,11 @@ public final class MacStudioWorkspaceModel {
             sessionStartDate = .now
             sessionPeakAmplitude = 0.0
         }
+        lastTimerTickUptime = ProcessInfo.processInfo.systemUptime
         isFocusRunning = true
         hapticDirector.playTimerIgnition(starting: true)
         let params = synthParameters
+        audioEngine.updateParametersImmediate(params)
         Task {
             await audioEngine.updateParameters(params)
             try? await audioEngine.start()
@@ -216,6 +225,7 @@ public final class MacStudioWorkspaceModel {
 
     public func pushCurrentSynthParameters() {
         let next = synthParameters
+        audioEngine.updateParametersImmediate(next)
         Task {
             await audioEngine.updateParameters(next)
         }
@@ -258,11 +268,15 @@ public final class MacStudioWorkspaceModel {
 
     private func startTelemetryAndSpectrumLoop() {
         timerTask?.cancel()
+        lastTimerTickUptime = ProcessInfo.processInfo.systemUptime
         timerTask = Task { [weak self] in
-            let dt = 1.0 / 30.0
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(33))
                 guard let self else { break }
+
+                let nowUptime = ProcessInfo.processInfo.systemUptime
+                let dt = min(max(nowUptime - self.lastTimerTickUptime, 0.0), 0.25)
+                self.lastTimerTickUptime = nowUptime
 
                 if self.isFocusRunning {
                     self.elapsedSeconds += dt
@@ -272,14 +286,14 @@ public final class MacStudioWorkspaceModel {
                     }
                 }
 
-                let telemetry = await self.audioEngine.snapshotTelemetry()
+                let telemetry = self.audioEngine.snapshotTelemetryImmediate()
                 self.liveRMSAmplitude = telemetry.rmsAmplitude
                 if telemetry.peakAmplitude > self.sessionPeakAmplitude {
                     self.sessionPeakAmplitude = telemetry.peakAmplitude
                 }
 
                 if telemetry.isRendering {
-                    let window = await self.audioEngine.snapshotScopeWindow()
+                    let window = self.audioEngine.snapshotScopeWindowImmediate()
                     let frame = self.fftAnalyzer.analyze(samples: window.samples, sampleRate: window.sampleRate)
                     self.spectrumBars = frame.bars
                     self.dominantSpectrumHz = frame.dominantFrequencyHz
@@ -300,7 +314,7 @@ public final class MacStudioWorkspaceModel {
         }
     }
 
-    private func syncFloatingHUDState() {
+    public func syncFloatingHUDState() {
         let vm = hudController.viewModel
         vm.habitTitle = selectedHabitTitle
         vm.presetName = activePresetName
@@ -380,6 +394,7 @@ public struct MacStudioThreeColumnWorkspaceView: View {
 
                 Button {
                     model.hudController.toggleHUD()
+                    model.syncFloatingHUDState()
                 } label: {
                     Label("Floating HUD (⌘⇧H)", systemImage: "pip.enter")
                 }
@@ -1010,6 +1025,7 @@ private struct MacMenuBarQuickControlView: View {
 
                 Button {
                     model.hudController.toggleHUD()
+                    model.syncFloatingHUDState()
                 } label: {
                     Label("HUD", systemImage: "pip.enter")
                 }

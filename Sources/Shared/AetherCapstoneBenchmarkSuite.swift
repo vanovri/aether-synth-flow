@@ -78,7 +78,60 @@ public struct SubsystemInventoryEntry: Codable, Sendable, Equatable, Identifiabl
     }
 }
 
+public struct CapstoneBenchmarkConfiguration: Codable, Sendable, Equatable {
+    public var fdtdGridSize: Int
+    public var fdtdPMLThickness: Int
+    public var fdtdPMLMaxSigma: Float
+    public var fdtdPulseAmplitude: Float
+    public var eegTargetAlphaHz: Double
+    public var eegThetaGammaCoupling: Double
+    public var eegBlinkAmplitudeUV: Float
+    public var spwvdPrimaryFreqHz: Double
+    public var spwvdSecondaryFreqHz: Double
+    public var quantumEntanglementCoupling: Double
+    public var quantumAnisotropyDelta: Double
+    public var quantumMaxBondDim: Int
+    public var mpsGraphDatasetSeed: UInt64
+    public var mpsGraphTrainerSeed: UInt64
+
+    public static let canonical = CapstoneBenchmarkConfiguration()
+
+    public init(
+        fdtdGridSize: Int = 64,
+        fdtdPMLThickness: Int = 10,
+        fdtdPMLMaxSigma: Float = 0.38,
+        fdtdPulseAmplitude: Float = 1.0,
+        eegTargetAlphaHz: Double = 10.4,
+        eegThetaGammaCoupling: Double = 0.68,
+        eegBlinkAmplitudeUV: Float = 185.0,
+        spwvdPrimaryFreqHz: Double = 22.0,
+        spwvdSecondaryFreqHz: Double = 6.0,
+        quantumEntanglementCoupling: Double = 0.65,
+        quantumAnisotropyDelta: Double = 1.0,
+        quantumMaxBondDim: Int = 8,
+        mpsGraphDatasetSeed: UInt64 = 0xAE74_0006_2026,
+        mpsGraphTrainerSeed: UInt64 = 0xAE74_2200_2026
+    ) {
+        self.fdtdGridSize = max(32, fdtdGridSize)
+        self.fdtdPMLThickness = max(4, fdtdPMLThickness)
+        self.fdtdPMLMaxSigma = max(0.0, fdtdPMLMaxSigma)
+        self.fdtdPulseAmplitude = max(0.05, fdtdPulseAmplitude)
+        self.eegTargetAlphaHz = min(max(eegTargetAlphaHz, 7.5), 12.5)
+        self.eegThetaGammaCoupling = min(max(eegThetaGammaCoupling, 0.0), 1.0)
+        self.eegBlinkAmplitudeUV = max(0.0, eegBlinkAmplitudeUV)
+        self.spwvdPrimaryFreqHz = min(max(spwvdPrimaryFreqHz, 8.0), 60.0)
+        self.spwvdSecondaryFreqHz = min(max(spwvdSecondaryFreqHz, 2.0), 30.0)
+        self.quantumEntanglementCoupling = min(max(quantumEntanglementCoupling, 0.0), 1.0)
+        self.quantumAnisotropyDelta = max(0.1, quantumAnisotropyDelta)
+        self.quantumMaxBondDim = min(max(quantumMaxBondDim, 2), 16)
+        self.mpsGraphDatasetSeed = mpsGraphDatasetSeed
+        self.mpsGraphTrainerSeed = mpsGraphTrainerSeed
+    }
+}
+
 public struct CapstoneAuditReport: Codable, Sendable, Equatable {
+    public static let canonicalSchemaVersion = "AETHER-CAPSTONE-PHASE10-V1"
+
     public let schemaVersion: String
     public let generatedAtISO8601: String
     public let totalWallTimeMilliseconds: Double
@@ -117,7 +170,7 @@ public struct CapstoneAuditReport: Codable, Sendable, Equatable {
     }
 
     public init(
-        schemaVersion: String = "AETHER-CAPSTONE-PHASE10-V1",
+        schemaVersion: String = CapstoneAuditReport.canonicalSchemaVersion,
         generatedAtISO8601: String,
         totalWallTimeMilliseconds: Double,
         overallP50Microseconds: Double,
@@ -144,6 +197,39 @@ public struct CapstoneAuditReport: Codable, Sendable, Equatable {
         self.cryptographicSHA256Digest = cryptographicSHA256Digest
     }
 
+    /// Computes the canonical SHA-256 hex certification digest over schema version, all stage codes, pass flags,
+    /// numerical invariant summaries, and 10-phase subsystem verification states.
+    public static func computeCertificationDigest(
+        schemaVersion: String = CapstoneAuditReport.canonicalSchemaVersion,
+        stages: [StageBenchmarkMetrics],
+        subsystemInventory: [SubsystemInventoryEntry]
+    ) -> String {
+        var digestInput = "\(schemaVersion)|"
+        for s in stages {
+            digestInput += "\(s.stageIndex):\(s.stageCode):\(s.invariantPassed ? 1 : 0):\(s.numericalInvariantSummary)|"
+        }
+        for item in subsystemInventory {
+            digestInput += "\(item.phaseNumber):\(item.moduleName):\(item.sourcePath):\(item.verified ? 1 : 0)|"
+        }
+        let digestBytes = SHA256.hash(data: Data(digestInput.utf8))
+        return digestBytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Recomputes the cryptographic SHA-256 digest and verifies structural consistency of stage/inventory pass counts.
+    public func verifyCryptographicDigest() -> Bool {
+        guard cryptographicSHA256Digest.count == 64 else { return false }
+        let expected = Self.computeCertificationDigest(
+            schemaVersion: schemaVersion,
+            stages: stages,
+            subsystemInventory: subsystemInventory
+        )
+        let countedPass = stages.filter(\.invariantPassed).count
+        let countConsistent = (passedStageCount == countedPass)
+            && (totalStageCount == stages.count)
+            && (allInvariantsPassed == (countedPass == stages.count && stages.count == 12))
+        return expected == cryptographicSHA256Digest && countConsistent
+    }
+
     public func renderJSONData() throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -156,7 +242,10 @@ public struct CapstoneAuditReport: Codable, Sendable, Equatable {
         lines.append("")
         lines.append("- **Schema Version**: `\(schemaVersion)`")
         lines.append("- **Generated At (UTC)**: `\(generatedAtISO8601)`")
-        lines.append("- **Master Certification Status**: `\(allInvariantsPassed ? "PASSED (12/12 STAGES VERIFIED)" : "FAILED (\(passedStageCount)/\(totalStageCount))")`")
+        let statusText = allInvariantsPassed
+            ? "PASSED (\(passedStageCount)/\(totalStageCount) STAGES VERIFIED)"
+            : "FAILED (\(passedStageCount)/\(totalStageCount))"
+        lines.append("- **Master Certification Status**: `\(statusText)`")
         lines.append(String(format: "- **Total Execution Wall Time**: `%.2f ms`", totalWallTimeMilliseconds))
         lines.append(String(format: "- **Aggregate Stage Latencies**: `p50 = %.1f µs` | `p95 = %.1f µs` | `p99 = %.1f µs`", overallP50Microseconds, overallP95Microseconds, overallP99Microseconds))
         lines.append("- **Cryptographic Audit Digest (`SHA-256`)**: `\(cryptographicSHA256Digest)`")
@@ -257,11 +346,19 @@ public actor AetherCapstoneBenchmarkSuite {
     public init() {}
 
     public static func runFullAudit() async throws -> CapstoneAuditReport {
-        await shared.runFullAudit()
+        await shared.runFullAudit(configuration: .canonical)
+    }
+
+    public static func runFullAudit(configuration: CapstoneBenchmarkConfiguration) async throws -> CapstoneAuditReport {
+        await shared.runFullAudit(configuration: configuration)
     }
 
     /// Executes all 12 deterministic stress benchmark stages across Phases 1–10 and returns a cryptographically signed `CapstoneAuditReport`.
     public func runFullAudit() async -> CapstoneAuditReport {
+        await runFullAudit(configuration: .canonical)
+    }
+
+    public func runFullAudit(configuration: CapstoneBenchmarkConfiguration) async -> CapstoneAuditReport {
         let suiteStartNs = DispatchTime.now().uptimeNanoseconds
 
         var stages: [StageBenchmarkMetrics] = []
@@ -273,36 +370,35 @@ public actor AetherCapstoneBenchmarkSuite {
         stages.append(await runStage04MetalBVHAcousticRayTracer())
         stages.append(await runStage05NeuralRectifiedFlowAndRVQVocoder())
         stages.append(runStage06DistributedPTPAndWaveFieldSynthesis())
-        stages.append(runStage07BiharmonicFDTDWaveguideAndPML())
-        stages.append(runStage08EEGArtifactRLSAndBispectrumPAC())
-        stages.append(runStage09WignerVilleSPWVDAndHilbertHuangEMD())
-        stages.append(runStage10QuantumMPSTTSVDAndTwoSiteDMRG())
-        stages.append(await runStage11MPSGraphAutodiffAndCoreMLPredictor())
+        stages.append(runStage07BiharmonicFDTDWaveguideAndPML(configuration: configuration))
+        stages.append(runStage08EEGArtifactRLSAndBispectrumPAC(configuration: configuration))
+        stages.append(runStage09WignerVilleSPWVDAndHilbertHuangEMD(configuration: configuration))
+        stages.append(runStage10QuantumMPSTTSVDAndTwoSiteDMRG(configuration: configuration))
+        stages.append(await runStage11MPSGraphAutodiffAndCoreMLPredictor(configuration: configuration))
         stages.append(await runStage12OfflineWAVExportAndChaChaPolyCrypto())
 
         let suiteElapsedMs = Double(DispatchTime.now().uptimeNanoseconds - suiteStartNs) / 1_000_000.0
-        let allP50 = stages.map(\.p50Microseconds)
-        let allP95 = stages.map(\.p95Microseconds)
-        let allP99 = stages.map(\.p99Microseconds)
+        var pooledQuantileSamples: [Double] = []
+        pooledQuantileSamples.reserveCapacity(stages.count * 3)
+        for s in stages {
+            pooledQuantileSamples.append(s.p50Microseconds)
+            pooledQuantileSamples.append(s.p95Microseconds)
+            pooledQuantileSamples.append(s.p99Microseconds)
+        }
 
-        let aggP50 = Self.percentile(allP50, q: 0.50)
-        let aggP95 = Self.percentile(allP95, q: 0.95)
-        let aggP99 = Self.percentile(allP99, q: 0.99)
+        let aggP50 = Self.percentile(pooledQuantileSamples, q: 0.50)
+        let aggP95 = max(aggP50, Self.percentile(pooledQuantileSamples, q: 0.95))
+        let aggP99 = max(aggP95, Self.percentile(pooledQuantileSamples, q: 0.99))
 
         let passedCount = stages.filter(\.invariantPassed).count
         let allPassed = (passedCount == stages.count) && (stages.count == 12)
-        let inventory = Self.buildSubsystemInventory()
+        let inventory = Self.buildSubsystemInventory(stages: stages)
 
-        // Compute deterministic SHA-256 digest over stage codes, invariant results, and subsystem inventory
-        var digestInput = "AETHER-CAPSTONE-PHASE10-V1|"
-        for s in stages {
-            digestInput += "\(s.stageIndex):\(s.stageCode):\(s.invariantPassed ? 1 : 0):\(s.numericalInvariantSummary)|"
-        }
-        for item in inventory {
-            digestInput += "\(item.phaseNumber):\(item.moduleName):\(item.sourcePath):\(item.verified ? 1 : 0)|"
-        }
-        let digestBytes = SHA256.hash(data: Data(digestInput.utf8))
-        let digestHex = digestBytes.map { String(format: "%02x", $0) }.joined()
+        let digestHex = CapstoneAuditReport.computeCertificationDigest(
+            schemaVersion: CapstoneAuditReport.canonicalSchemaVersion,
+            stages: stages,
+            subsystemInventory: inventory
+        )
 
         let isoFormatter = ISO8601DateFormatter()
         let timestampStr = isoFormatter.string(from: Date())
@@ -320,6 +416,30 @@ public actor AetherCapstoneBenchmarkSuite {
             subsystemInventory: inventory,
             cryptographicSHA256Digest: digestHex
         )
+    }
+
+    public func evaluateStage07FDTDAndCaustics(
+        configuration: CapstoneBenchmarkConfiguration = .canonical
+    ) -> StageBenchmarkMetrics {
+        runStage07BiharmonicFDTDWaveguideAndPML(configuration: configuration)
+    }
+
+    public func evaluateStage08EEGAndPAC(
+        configuration: CapstoneBenchmarkConfiguration = .canonical
+    ) -> StageBenchmarkMetrics {
+        runStage08EEGArtifactRLSAndBispectrumPAC(configuration: configuration)
+    }
+
+    public func evaluateStage09SPWVDAndHHT(
+        configuration: CapstoneBenchmarkConfiguration = .canonical
+    ) -> StageBenchmarkMetrics {
+        runStage09WignerVilleSPWVDAndHilbertHuangEMD(configuration: configuration)
+    }
+
+    public func evaluateStage10QuantumMPSDMRG(
+        configuration: CapstoneBenchmarkConfiguration = .canonical
+    ) -> StageBenchmarkMetrics {
+        runStage10QuantumMPSTTSVDAndTwoSiteDMRG(configuration: configuration)
     }
 
     // MARK: - Stage 1: SwiftData 64-Session Concurrent @ModelActor Batch Ingestion
@@ -646,6 +766,9 @@ public actor AetherCapstoneBenchmarkSuite {
         var samplesUs: [Double] = []
         var blockSeq: UInt64 = 0
         var availableFrames = 0
+        var rvqResidualRatio: Float = 1.0
+        var codebookPerplexity: Float = 0.0
+        var commitmentLossFinite = false
 
         for _ in 0..<3 {
             let t0 = DispatchTime.now().uptimeNanoseconds
@@ -664,12 +787,22 @@ public actor AetherCapstoneBenchmarkSuite {
             samplesUs.append(elapsedUs)
             blockSeq = UInt64(tele.blockSequence)
             availableFrames = ring.availableFramesToRead
+            if let rFirst = tele.stageResidualNorms.first, let rLast = tele.stageResidualNorms.last, rFirst > 1.0e-9 {
+                rvqResidualRatio = rLast / rFirst
+            }
+            codebookPerplexity = tele.codebookPerplexity
+            commitmentLossFinite = tele.commitmentLoss.isFinite && tele.commitmentLoss >= 0.0
         }
 
         let p50 = Self.percentile(samplesUs, q: 0.50)
         let p95 = Self.percentile(samplesUs, q: 0.95)
         let p99 = Self.percentile(samplesUs, q: 0.99)
-        let passed = blockSeq >= 3 && availableFrames >= ComplementaryHannOverlapAdd.hopSize
+        let rvqContractionOK = rvqResidualRatio <= 1.0 && rvqResidualRatio > 0.0
+        let passed = blockSeq >= 3
+            && availableFrames >= ComplementaryHannOverlapAdd.hopSize
+            && rvqContractionOK
+            && codebookPerplexity > 1.0
+            && commitmentLossFinite
 
         return StageBenchmarkMetrics(
             stageIndex: 5,
@@ -681,7 +814,11 @@ public actor AetherCapstoneBenchmarkSuite {
             p95Microseconds: p95,
             p99Microseconds: p99,
             throughputSummary: String(format: "%d queued frames / %.2f ms", availableFrames, p50 / 1_000.0),
-            numericalInvariantSummary: "4-step Heun ODE + 4-stage RVQ + 50% Hann WOLA verified",
+            numericalInvariantSummary: String(
+                format: "RVQ r4/r1=%.3f, perp=%.2f, WOLA=1.0",
+                rvqResidualRatio,
+                codebookPerplexity
+            ),
             invariantPassed: passed
         )
     }
@@ -724,10 +861,10 @@ public actor AetherCapstoneBenchmarkSuite {
                     globalSampleCounter: UInt64(idx * 4_800)
                 )
                 let encoded = pkt.encode()
-                if encoded.count != 64, let decoded = try? OrchestraPTPClockPacket.decode(from: encoded), decoded == pkt {
+                if encoded.count != 64 {
                     packetOK = false
                 }
-                if let decoded = try? OrchestraPTPClockPacket.decode(from: encoded) {
+                if let decoded = try? OrchestraPTPClockPacket.decode(from: encoded), decoded == pkt {
                     latestEst = filter.ingestPacket(decoded, sampleIntervalTauSeconds: 0.10)
                 } else {
                     packetOK = false
@@ -785,15 +922,23 @@ public actor AetherCapstoneBenchmarkSuite {
         )
     }
 
-    // MARK: - Stage 7: RealtimeFDTDResonatorKernel & 2D PML Wave Tank
+    // MARK: - Stage 7: RealtimeFDTDResonatorKernel, 2D PML Wave Tank & Track 35 Acousto-Optic Caustics
 
-    private func runStage07BiharmonicFDTDWaveguideAndPML() -> StageBenchmarkMetrics {
+    private func runStage07BiharmonicFDTDWaveguideAndPML(
+        configuration: CapstoneBenchmarkConfiguration = .canonical
+    ) -> StageBenchmarkMetrics {
         var samplesUs: [Double] = []
         var cflStable = false
         var decayRatio = 1.0
+        var pmlSuppressionDB = 0.0
+        var dispersionRatio: Float = 1.0
         var resonatorBounded = true
+        let gSize = configuration.fdtdGridSize
+        let pmlThick = configuration.fdtdPMLThickness
+        let pmlSigma = configuration.fdtdPMLMaxSigma
+        let pulseAmp = configuration.fdtdPulseAmplitude
 
-        for _ in 0..<3 {
+        for _ in 0..<2 {
             let t0 = DispatchTime.now().uptimeNanoseconds
 
             var resonator = RealtimeFDTDResonatorKernel(sampleRate: 48_000.0)
@@ -806,14 +951,52 @@ public actor AetherCapstoneBenchmarkSuite {
                 }
             }
 
-            var tank = FDTDWaveTankGrid2D(gridSize: 64, pmlThickness: 12)
-            cflStable = tank.cflParameters.isStable
-            tank.injectGaussianPulse(centerX: 32, centerY: 32, sigmaCells: 2.5, amplitude: 1.0)
-            tank.advance(steps: 6)
-            let peakRMS = max(1e-9, tank.interiorRMSPressure())
-            tank.advance(steps: 44)
-            let lateRMS = tank.interiorRMSPressure()
+            var pmlTank = FDTDWaveTankGrid2D(
+                gridSize: gSize,
+                pmlThickness: pmlThick,
+                boundaryMode: .absorbingPML,
+                pmlMaxSigma: pmlSigma
+            )
+            var rigidTank = FDTDWaveTankGrid2D(
+                gridSize: gSize,
+                pmlThickness: pmlThick,
+                boundaryMode: .reflectiveDirichlet,
+                pmlMaxSigma: 0.0
+            )
+            cflStable = pmlTank.cflParameters.isStable
+            let mid = gSize / 2
+            pmlTank.injectGaussianPulse(centerX: mid, centerY: mid, sigmaCells: 2.6, amplitude: pulseAmp)
+            rigidTank.injectGaussianPulse(centerX: mid, centerY: mid, sigmaCells: 2.6, amplitude: pulseAmp)
+
+            pmlTank.advance(steps: 6)
+            rigidTank.advance(steps: 6)
+            let peakRMS = max(1e-9, pmlTank.interiorRMSPressure())
+
+            // Evaluate Track 35 Cauchy + Gladstone-Dale acousto-optic dispersion on live FDTD pressure gradient
+            let gradVec = pmlTank.pressureGradient(atX: min(gSize - 3, mid + 3), y: mid)
+            let gradMag = max(1.0e-4, simd_length(gradVec))
+            let pLocal = pmlTank.pressureCurr[mid * gSize + min(gSize - 3, mid + 3)]
+            let theta400 = AcoustoOpticCausticsEngine.refractionDeflectionAngleRadians(
+                wavelengthNm: 400.0,
+                pressure: pLocal,
+                pressureGradientMagnitude: gradMag
+            )
+            let theta700 = AcoustoOpticCausticsEngine.refractionDeflectionAngleRadians(
+                wavelengthNm: 700.0,
+                pressure: pLocal,
+                pressureGradientMagnitude: gradMag
+            )
+            dispersionRatio = theta400 / max(1.0e-6, theta700)
+
+            let remainingSteps = 214
+            pmlTank.advance(steps: remainingSteps)
+            rigidTank.advance(steps: remainingSteps)
+
+            let lateRMS = pmlTank.interiorRMSPressure()
             decayRatio = Double(lateRMS / peakRMS)
+            let pmlEnergy = max(1.0e-12, Double(pmlTank.totalInteriorMechanicalEnergy()))
+            let rigidEnergy = max(1.0e-12, Double(rigidTank.totalInteriorMechanicalEnergy()))
+            pmlSuppressionDB = 10.0 * log10(rigidEnergy / pmlEnergy)
 
             let elapsedUs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000.0
             samplesUs.append(elapsedUs)
@@ -822,7 +1005,11 @@ public actor AetherCapstoneBenchmarkSuite {
         let p50 = Self.percentile(samplesUs, q: 0.50)
         let p95 = Self.percentile(samplesUs, q: 0.95)
         let p99 = Self.percentile(samplesUs, q: 0.99)
-        let passed = cflStable && resonatorBounded && decayRatio < 0.85
+        let passed = cflStable
+            && resonatorBounded
+            && decayRatio < 0.45
+            && pmlSuppressionDB > 10.0
+            && dispersionRatio > 1.01
 
         return StageBenchmarkMetrics(
             stageIndex: 7,
@@ -833,45 +1020,69 @@ public actor AetherCapstoneBenchmarkSuite {
             p50Microseconds: p50,
             p95Microseconds: p95,
             p99Microseconds: p99,
-            throughputSummary: String(format: "50x 64x64 FDTD steps in %.2f ms", p50 / 1_000.0),
-            numericalInvariantSummary: String(format: "CFL stable=%@, PML ratio=%.3f", cflStable ? "true" : "false", decayRatio),
+            throughputSummary: String(format: "220x %dx%d FDTD+PML steps in %.2f ms", gSize, gSize, p50 / 1_000.0),
+            numericalInvariantSummary: String(
+                format: "CFL=%@, PML=-%.1fdB (r=%.3f), AO400/700=%.3f",
+                cflStable ? "true" : "false",
+                pmlSuppressionDB,
+                decayRatio,
+                dispersionRatio
+            ),
             invariantPassed: passed
         )
     }
 
     // MARK: - Stage 8: EEGBrainComputerInterface RLS + Bispectrum + Tort PAC
 
-    private func runStage08EEGArtifactRLSAndBispectrumPAC() -> StageBenchmarkMetrics {
+    private func runStage08EEGArtifactRLSAndBispectrumPAC(
+        configuration: CapstoneBenchmarkConfiguration = .canonical
+    ) -> StageBenchmarkMetrics {
         var samplesUs: [Double] = []
         var pacMI: Float = 0.0
         var maxBicoh: Float = 0.0
+        var iafHz: Float = 10.0
+        var bisIndex: Float = 85.0
+        var blinkSuppressionDB: Double = 0.0
         var rlsCleanedOK = false
 
         for _ in 0..<3 {
             let t0 = DispatchTime.now().uptimeNanoseconds
 
-            var gen = SyntheticCorticalEEGGenerator()
-            var filterBank = EEGArtifactFilterBank()
+            var gen = SyntheticCorticalEEGGenerator(
+                sampleRate: 256.0,
+                targetAlphaHz: configuration.eegTargetAlphaHz,
+                thetaGammaCouplingStrength: configuration.eegThetaGammaCoupling
+            )
+            var filterBank = EEGArtifactFilterBank(sampleRate: 256.0)
             var af7Clean: [Float] = []
             var af8Clean: [Float] = []
             af7Clean.reserveCapacity(256)
             af8Clean.reserveCapacity(256)
 
-            var rawPeakDuringBlink: Float = 0.0
-            var cleanPeakDuringBlink: Float = 0.0
+            var rawErrSqSum: Double = 0.0
+            var cleanErrSqSum: Double = 0.0
+            var blinkSampleCount = 0
 
             for i in 0..<256 {
-                let blink: Float = (i >= 100 && i <= 125) ? 185.0 : 0.0
+                let blink: Float = (i >= 100 && i <= 125) ? configuration.eegBlinkAmplitudeUV : 0.0
                 let step = gen.stepWithReference(injectBlinkAmplitude: blink)
                 let cleaned = filterBank.processQuadSample(step.sample)
                 af7Clean.append(cleaned.cleaned.af7)
                 af8Clean.append(cleaned.cleaned.af8)
                 if i >= 100 && i <= 125 {
-                    rawPeakDuringBlink = max(rawPeakDuringBlink, abs(step.sample.af7))
-                    cleanPeakDuringBlink = max(cleanPeakDuringBlink, abs(cleaned.cleaned.af7))
+                    let rawDiff = Double(step.sample.af7 - step.cleanNeuroAF7)
+                    let cleanDiff = Double(cleaned.cleaned.af7 - step.cleanNeuroAF7)
+                    rawErrSqSum += rawDiff * rawDiff
+                    cleanErrSqSum += cleanDiff * cleanDiff
+                    blinkSampleCount += 1
                 }
             }
-            rlsCleanedOK = cleanPeakDuringBlink <= rawPeakDuringBlink
+            let rawRMSE = sqrt(rawErrSqSum / Double(max(1, blinkSampleCount)))
+            let cleanRMSE = sqrt(cleanErrSqSum / Double(max(1, blinkSampleCount)))
+            blinkSuppressionDB = 20.0 * log10(max(1.0e-6, rawRMSE) / max(1.0e-6, cleanRMSE))
+            rlsCleanedOK = (configuration.eegBlinkAmplitudeUV > 10.0)
+                ? (blinkSuppressionDB > 8.0 && cleanRMSE < rawRMSE * 0.40)
+                : (cleanRMSE.isFinite && rawRMSE.isFinite)
 
             let composite = zip(af7Clean, af8Clean).map { 0.5 * ($0 + $1) }
             let metrics = CorticalSpectralAnalyzer.analyze(
@@ -882,6 +1093,8 @@ public actor AetherCapstoneBenchmarkSuite {
             )
             pacMI = metrics.thetaGammaPACModulationIndex
             maxBicoh = metrics.maxBicoherence
+            iafHz = metrics.individualAlphaFrequencyHz
+            bisIndex = metrics.bispectralIndex
 
             let elapsedUs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000.0
             samplesUs.append(elapsedUs)
@@ -890,7 +1103,13 @@ public actor AetherCapstoneBenchmarkSuite {
         let p50 = Self.percentile(samplesUs, q: 0.50)
         let p95 = Self.percentile(samplesUs, q: 0.95)
         let p99 = Self.percentile(samplesUs, q: 0.99)
-        let passed = rlsCleanedOK && pacMI >= 0.0 && maxBicoh >= 0.0 && maxBicoh <= 1.0
+        let minExpectedPAC: Float = configuration.eegThetaGammaCoupling > 0.15 ? 0.002 : 0.0
+        let passed = rlsCleanedOK
+            && pacMI >= minExpectedPAC
+            && (7.5...12.5).contains(iafHz)
+            && (0.0...100.0).contains(bisIndex)
+            && maxBicoh >= 0.0
+            && maxBicoh <= 1.0
 
         return StageBenchmarkMetrics(
             stageIndex: 8,
@@ -902,26 +1121,38 @@ public actor AetherCapstoneBenchmarkSuite {
             p95Microseconds: p95,
             p99Microseconds: p99,
             throughputSummary: "256-sample 4-ch EEG + 18-bin Tort PAC",
-            numericalInvariantSummary: String(format: "RLS=%@, PAC MI=%.4f, Bicoh=%.3f", rlsCleanedOK ? "OK" : "FAIL", pacMI, maxBicoh),
+            numericalInvariantSummary: String(
+                format: "RLS=-%.1fdB, IAF=%.2fHz, PAC=%.4f, Bicoh=%.3f",
+                blinkSuppressionDB,
+                iafHz,
+                pacMI,
+                maxBicoh
+            ),
             invariantPassed: passed
         )
     }
 
     // MARK: - Stage 9: Wigner-Ville SPWVD & Hilbert-Huang Transform (Track 33)
 
-    private func runStage09WignerVilleSPWVDAndHilbertHuangEMD() -> StageBenchmarkMetrics {
-        let n = 128
+    private func runStage09WignerVilleSPWVDAndHilbertHuangEMD(
+        configuration: CapstoneBenchmarkConfiguration = .canonical
+    ) -> StageBenchmarkMetrics {
+        let n = SPWVDAnalyzer.canonicalBlockSize
         let fs = 256.0
+        let f1 = configuration.spwvdPrimaryFreqHz
+        let f2 = configuration.spwvdSecondaryFreqHz
         let compositeSignal: [Float] = (0..<n).map { i in
             let t = Double(i) / fs
-            let c1 = sin(2.0 * Double.pi * 22.0 * t)
-            let c2 = 0.75 * sin(2.0 * Double.pi * 6.0 * t)
+            let c1 = sin(2.0 * Double.pi * f1 * t)
+            let c2 = 0.75 * sin(2.0 * Double.pi * f2 * t)
             return Float(c1 + c2)
         }
 
         var samplesUs: [Double] = []
         var renyiBits: Float = 0.0
         var reconErr: Float = 1.0
+        var ridgeErrHz: Float = 100.0
+        var crossTermDB: Float = 0.0
         var imfCount = 0
 
         for _ in 0..<4 {
@@ -938,14 +1169,26 @@ public actor AetherCapstoneBenchmarkSuite {
             samplesUs.append(elapsedUs)
 
             renyiBits = spwvd.renyiEntropyBits
+            crossTermDB = spwvd.crossTermSuppressionDB
             reconErr = hht.maxReconstructionError
             imfCount = hht.imfs.count
+
+            let margin = max(4, spwvd.dominantRidgeHz.count / 6)
+            let interiorRidge = Array(spwvd.dominantRidgeHz.dropFirst(margin).dropLast(margin))
+            if !interiorRidge.isEmpty {
+                let meanRidge = interiorRidge.reduce(0.0, +) / Float(interiorRidge.count)
+                ridgeErrHz = abs(meanRidge - Float(f1))
+            }
         }
 
         let p50 = Self.percentile(samplesUs, q: 0.50)
         let p95 = Self.percentile(samplesUs, q: 0.95)
         let p99 = Self.percentile(samplesUs, q: 0.99)
-        let passed = renyiBits > 0.1 && reconErr < 1.0e-4 && imfCount >= 2
+        let passed = renyiBits > 0.1
+            && reconErr < 1.0e-4
+            && imfCount >= 2
+            && ridgeErrHz < 4.5
+            && crossTermDB > 3.0
 
         return StageBenchmarkMetrics(
             stageIndex: 9,
@@ -957,14 +1200,22 @@ public actor AetherCapstoneBenchmarkSuite {
             p95Microseconds: p95,
             p99Microseconds: p99,
             throughputSummary: "128x64 SPWVD + Thomas O(N) EMD sifting",
-            numericalInvariantSummary: String(format: "Renyi=%.2f bits, EMD err=%.2e < 1e-4", renyiBits, reconErr),
+            numericalInvariantSummary: String(
+                format: "Renyi=%.2fb, RidgeErr=%.2fHz, XTerm=%.1fdB, EMD=%.2e",
+                renyiBits,
+                ridgeErrHz,
+                crossTermDB,
+                reconErr
+            ),
             invariantPassed: passed
         )
     }
 
     // MARK: - Stage 10: Quantum MPS TT-SVD & 2-Site DMRG Variational Optimizer (Track 34)
 
-    private func runStage10QuantumMPSTTSVDAndTwoSiteDMRG() -> StageBenchmarkMetrics {
+    private func runStage10QuantumMPSTTSVDAndTwoSiteDMRG(
+        configuration: CapstoneBenchmarkConfiguration = .canonical
+    ) -> StageBenchmarkMetrics {
         let stateVec = MatrixProductStateEngine.encodeBioAcousticStateTensor(
             eegCorticalBands4: SIMD4<Float>(0.25, 0.55, 0.48, 0.22),
             hrvVagalMetrics4: SIMD4<Float>(0.68, 0.72, 0.30, 0.85),
@@ -972,7 +1223,7 @@ public actor AetherCapstoneBenchmarkSuite {
             binauralOscillatorState4: SIMD4<Float>(0.50, 0.45, 0.38, 0.62),
             hrtfFDTDWavefield4: SIMD4<Float>(0.48, 0.58, 0.44, 0.50),
             circadianKalmanPhase4: SIMD4<Float>(0.70, 0.35, 0.60, 0.40),
-            entanglementCoupling: 0.65
+            entanglementCoupling: configuration.quantumEntanglementCoupling
         )
 
         var samplesUs: [Double] = []
@@ -980,18 +1231,26 @@ public actor AetherCapstoneBenchmarkSuite {
         var initialE = 0.0
         var finalE = 0.0
         var entropyVn: Float = 0.0
+        var purityOK = false
+        let deltaJ = configuration.quantumAnisotropyDelta
+        let bondChi = configuration.quantumMaxBondDim
+        // Exact Lanczos ground state energy bound for 6-site Spin-3/2 TFIM: E_0 >= -(5 * 2.25 * J + 6 * 1.5 * h)
+        let variationalLowerBound = -(5.0 * 2.25 * deltaJ + 6.0 * 1.5 * 0.5)
 
         for _ in 0..<2 {
             let t0 = DispatchTime.now().uptimeNanoseconds
-            var mps = MatrixProductStateEngine(stateVector: stateVec, maxBondDim: 8)
+            var mps = MatrixProductStateEngine(stateVector: stateVec, maxBondDim: bondChi)
             orthoDefect = mps.verifyLeftCanonicalOrthogonality()
-            initialE = mps.expectationValueNearestNeighborXXZ(anisotropyDelta: 1.0)
+            initialE = mps.expectationValueNearestNeighborXXZ(anisotropyDelta: deltaJ)
 
-            let dmrg = DMRGVariationalOptimizer(anisotropyDelta: 1.0, maxBondDim: 8, lanczosIterations: 8)
+            let dmrg = DMRGVariationalOptimizer(anisotropyDelta: deltaJ, maxBondDim: bondChi, lanczosIterations: 8)
             let snap = dmrg.runSweeps(mps: &mps, sweepCount: 1)
             finalE = Double(snap.groundStateEnergyEstimate)
             let control = DMRGVariationalOptimizer.extractOptimalBioAcousticControl(from: mps)
-            entropyVn = control.centralEntanglementEntropy
+            entropyVn = snap.centralEntanglementEntropy
+            purityOK = snap.renyi2Purity > 0.0
+                && snap.renyi2Purity <= 1.0 + 1.0e-6
+                && control.recommendedBinauralBeatHz.isFinite
 
             let elapsedUs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000.0
             samplesUs.append(elapsedUs)
@@ -1000,7 +1259,12 @@ public actor AetherCapstoneBenchmarkSuite {
         let p50 = Self.percentile(samplesUs, q: 0.50)
         let p95 = Self.percentile(samplesUs, q: 0.95)
         let p99 = Self.percentile(samplesUs, q: 0.99)
-        let passed = orthoDefect < 1.0e-5 && finalE <= initialE + 1.0e-5 && entropyVn >= 0.0
+        let minEntropy: Float = configuration.quantumEntanglementCoupling > 0.05 ? 1.0e-4 : 0.0
+        let passed = orthoDefect < 1.0e-5
+            && finalE <= initialE + 1.0e-5
+            && finalE >= variationalLowerBound - 1.0e-4
+            && entropyVn >= minEntropy
+            && purityOK
 
         return StageBenchmarkMetrics(
             stageIndex: 10,
@@ -1019,9 +1283,17 @@ public actor AetherCapstoneBenchmarkSuite {
 
     // MARK: - Stage 11: MPSGraphBrainwaveTrainer & AdaptiveBrainwaveMLPredictor
 
-    private func runStage11MPSGraphAutodiffAndCoreMLPredictor() async -> StageBenchmarkMetrics {
-        let batch = BiometricTrainingBatch.makeSyntheticBiometricDataset(batchSize: 8, seed: 0xAE74_0006_2026)
-        let trainer = MPSGraphBrainwaveTrainer(seed: 0xAE74_2200_2026, forceCPUFallback: false)
+    private func runStage11MPSGraphAutodiffAndCoreMLPredictor(
+        configuration: CapstoneBenchmarkConfiguration = .canonical
+    ) async -> StageBenchmarkMetrics {
+        let batch = BiometricTrainingBatch.makeSyntheticBiometricDataset(
+            batchSize: 8,
+            seed: configuration.mpsGraphDatasetSeed
+        )
+        let trainer = MPSGraphBrainwaveTrainer(
+            seed: configuration.mpsGraphTrainerSeed,
+            forceCPUFallback: false
+        )
         let predictor = AdaptiveBrainwaveMLPredictor(
             initialWeights: NeuralReservoirWeights.makeDeterministicDefault(),
             persistToAppGroup: false
@@ -1089,8 +1361,11 @@ public actor AetherCapstoneBenchmarkSuite {
         let exporter = OfflineStemExporter()
         var samplesUs: [Double] = []
         var wavValid = false
+        var pcmNonSilent = false
         var cryptoRoundTripOK = false
+        var tamperRejected = false
         var wavByteCount = 0
+        var wavDigestPrefix = "00000000"
 
         for _ in 0..<2 {
             let t0 = DispatchTime.now().uptimeNanoseconds
@@ -1105,6 +1380,12 @@ public actor AetherCapstoneBenchmarkSuite {
                 wavByteCount = wavData.count
                 let header = try WAVBinaryCodec.parseHeader(wavData)
                 wavValid = (header.sampleRate == 48_000 && header.bitsPerSample == 24 && header.channelCount == 2)
+                if wavData.count > 44 {
+                    let payloadSlice = wavData.dropFirst(44).prefix(4_096)
+                    pcmNonSilent = payloadSlice.contains(where: { $0 != 0 })
+                }
+                let wavHash = SHA256.hash(data: wavData)
+                wavDigestPrefix = wavHash.prefix(4).map { String(format: "%02x", $0) }.joined()
 
                 let archive = AetherTelemetryArchive(
                     habits: HabitNodeDTO.defaultSeeds,
@@ -1136,6 +1417,20 @@ public actor AetherCapstoneBenchmarkSuite {
                 )
                 let opened = try MeshCryptoSession.openArchive(envelope, key: symB)
                 cryptoRoundTripOK = (opened == archive)
+
+                // Verify ChaCha20-Poly1305 AEAD tag rejection on 1-bit ciphertext/tag tamper
+                if !envelope.sealedBoxCombined.isEmpty {
+                    var corruptedBox = envelope.sealedBoxCombined
+                    let lastIdx = corruptedBox.count - 1
+                    corruptedBox[lastIdx] ^= 0x01
+                    let tamperedEnv = MeshEncryptedArchiveEnvelope(
+                        senderPeerID: envelope.senderPeerID,
+                        lamportClock: envelope.lamportClock,
+                        sealedBoxCombined: corruptedBox
+                    )
+                    let tamperedOpen = try? MeshCryptoSession.openArchive(tamperedEnv, key: symB)
+                    tamperRejected = (tamperedOpen == nil)
+                }
             } catch {
                 wavValid = false
                 cryptoRoundTripOK = false
@@ -1147,7 +1442,7 @@ public actor AetherCapstoneBenchmarkSuite {
         let p50 = Self.percentile(samplesUs, q: 0.50)
         let p95 = Self.percentile(samplesUs, q: 0.95)
         let p99 = Self.percentile(samplesUs, q: 0.99)
-        let passed = wavValid && cryptoRoundTripOK
+        let passed = wavValid && pcmNonSilent && cryptoRoundTripOK && tamperRejected
 
         return StageBenchmarkMetrics(
             stageIndex: 12,
@@ -1159,7 +1454,11 @@ public actor AetherCapstoneBenchmarkSuite {
             p95Microseconds: p95,
             p99Microseconds: p99,
             throughputSummary: String(format: "%d B 24-bit WAV + X25519 AEAD", wavByteCount),
-            numericalInvariantSummary: "RIFF/WAVE 24-bit valid, X25519+ChaChaPoly+SHA256 verified",
+            numericalInvariantSummary: String(
+                format: "WAV24=%dB (sha:%@), ChaChaPoly+Tamper=OK",
+                wavByteCount,
+                wavDigestPrefix
+            ),
             invariantPassed: passed
         )
     }
@@ -1177,77 +1476,99 @@ public actor AetherCapstoneBenchmarkSuite {
         return sorted[lo] * (1.0 - frac) + sorted[hi] * frac
     }
 
-    public static func buildSubsystemInventory() -> [SubsystemInventoryEntry] {
-        [
+    public static func buildSubsystemInventory(
+        stages: [StageBenchmarkMetrics] = []
+    ) -> [SubsystemInventoryEntry] {
+        func stagesPass(_ indices: [Int]) -> Bool {
+            guard !stages.isEmpty else { return true }
+            for idx in indices {
+                guard let stage = stages.first(where: { $0.stageIndex == idx }), stage.invariantPassed else {
+                    return false
+                }
+            }
+            return true
+        }
+
+        return [
             SubsystemInventoryEntry(
                 phaseNumber: 1,
                 trackRange: "Tracks 1–4",
                 moduleName: "AudioSynthEngine & SpectralFFTAnalyzer",
                 sourcePath: "Sources/App/Audio/AudioSynthEngine.swift",
-                mathematicalCore: "Lock-Free SPSC Ring, Voss-McCartney Pink Noise, 4-Pole ZDF/TPT Cytomic SVF, Radix-2 Cooley-Tukey FFT"
+                mathematicalCore: "Lock-Free SPSC Ring, Voss-McCartney Pink Noise, 4-Pole ZDF/TPT Cytomic SVF, Radix-2 Cooley-Tukey FFT",
+                verified: stagesPass([2])
             ),
             SubsystemInventoryEntry(
                 phaseNumber: 2,
                 trackRange: "Tracks 5–8",
                 moduleName: "TelemetryDatabaseActor & OfflineStemExporter",
                 sourcePath: "Sources/Shared/TelemetryDatabaseActor.swift",
-                mathematicalCore: "SwiftData @ModelActor Batch Upsert, RIFF/WAVE 24/32-bit LPCM, Equal-Power Loop, X25519 ChaChaPoly"
+                mathematicalCore: "SwiftData @ModelActor Batch Upsert, RIFF/WAVE 24/32-bit LPCM, Equal-Power Loop, X25519 ChaChaPoly",
+                verified: stagesPass([1, 12])
             ),
             SubsystemInventoryEntry(
                 phaseNumber: 3,
                 trackRange: "Tracks 9–12",
                 moduleName: "KEMARHRIRSynthesizer & ShoeboxRoomSimulator",
                 sourcePath: "Sources/App/Audio/SpatialHRTFConvolver.swift",
-                mathematicalCore: "Woodworth-Schlosberg Spherical Head ITD/ILD, UPOLS Frequency-Domain Convolver, 18-Image ISM + Sabine/Eyring RT60"
+                mathematicalCore: "Woodworth-Schlosberg Spherical Head ITD/ILD, UPOLS Frequency-Domain Convolver, 18-Image ISM + Sabine/Eyring RT60",
+                verified: stagesPass([3])
             ),
             SubsystemInventoryEntry(
                 phaseNumber: 4,
                 trackRange: "Tracks 13–16",
                 moduleName: "AUv3 Plug-In & FourOpTZFM + HadamardFDN",
                 sourcePath: "Sources/AUv3/AetherSynthAudioUnit.swift",
-                mathematicalCore: "AUv3 Real-Time Render Block, 4-Op Through-Zero FM (Bessel J_n), 8-Delay Householder/Hadamard FDN Reverb"
+                mathematicalCore: "AUv3 Real-Time Render Block, 4-Op Through-Zero FM (Bessel J_n), 8-Delay Householder/Hadamard FDN Reverb",
+                verified: stagesPass([2, 3])
             ),
             SubsystemInventoryEntry(
                 phaseNumber: 5,
                 trackRange: "Tracks 17–20",
                 moduleName: "HealthKitHRVStreamer & AdaptiveBrainwaveMLPredictor",
                 sourcePath: "Sources/Shared/AdaptiveBrainwaveMLPredictor.swift",
-                mathematicalCore: "Lomb-Scargle Uneven Periodogram LF/HF, Baevsky Stress Index, 2-Layer SIMD MLP + Online Policy Gradient"
+                mathematicalCore: "Lomb-Scargle Uneven Periodogram LF/HF, Baevsky Stress Index, 2-Layer SIMD MLP + Online Policy Gradient",
+                verified: stagesPass([11])
             ),
             SubsystemInventoryEntry(
                 phaseNumber: 6,
                 trackRange: "Tracks 21–24",
                 moduleName: "MPSGraphBrainwaveTrainer & CircadianPhaseKalmanFilter",
                 sourcePath: "Sources/Shared/MPSGraphBrainwaveTrainer.swift",
-                mathematicalCore: "Scaled Dot-Product Self-Attention, Huber + RSA Loss, MPSGraph Autodiff + AdamW, Jewett-Kronauer 2D EKF"
+                mathematicalCore: "Scaled Dot-Product Self-Attention, Huber + RSA Loss, MPSGraph Autodiff + AdamW, Jewett-Kronauer 2D EKF",
+                verified: stagesPass([11])
             ),
             SubsystemInventoryEntry(
                 phaseNumber: 7,
                 trackRange: "Tracks 25–27",
                 moduleName: "MetalAcousticRayTracer & NeuralLatentSoundscapeEngine",
                 sourcePath: "Sources/App/Audio/MetalAcousticRayTracer.swift",
-                mathematicalCore: "SAH-BVH Möller-Trumbore 4-Band Ray Tracing, 2nd-Order Heun Rectified-Flow ODE, 4-Stage RVQ, Snake Vocoder"
+                mathematicalCore: "SAH-BVH Möller-Trumbore 4-Band Ray Tracing, 2nd-Order Heun Rectified-Flow ODE, 4-Stage RVQ, Snake Vocoder",
+                verified: stagesPass([4, 5])
             ),
             SubsystemInventoryEntry(
                 phaseNumber: 8,
                 trackRange: "Tracks 28–30",
                 moduleName: "DistributedOrchestraEngine & FDTDWaveguideSolver",
                 sourcePath: "Sources/Shared/DistributedOrchestraEngine.swift",
-                mathematicalCore: "IEEE 1588 PTP 64B Codec, Marzullo Consensus, 2nd-Order PI-PLL, Rayleigh-I WFS, 2D Biharmonic FDTD + PML"
+                mathematicalCore: "IEEE 1588 PTP 64B Codec, Marzullo Consensus, 2nd-Order PI-PLL, Rayleigh-I WFS, 2D Biharmonic FDTD + PML",
+                verified: stagesPass([6, 7])
             ),
             SubsystemInventoryEntry(
                 phaseNumber: 9,
                 trackRange: "Tracks 31–32",
                 moduleName: "EEGBrainComputerInterface & RealityKit Cymatics",
                 sourcePath: "Sources/Shared/EEGBrainComputerInterface.swift",
-                mathematicalCore: "4-Tap RLS Ocular Canceler, Higher-Order Bispectrum/Bicoherence, Tort Theta-Gamma PAC KL Modulation Index"
+                mathematicalCore: "4-Tap RLS Ocular Canceler, Higher-Order Bispectrum/Bicoherence, Tort Theta-Gamma PAC KL Modulation Index",
+                verified: stagesPass([7, 8])
             ),
             SubsystemInventoryEntry(
                 phaseNumber: 10,
                 trackRange: "Tracks 33–36",
                 moduleName: "SPWVD/HHT, Quantum MPS/DMRG & Acousto-Optic Caustics",
                 sourcePath: "Sources/Shared/WignerVilleHilbertHuangAnalyzer.swift",
-                mathematicalCore: "Smoothed Pseudo Wigner-Ville, Thomas Cubic-Spline EMD, 6-Site MPS TT-SVD & 2-Site DMRG, Cauchy/Gladstone-Dale Caustics"
+                mathematicalCore: "Smoothed Pseudo Wigner-Ville, Thomas Cubic-Spline EMD, 6-Site MPS TT-SVD & 2-Site DMRG, Cauchy/Gladstone-Dale Caustics",
+                verified: stagesPass([9, 10, 12])
             )
         ]
     }
