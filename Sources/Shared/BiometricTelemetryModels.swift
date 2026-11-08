@@ -116,7 +116,6 @@ public struct HRVAnalysisMetricsDTO: Codable, Sendable, Equatable {
     public var pnn50Percent: Double { pNN50Percent }
     public var rmssdMilliseconds: Double { rmssdMs }
     public var sdnnMilliseconds: Double { sdnnMs }
-    public var rsaCoherenceScore: Double { vagalCoherenceScore }
     public let baevskyStressIndex: Double
     public let poincareSD1Ms: Double
     public let poincareSD2Ms: Double
@@ -210,7 +209,6 @@ public struct HRVAnalysisMetricsDTO: Codable, Sendable, Equatable {
     public var lfPowerMs2: Double { lfPower }
     public var hfPowerMs2: Double { hfPower }
     public var dominantFrequencyHz: Double { peakMayerFrequencyHz }
-    public var rsaCoherenceScore: Double { vagalCoherenceScore }
 
     public var sd1ToSd2Ratio: Double {
         guard poincareSD2Ms > 1e-6 else { return 0.0 }
