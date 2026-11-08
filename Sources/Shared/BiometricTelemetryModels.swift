@@ -114,6 +114,9 @@ public struct HRVAnalysisMetricsDTO: Codable, Sendable, Equatable {
     public let rmssdMs: Double
     public let pNN50Percent: Double
     public var pnn50Percent: Double { pNN50Percent }
+    public var rmssdMilliseconds: Double { rmssdMs }
+    public var sdnnMilliseconds: Double { sdnnMs }
+    public var rsaCoherenceScore: Double { vagalCoherenceScore }
     public let baevskyStressIndex: Double
     public let poincareSD1Ms: Double
     public let poincareSD2Ms: Double

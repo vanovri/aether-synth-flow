@@ -9,6 +9,9 @@ public struct KalmanFocusEstimate: Codable, Sendable, Equatable {
     public let fatigueVelocity: Double
     public let errorCovarianceTrace: Double
     public let recommendedSessionMinutes: Int
+    public var focusCapacity: Double { coherence }
+    public var cognitiveFatigue: Double { min(max(0.5 + fatigueVelocity * 0.5, 0.05), 1.0) }
+    public var circadianPhaseRadians: Double { coherence * Double.pi }
 
     public init(
         coherence: Double,

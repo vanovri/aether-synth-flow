@@ -1051,7 +1051,7 @@ public actor AetherCapstoneBenchmarkSuite {
             var gen = SyntheticCorticalEEGGenerator(
                 sampleRate: 256.0,
                 targetAlphaHz: configuration.eegTargetAlphaHz,
-                thetaGammaCouplingStrength: configuration.eegThetaGammaCoupling
+                thetaGammaCouplingStrength: Float(configuration.eegThetaGammaCoupling)
             )
             var filterBank = EEGArtifactFilterBank(sampleRate: 256.0)
             var af7Clean: [Float] = []
@@ -1070,8 +1070,8 @@ public actor AetherCapstoneBenchmarkSuite {
                 af7Clean.append(cleaned.cleaned.af7)
                 af8Clean.append(cleaned.cleaned.af8)
                 if i >= 100 && i <= 125 {
-                    let rawDiff = Double(step.sample.af7 - step.cleanNeuroAF7)
-                    let cleanDiff = Double(cleaned.cleaned.af7 - step.cleanNeuroAF7)
+                    let rawDiff: Double = Double(step.sample.af7 - step.cleanNeuroAF7)
+                    let cleanDiff: Double = Double(cleaned.cleaned.af7 - step.cleanNeuroAF7)
                     rawErrSqSum += rawDiff * rawDiff
                     cleanErrSqSum += cleanDiff * cleanDiff
                     blinkSampleCount += 1
@@ -1223,7 +1223,7 @@ public actor AetherCapstoneBenchmarkSuite {
             binauralOscillatorState4: SIMD4<Float>(0.50, 0.45, 0.38, 0.62),
             hrtfFDTDWavefield4: SIMD4<Float>(0.48, 0.58, 0.44, 0.50),
             circadianKalmanPhase4: SIMD4<Float>(0.70, 0.35, 0.60, 0.40),
-            entanglementCoupling: configuration.quantumEntanglementCoupling
+            entanglementCoupling: Float(configuration.quantumEntanglementCoupling)
         )
 
         var samplesUs: [Double] = []
