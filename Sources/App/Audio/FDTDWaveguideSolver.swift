@@ -608,13 +608,15 @@ public struct RealtimeFDTDResonatorKernel: @unchecked Sendable {
         guard abs(baseLambdaSq - cachedCutoffLambdaSq) > 1.0e-5 else { return }
         cachedCutoffLambdaSq = baseLambdaSq
         let lambda = sqrtf(max(1.0e-4, baseLambdaSq))
-        let ppw = FDTDCFLParameters.worstDirectionalDispersionError(
+        let dispErr: Float = FDTDCFLParameters.worstDirectionalDispersionError(
             pointsPerWavelength: 6.5,
             courantLambda: lambda,
             dimension: 2
-        ) <= 0.025 ? 6.5 : 8.0
-        let fs = Float(sampleRate)
-        let fc = min(max((lambda / ppw) * fs, 180.0), 0.44 * fs)
+        )
+        let ppw: Float = dispErr <= 0.025 ? 6.5 : 8.0
+        let fs: Float = Float(sampleRate)
+        let rawFc: Float = (lambda / ppw) * fs
+        let fc: Float = min(max(rawFc, 180.0), 0.44 * fs)
         let w0 = 2.0 * Float.pi * fc / fs
         let cosW0 = cosf(w0)
         let sinW0 = sinf(w0)
