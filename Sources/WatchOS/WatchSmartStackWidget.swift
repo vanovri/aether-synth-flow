@@ -89,8 +89,8 @@ public struct WatchSmartStackEntryView: View {
                 Text("\(data.streakDays)d")
                     .font(.system(size: 8, weight: .semibold, design: .rounded))
             } maximumValueLabel: {
-                Image(systemName: "flame.fill")
-                    .font(.system(size: 8))
+                Text("100")
+                    .font(.system(size: 8, weight: .semibold, design: .rounded))
             }
             .gaugeStyle(.accessoryCircular)
             .tint(accent)
