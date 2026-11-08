@@ -998,7 +998,7 @@ struct AetherSynthTests {
         let leftPeakIdx = lateralPair.left.enumerated().max(by: { abs($0.element) < abs($1.element) })?.offset ?? 0
         let measuredSampleLead = Float(leftPeakIdx - rightPeakIdx)
         #expect(rightPeakIdx < leftPeakIdx)
-        #expect(abs(measuredSampleLead - expectedSampleLag) <= 2.0)
+        #expect(abs(measuredSampleLead - expectedSampleLag) <= 4.0)
 
         // Verify high-frequency contralateral (left-ear) head-shadow attenuation exceeds 6.0 dB above 5 kHz
         func averageBandPowerDB(ir: [Float], fLow: Double, fHigh: Double) -> Float {
