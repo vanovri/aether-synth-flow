@@ -4,6 +4,7 @@ import Foundation
 import simd
 
 #if os(visionOS) && canImport(CompositorServices)
+import SwiftUI
 import CompositorServices
 import Metal
 import ARKit

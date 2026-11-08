@@ -188,6 +188,13 @@ targets:
       - path: Sources/Shared
         excludes:
           - "AetherCapstoneBenchmarkSuite.swift"
+          - "AetherMeshSyncActor.swift"
+          - "DistributedOrchestraEngine.swift"
+          - "EEGBrainComputerInterface.swift"
+          - "MPSGraphBrainwaveTrainer.swift"
+          - "NeuralLatentSoundscapeEngine.swift"
+          - "TensorNetworkQuantumOptimizer.swift"
+          - "WignerVilleHilbertHuangAnalyzer.swift"
       - path: Sources/WatchOS
     info:
       path: Config/AetherSynthWatch-Info.plist
