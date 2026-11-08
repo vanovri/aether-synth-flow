@@ -172,5 +172,20 @@ struct Track35CausticsAuditTests {
             totalEnergy += cell.x + cell.y + cell.z
         }
         #expect(totalEnergy > 1.0)
+
+        // [F-09] & [F-10]: Verify renderDownsampledCaustics outputs single-pass Reinhard tone-mapped values in [0, 1]
+        let downsampled = VolumetricCausticsDispatcher.shared.renderDownsampledCaustics(
+            sourcePressure: syntheticPressure,
+            sourceGridSize: n,
+            renderGridSize: 8,
+            pressureGain: 6.5,
+            requestedPhotons: 512
+        )
+        #expect(downsampled.count == 64)
+        for rgb in downsampled {
+            #expect(rgb.x >= 0.0 && rgb.x <= 1.0)
+            #expect(rgb.y >= 0.0 && rgb.y <= 1.0)
+            #expect(rgb.z >= 0.0 && rgb.z <= 1.0)
+        }
     }
 }

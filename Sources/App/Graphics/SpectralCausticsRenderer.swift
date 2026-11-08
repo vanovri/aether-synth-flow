@@ -595,6 +595,8 @@ public final class VolumetricCausticsDispatcher: @unchecked Sendable {
     private var governor = CausticsQualityGovernor()
     private var frameCounter: UInt32 = 1
     private var reusableSampledPressure: [Float] = []
+    private var latestResolvedField: [SIMD3<Float>] = []
+    private var gpuDispatchInFlight: Bool = false
 
     #if canImport(Metal) && !os(watchOS)
     private var device: MTLDevice?
@@ -718,18 +720,29 @@ public final class VolumetricCausticsDispatcher: @unchecked Sendable {
         #endif
 
         let startNs = DispatchTime.now().uptimeNanoseconds
-        let field = AcoustoOpticCausticsEngine.traceCausticsField(
+        let rawField = AcoustoOpticCausticsEngine.traceCausticsField(
             pressureGrid: sampledSnapshot,
             gridSize: renderN,
             photonCount: effectivePhotons,
             integrationSteps: effectiveSteps
         )
+        var toneMappedField = [SIMD3<Float>](repeating: .zero, count: rawField.count)
+        let compression: Float = 0.65
+        for i in 0..<rawField.count {
+            let rgb = rawField[i]
+            toneMappedField[i] = SIMD3<Float>(
+                rgb.x / (1.0 + rgb.x * compression),
+                rgb.y / (1.0 + rgb.y * compression),
+                rgb.z / (1.0 + rgb.z * compression)
+            )
+        }
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
 
         lock.lock()
         governor.recordFrameTime(milliseconds: elapsedMs)
+        latestResolvedField = toneMappedField
         lock.unlock()
-        return field
+        return toneMappedField
     }
 
     #if canImport(Metal) && !os(watchOS)
@@ -753,17 +766,28 @@ public final class VolumetricCausticsDispatcher: @unchecked Sendable {
             return nil
         }
 
+        if gpuDispatchInFlight && latestResolvedField.count == cellCount {
+            let cached = latestResolvedField
+            lock.unlock()
+            return cached
+        }
+
         sampledPressure.withUnsafeBufferPointer { src in
             if let base = src.baseAddress {
                 memcpy(pBuf.contents(), base, cellCount * MemoryLayout<Float>.stride)
             }
         }
         memset(aBuf.contents(), 0, cellCount * 3 * MemoryLayout<UInt32>.stride)
+        gpuDispatchInFlight = true
+        let cachedBeforeCommit = (latestResolvedField.count == cellCount) ? latestResolvedField : nil
         lock.unlock()
 
         guard let cmdBuf = queue.makeCommandBuffer(),
               let encoder = cmdBuf.makeComputeCommandEncoder() else {
-            return nil
+            lock.lock()
+            gpuDispatchInFlight = false
+            lock.unlock()
+            return cachedBeforeCommit
         }
 
         let stepLen: Float = 0.85
@@ -794,6 +818,8 @@ public final class VolumetricCausticsDispatcher: @unchecked Sendable {
         let groupCount = MTLSize(width: (photonCount + 63) / 64, height: 1, depth: 1)
         encoder.dispatchThreadgroups(groupCount, threadsPerThreadgroup: threadsPerGroup)
 
+        encoder.memoryBarrier(scope: .buffers)
+
         encoder.setComputePipelineState(resolvePSO)
         encoder.setBuffer(aBuf, offset: 0, index: 0)
         encoder.setBuffer(rBuf, offset: 0, index: 1)
@@ -809,7 +835,15 @@ public final class VolumetricCausticsDispatcher: @unchecked Sendable {
             guard let self else { return }
             let gpuStart = completedBuffer.gpuStartTime
             let gpuEnd = completedBuffer.gpuEndTime
+            var resolvedSnapshot = [SIMD3<Float>](repeating: .zero, count: cellCount)
             self.lock.lock()
+            let resolvedPtr = rBuf.contents().bindMemory(to: SIMD4<Float>.self, capacity: cellCount)
+            for i in 0..<cellCount {
+                let v = resolvedPtr[i]
+                resolvedSnapshot[i] = SIMD3<Float>(v.x, v.y, v.z)
+            }
+            self.latestResolvedField = resolvedSnapshot
+            self.gpuDispatchInFlight = false
             if gpuEnd > gpuStart && gpuStart > 0.0 {
                 self.governor.recordCommandBuffer(completedBuffer)
             } else {
@@ -820,17 +854,11 @@ public final class VolumetricCausticsDispatcher: @unchecked Sendable {
         }
 
         cmdBuf.commit()
-        cmdBuf.waitUntilCompleted()
 
-        var outField = [SIMD3<Float>](repeating: .zero, count: cellCount)
-        lock.lock()
-        let resolvedPtr = rBuf.contents().bindMemory(to: SIMD4<Float>.self, capacity: cellCount)
-        for i in 0..<cellCount {
-            let v = resolvedPtr[i]
-            outField[i] = SIMD3<Float>(v.x, v.y, v.z)
+        if let cachedBeforeCommit {
+            return cachedBeforeCommit
         }
-        lock.unlock()
-        return outField
+        return nil
     }
     #endif
 }
@@ -885,12 +913,7 @@ public struct AcoustoOpticCausticsCanvasView: View {
 
                     for ry in 0..<renderN {
                         for rx in 0..<renderN {
-                            let rgb = caustics[ry * renderN + rx]
-                            let mapped = SIMD3<Float>(
-                                rgb.x / (1.0 + rgb.x * 0.65),
-                                rgb.y / (1.0 + rgb.y * 0.65),
-                                rgb.z / (1.0 + rgb.z * 0.65)
-                            )
+                            let mapped = caustics[ry * renderN + rx]
                             let luma = max(mapped.x, max(mapped.y, mapped.z))
                             guard luma > 0.015 else { continue }
 
@@ -1046,12 +1069,7 @@ public struct ChromaticCausticsViewportView: View {
 
             for ry in 0..<renderN {
                 for rx in 0..<renderN {
-                    let rgb = caustics[ry * renderN + rx]
-                    let mapped = SIMD3<Float>(
-                        rgb.x / (1.0 + rgb.x * 0.65),
-                        rgb.y / (1.0 + rgb.y * 0.65),
-                        rgb.z / (1.0 + rgb.z * 0.65)
-                    )
+                    let mapped = caustics[ry * renderN + rx]
                     let luma = max(mapped.x, max(mapped.y, mapped.z))
                     guard luma > 0.015 else { continue }
 

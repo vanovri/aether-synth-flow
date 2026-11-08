@@ -259,6 +259,16 @@ kernel void aetherTraceAcoustoOpticPhotons(
     float baseDispersionN = fma(uniforms.cauchyDispersionB, invLambdaUmSq, uniforms.baseRefractiveIndex);
     float gradNScale = baseDispersionN * uniforms.acoustoOpticKappa;
 
+    // Surface entry Snell refraction modulated by initial local pressure
+    float3 entryPG = aether_caustics::samplePressureAndGradientFused(pressureField, pos, w, h);
+    float entryN = aether_caustics::refractiveIndexFromBase(
+        baseDispersionN,
+        entryPG.x,
+        uniforms.acoustoOpticKappa
+    );
+    rayDir.xy /= entryN;
+    rayDir = fast::normalize(rayDir);
+
     uint maxSteps = min(max(uniforms.integrationSteps, 4u), 64u);
     float baseStepCells = max(0.05f, uniforms.stepSizeCells);
     float targetSlabDepth = (uniforms.slabDepthCells > 0.1f)
