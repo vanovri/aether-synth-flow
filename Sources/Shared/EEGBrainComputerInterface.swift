@@ -525,8 +525,9 @@ public struct EEGBLEJitterReorderBuffer: Sendable {
     public private(set) var duplicateOrLateDropCount: Int = 0
     public private(set) var reorderedRecoveredCount: Int = 0
     public private(set) var forcedHoldAdvanceCount: Int = 0
+    private let initialSequenceNumber: UInt16?
 
-    public init(capacity: Int = 64, maxHoldSeconds: TimeInterval = 0.105) {
+    public init(capacity: Int = 64, maxHoldSeconds: TimeInterval = 0.105, initialSequenceNumber: UInt16? = nil) {
         var pow2 = 8
         while pow2 < min(max(capacity, 8), 512) {
             pow2 <<= 1
@@ -534,6 +535,8 @@ public struct EEGBLEJitterReorderBuffer: Sendable {
         self.capacity = pow2
         self.maxHoldSeconds = max(0.008, maxHoldSeconds)
         self.slots = [Slot](repeating: Slot(), count: pow2)
+        self.initialSequenceNumber = initialSequenceNumber
+        self.expectedSequenceNumber = initialSequenceNumber
     }
 
     @inline(__always)
@@ -545,7 +548,7 @@ public struct EEGBLEJitterReorderBuffer: Sendable {
         for idx in 0..<capacity {
             slots[idx].isOccupied = false
         }
-        expectedSequenceNumber = nil
+        expectedSequenceNumber = initialSequenceNumber
         duplicateOrLateDropCount = 0
         reorderedRecoveredCount = 0
         forcedHoldAdvanceCount = 0
@@ -692,6 +695,7 @@ public struct EEGBLEStreamSynchronizer: Sendable {
     private var lastEmittedSequenceNumber: UInt16?
     private var lastMeasuredSample: EEGQuadSample?
     private var secondLastMeasuredSample: EEGQuadSample?
+    private let initialSequenceNumber: UInt16?
 
     public var duplicateOrLateDropCount: Int {
         jitterBuffer.duplicateOrLateDropCount + packetDecoder.duplicateOrStaleDropCount
@@ -709,13 +713,15 @@ public struct EEGBLEStreamSynchronizer: Sendable {
         sampleRate: Double = 256.0,
         jitterBufferCapacity: Int = 64,
         maxHoldSeconds: TimeInterval = 0.105,
-        maxInterpolatedGapSamples: Int = 16
+        maxInterpolatedGapSamples: Int = 16,
+        initialSequenceNumber: UInt16? = nil
     ) {
         let fs = max(64.0, sampleRate)
         self.sampleRate = fs
         self.maxInterpolatedGapSamples = max(1, maxInterpolatedGapSamples)
         self.packetDecoder = EEGBLEPacketDecoder(sampleRate: fs)
-        self.jitterBuffer = EEGBLEJitterReorderBuffer(capacity: jitterBufferCapacity, maxHoldSeconds: maxHoldSeconds)
+        self.initialSequenceNumber = initialSequenceNumber
+        self.jitterBuffer = EEGBLEJitterReorderBuffer(capacity: jitterBufferCapacity, maxHoldSeconds: maxHoldSeconds, initialSequenceNumber: initialSequenceNumber)
     }
 
     public mutating func ingestBLEPacket(
@@ -776,6 +782,19 @@ public struct EEGBLEStreamSynchronizer: Sendable {
     ) {
         var isPostDiscontinuity = false
         var gapLength = 0
+
+        // An explicit acquisition origin preserves the sample clock when startup packets are lost or reordered.
+        // Without one, sample zero remains the first emitted measurement, as in the original API.
+        if lastEmittedSequenceNumber == nil, let origin = initialSequenceNumber {
+            let prefix = EEGBLEPacketDecoder.signedSequenceDelta(sequenceNumber, origin)
+            guard prefix >= 0 else { return }
+            cumulativeSampleIndex = UInt64(prefix)
+            if prefix > 0 {
+                uninterpolatedDropCount += prefix
+                gapLength = prefix
+                isPostDiscontinuity = true
+            }
+        }
 
         if let prevSeq = lastEmittedSequenceNumber, let prevSample = lastMeasuredSample {
             let diff = EEGBLEPacketDecoder.signedSequenceDelta(sequenceNumber, prevSeq)

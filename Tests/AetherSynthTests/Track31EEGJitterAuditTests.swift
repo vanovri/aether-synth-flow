@@ -8,6 +8,32 @@ import Foundation
 @Suite("Track 31 BLE EEG 15% Packet Drop, Extreme Jitter, UInt16 Wrap & Artifact Filter Audit")
 struct Track31EEGJitterAuditTests {
 
+    @Test("Known acquisition origin preserves a missing prefix and UInt16 rollover")
+    func knownOriginPreservesPrefixAndRollover() {
+        var stream = EEGBLEStreamSynchronizer(initialSequenceNumber: 65534)
+        let value = EEGQuadSample(tp9: 10, af7: 20, af8: 30, tp10: 40, timestamp: 0)
+        let a = EEGBLEPacketDecoder.encode12BitBigEndianPacket(sequenceNumber: 65535, sample: value)
+        let b = EEGBLEPacketDecoder.encode12BitBigEndianPacket(sequenceNumber: 1, sample: value)
+        var result = stream.ingestBLEPacket(a, arrivalTimestamp: 0.001)
+        result += stream.ingestBLEPacket(b, arrivalTimestamp: 0.002)
+        result += stream.flush()
+        #expect(result.map(\.sampleIndex) == [1, 2, 3])
+        #expect(result.map(\.sequenceNumber) == [65535, 0, 1])
+        #expect(result.map(\.isSynthetic) == [false, true, false])
+        #expect(stream.uninterpolatedDropCount == 1)
+        #expect(result.first?.isPostDiscontinuity == true)
+    }
+
+    @Test("Unknown acquisition origin retains the first-measurement-zero contract")
+    func unknownOriginRetainsRelativeClock() {
+        var stream = EEGBLEStreamSynchronizer()
+        let value = EEGQuadSample(tp9: 10, af7: 20, af8: 30, tp10: 40, timestamp: 0)
+        let packet = EEGBLEPacketDecoder.encode12BitBigEndianPacket(sequenceNumber: 65002, sample: value)
+        let result = stream.ingestBLEPacket(packet, arrivalTimestamp: 0.1)
+        #expect(result.first?.sampleIndex == 0)
+        #expect(result.first?.sequenceNumber == 65002)
+    }
+
     private struct SplitMix64PRNG: Sendable {
         var state: UInt64
 
@@ -221,7 +247,8 @@ struct Track31EEGJitterAuditTests {
             sampleRate: sampleRate,
             jitterBufferCapacity: 64,
             maxHoldSeconds: 0.105,
-            maxInterpolatedGapSamples: 16
+            maxInterpolatedGapSamples: 16,
+            initialSequenceNumber: startSeq
         )
         var filterBank = EEGArtifactFilterBank(sampleRate: sampleRate)
         var detector = EEGOcularBlinkAndSpikeDetector()
