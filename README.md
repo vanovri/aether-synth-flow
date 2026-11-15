@@ -25,7 +25,9 @@ Other builds need the corresponding SDK and simulator. The [workflow](.github/wo
 
 ## Evidence and scope
 
-The CI result inspected on 15 November 2026 failed assertions in [Track31EEGJitterAuditTests.swift](Tests/AetherSynthTests/Track31EEGJitterAuditTests.swift). This is a numerical failure, not a missing dependency. The audit leaves those assertions intact. See [current CI](https://github.com/vanovri/aether-synth-flow/actions).
+The [verified CI run on 15 November 2026](https://github.com/vanovri/aether-synth-flow/actions/runs/43730846782) passed at source commit `33e8a23f97479848a0c35dd6c195fd310dd025af`. It executed the native macOS Swift Testing suite, built iOS application/extension targets and the iOS test bundle, and built the visionOS and watchOS targets. The iOS step uses `build-for-testing`; it does not execute simulator tests.
+
+The BLE synchronizer now accepts an optional acquisition sequence origin. This preserves producer sample indices through initial packet reordering, missing prefixes, and UInt16 rollover. An unknown origin retains the first-measurement-zero clock. The Track31 numerical assertions remain unchanged, with two added origin-contract regression tests. Native throughput assertions run with Release optimization and retain their original time budget. See [current CI](https://github.com/vanovri/aether-synth-flow/actions) for later commits.
 
 Earlier latency, attenuation, allocation, and blanket test-pass claims have been removed because the audit did not reproduce them. Synthetic signal fixtures do not establish clinical accuracy, Apple Watch measurement validity, or headset performance.
 
